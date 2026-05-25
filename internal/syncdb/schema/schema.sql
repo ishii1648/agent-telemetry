@@ -1,3 +1,5 @@
+DROP TRIGGER IF EXISTS sessions_insert_events;
+DROP TRIGGER IF EXISTS transcript_stats_insert_events;
 DROP VIEW IF EXISTS weekly_session_metrics;
 DROP VIEW IF EXISTS weekly_pr_metrics;
 DROP VIEW IF EXISTS pr_merged_at_approx;
@@ -5,9 +7,10 @@ DROP VIEW IF EXISTS pr_metrics;
 DROP VIEW IF EXISTS session_concurrency_weekly;
 DROP VIEW IF EXISTS session_concurrency_daily;
 DROP VIEW IF EXISTS session_intervals;
+DROP VIEW IF EXISTS transcript_stats;
+DROP VIEW IF EXISTS sessions;
 DROP TABLE IF EXISTS permission_events;
-DROP TABLE IF EXISTS transcript_stats;
-DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS events;
 DROP TABLE IF EXISTS schema_meta;
 
 CREATE TABLE schema_meta (
@@ -15,50 +18,195 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 );
 
-CREATE TABLE sessions (
-    session_id        TEXT NOT NULL,
-    coding_agent      TEXT NOT NULL DEFAULT 'claude',
-    agent_version     TEXT NOT NULL DEFAULT '',
-    user_id           TEXT NOT NULL DEFAULT 'unknown',
-    timestamp         TEXT NOT NULL,
-    cwd               TEXT NOT NULL DEFAULT '',
-    repo              TEXT NOT NULL DEFAULT '',
-    branch            TEXT NOT NULL DEFAULT '',
-    pr_url            TEXT NOT NULL DEFAULT '',
-    pr_title          TEXT NOT NULL DEFAULT '',
-    transcript        TEXT NOT NULL DEFAULT '',
-    parent_session_id TEXT NOT NULL DEFAULT '',
-    ended_at          TEXT NOT NULL DEFAULT '',
-    end_reason        TEXT NOT NULL DEFAULT '',
-    is_subagent       INTEGER NOT NULL DEFAULT 0,
-    backfill_checked  INTEGER NOT NULL DEFAULT 0,
-    is_merged         INTEGER NOT NULL DEFAULT 0,
-    task_type         TEXT NOT NULL DEFAULT '',
-    review_comments   INTEGER NOT NULL DEFAULT 0,
-    changes_requested INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, coding_agent)
+CREATE TABLE events (
+    local_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       TEXT NOT NULL UNIQUE,
+    occurred_at    TEXT NOT NULL,
+    received_at    TEXT NOT NULL DEFAULT '',
+    session_id     TEXT NOT NULL,
+    coding_agent   TEXT NOT NULL DEFAULT 'claude',
+    event_name     TEXT NOT NULL,
+    attributes     TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE TABLE transcript_stats (
-    session_id         TEXT NOT NULL,
-    coding_agent       TEXT NOT NULL DEFAULT 'claude',
-    tool_use_total     INTEGER NOT NULL DEFAULT 0,
-    mid_session_msgs   INTEGER NOT NULL DEFAULT 0,
-    ask_user_question  INTEGER NOT NULL DEFAULT 0,
-    input_tokens       INTEGER NOT NULL DEFAULT 0,
-    output_tokens      INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
-    model              TEXT NOT NULL DEFAULT '',
-    is_ghost           INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, coding_agent)
-);
+CREATE INDEX idx_events_session ON events(session_id, coding_agent, event_name, occurred_at, local_sequence);
+CREATE INDEX idx_events_name_time ON events(event_name, occurred_at);
 
-CREATE INDEX idx_sessions_pr_url ON sessions(pr_url);
-CREATE INDEX idx_sessions_repo ON sessions(repo);
-CREATE INDEX idx_sessions_coding_agent ON sessions(coding_agent);
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE VIEW sessions AS
+WITH
+latest_started AS (
+    SELECT e.*
+    FROM events e
+    WHERE e.event_name = 'agent.session.started'
+      AND e.local_sequence = (
+        SELECT MAX(e2.local_sequence)
+        FROM events e2
+        WHERE e2.session_id = e.session_id
+          AND e2.coding_agent = e.coding_agent
+          AND e2.event_name = e.event_name
+      )
+),
+latest_ended AS (
+    SELECT e.*
+    FROM events e
+    WHERE e.event_name = 'agent.session.ended'
+      AND e.local_sequence = (
+        SELECT MAX(e2.local_sequence)
+        FROM events e2
+        WHERE e2.session_id = e.session_id
+          AND e2.coding_agent = e.coding_agent
+          AND e2.event_name = e.event_name
+      )
+),
+latest_pr AS (
+    SELECT e.*
+    FROM events e
+    WHERE e.event_name = 'agent.pr.observed'
+      AND e.local_sequence = (
+        SELECT MAX(e2.local_sequence)
+        FROM events e2
+        WHERE e2.session_id = e.session_id
+          AND e2.coding_agent = e.coding_agent
+          AND e2.event_name = e.event_name
+      )
+)
+SELECT
+    s.session_id,
+    s.coding_agent,
+    COALESCE(json_extract(s.attributes, '$.agent_version'), '') AS agent_version,
+    COALESCE(json_extract(s.attributes, '$.user_id'), 'unknown') AS user_id,
+    COALESCE(json_extract(s.attributes, '$.started_at'), s.occurred_at) AS timestamp,
+    COALESCE(json_extract(s.attributes, '$.cwd'), '') AS cwd,
+    COALESCE(json_extract(s.attributes, '$.repo'), '') AS repo,
+    COALESCE(json_extract(s.attributes, '$.branch'), '') AS branch,
+    COALESCE(json_extract(p.attributes, '$.pr_url'), '') AS pr_url,
+    COALESCE(json_extract(p.attributes, '$.pr_title'), '') AS pr_title,
+    COALESCE(json_extract(s.attributes, '$.transcript'), '') AS transcript,
+    COALESCE(json_extract(s.attributes, '$.parent_session_id'), '') AS parent_session_id,
+    COALESCE(json_extract(en.attributes, '$.ended_at'), '') AS ended_at,
+    COALESCE(json_extract(en.attributes, '$.end_reason'), '') AS end_reason,
+    CASE WHEN COALESCE(json_extract(s.attributes, '$.parent_session_id'), '') != '' THEN 1 ELSE 0 END AS is_subagent,
+    COALESCE(json_extract(p.attributes, '$.backfill_checked'), 0) AS backfill_checked,
+    COALESCE(json_extract(p.attributes, '$.is_merged'), 0) AS is_merged,
+    CASE
+      WHEN COALESCE(json_extract(s.attributes, '$.branch'), '') LIKE 'feat/%' THEN 'feat'
+      WHEN COALESCE(json_extract(s.attributes, '$.branch'), '') LIKE 'fix/%' THEN 'fix'
+      WHEN COALESCE(json_extract(s.attributes, '$.branch'), '') LIKE 'docs/%' THEN 'docs'
+      WHEN COALESCE(json_extract(s.attributes, '$.branch'), '') LIKE 'chore/%' THEN 'chore'
+      ELSE ''
+    END AS task_type,
+    COALESCE(json_extract(p.attributes, '$.review_comments'), 0) AS review_comments,
+    COALESCE(json_extract(p.attributes, '$.changes_requested'), 0) AS changes_requested
+FROM latest_started s
+LEFT JOIN latest_ended en
+    ON en.session_id = s.session_id AND en.coding_agent = s.coding_agent
+LEFT JOIN latest_pr p
+    ON p.session_id = s.session_id AND p.coding_agent = s.coding_agent;
+
+CREATE VIEW transcript_stats AS
+WITH latest_stats AS (
+    SELECT e.*
+    FROM events e
+    WHERE e.event_name = 'agent.transcript.scanned'
+      AND e.local_sequence = (
+        SELECT MAX(e2.local_sequence)
+        FROM events e2
+        WHERE e2.session_id = e.session_id
+          AND e2.coding_agent = e.coding_agent
+          AND e2.event_name = e.event_name
+      )
+)
+SELECT
+    session_id,
+    coding_agent,
+    COALESCE(json_extract(attributes, '$.tool_use_total'), 0) AS tool_use_total,
+    COALESCE(json_extract(attributes, '$.mid_session_msgs'), 0) AS mid_session_msgs,
+    COALESCE(json_extract(attributes, '$.ask_user_question'), 0) AS ask_user_question,
+    COALESCE(json_extract(attributes, '$.input_tokens'), 0) AS input_tokens,
+    COALESCE(json_extract(attributes, '$.output_tokens'), 0) AS output_tokens,
+    COALESCE(json_extract(attributes, '$.cache_write_tokens'), 0) AS cache_write_tokens,
+    COALESCE(json_extract(attributes, '$.cache_read_tokens'), 0) AS cache_read_tokens,
+    COALESCE(json_extract(attributes, '$.reasoning_tokens'), 0) AS reasoning_tokens,
+    COALESCE(json_extract(attributes, '$.model'), '') AS model,
+    COALESCE(json_extract(attributes, '$.is_ghost'), 0) AS is_ghost
+FROM latest_stats;
+
+CREATE TRIGGER sessions_insert_events
+INSTEAD OF INSERT ON sessions
+BEGIN
+    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    VALUES (
+        lower(hex(randomblob(16))),
+        COALESCE(NULLIF(NEW.timestamp, ''), datetime('now')),
+        NEW.session_id,
+        NEW.coding_agent,
+        'agent.session.started',
+        json_object(
+            'agent_version', NEW.agent_version,
+            'user_id', NEW.user_id,
+            'cwd', NEW.cwd,
+            'repo', NEW.repo,
+            'branch', NEW.branch,
+            'transcript', NEW.transcript,
+            'parent_session_id', NEW.parent_session_id,
+            'started_at', NEW.timestamp
+        )
+    );
+
+    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    SELECT
+        lower(hex(randomblob(16))),
+        COALESCE(NULLIF(NEW.ended_at, ''), datetime('now')),
+        NEW.session_id,
+        NEW.coding_agent,
+        'agent.session.ended',
+        json_object('ended_at', NEW.ended_at, 'end_reason', NEW.end_reason)
+    WHERE NEW.ended_at != '' OR NEW.end_reason != '';
+
+    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    VALUES (
+        lower(hex(randomblob(16))),
+        datetime('now'),
+        NEW.session_id,
+        NEW.coding_agent,
+        'agent.pr.observed',
+        json_object(
+            'pr_url', NEW.pr_url,
+            'pr_title', NEW.pr_title,
+            'pr_state', CASE WHEN NEW.is_merged = 1 THEN 'merged' ELSE '' END,
+            'is_merged', NEW.is_merged,
+            'review_comments', NEW.review_comments,
+            'changes_requested', NEW.changes_requested,
+            'pr_pinned', CASE WHEN NEW.pr_url != '' THEN 1 ELSE 0 END,
+            'backfill_checked', NEW.backfill_checked
+        )
+    );
+END;
+
+CREATE TRIGGER transcript_stats_insert_events
+INSTEAD OF INSERT ON transcript_stats
+BEGIN
+    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    VALUES (
+        lower(hex(randomblob(16))),
+        datetime('now'),
+        NEW.session_id,
+        NEW.coding_agent,
+        'agent.transcript.scanned',
+        json_object(
+            'tool_use_total', NEW.tool_use_total,
+            'mid_session_msgs', NEW.mid_session_msgs,
+            'ask_user_question', NEW.ask_user_question,
+            'input_tokens', NEW.input_tokens,
+            'output_tokens', NEW.output_tokens,
+            'cache_write_tokens', NEW.cache_write_tokens,
+            'cache_read_tokens', NEW.cache_read_tokens,
+            'reasoning_tokens', NEW.reasoning_tokens,
+            'model', NEW.model,
+            'is_ghost', NEW.is_ghost
+        )
+    );
+END;
 
 CREATE VIEW session_intervals AS
 SELECT
@@ -153,9 +301,6 @@ FROM (
     GROUP BY s.pr_url, s.coding_agent, s.user_id
 ) pm;
 
--- merge 時刻が schema に無いため、PR に紐づくセッション群の最後のタイムスタンプを近似値として使う
--- ended_at が空のセッション（hook 未実装・abort・強制終了）でも timestamp で代替して拾う
--- user_id を集約軸に含めることで pr_metrics と 1:1 で JOIN できる（pair coding 時の行膨張を防ぐ）
 CREATE VIEW pr_merged_at_approx AS
 SELECT
     pr_url,

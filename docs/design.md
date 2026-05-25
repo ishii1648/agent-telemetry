@@ -431,7 +431,7 @@ Content-Encoding: gzip   (optional)
 
 サーバの ingest ハンドラは payload を分解して events table に `INSERT OR IGNORE`。受信形式が OTLP なので、将来 OTel Collector を経由する構成や、Loki / Tempo などへの fanout も自然に追加できる。
 
-### 差分検知 — `state.json` の `last_flushed_event_id`
+### 差分検知 — `state.json` の `last_flushed_sequence`
 
 `agent-telemetry-state.json` に新フィールドを追加する:
 
@@ -439,24 +439,27 @@ Content-Encoding: gzip   (optional)
 {
   "last_backfill_offset": 123,
   "last_meta_check": "...",
-  "last_flushed_event_id": "01HXYZ..."
+  "last_flushed_sequence": 12345
 }
 ```
 
-- `event_id` は UUIDv7（時系列ソート可能）。クライアントは `events` から `event_id > last_flushed_event_id` の行を抽出して送る
-- 送信成功時に `last_flushed_event_id` を更新する（最大の `event_id` に進める）
-- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_event_id` より大きい `event_id` になり、次の flush で自動的に拾われる。SHA-256 hash 計算は不要
-- 既存 state.json にこのフィールドが欠けていれば空文字列扱い（次の flush で全 events を送る。サーバ側で冪等にスキップされる）
+- クライアント側 `events.local_sequence` は挿入順に増える整数。クライアントは `events` から `local_sequence > last_flushed_sequence` の行を抽出して送る
+- 送信成功時に `last_flushed_sequence` を更新する（最大の `local_sequence` に進める）
+- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_sequence` より大きい `local_sequence` になり、次の flush で自動的に拾われる。SHA-256 hash 計算は不要
+- 既存 state.json にこのフィールドが欠けていれば 0 扱い（次の flush で全 events を送る。サーバ側で冪等にスキップされる）
 - 進行中セッション（`agent.session.ended` 未着）の events も送る。旧設計のように「最後の Stop 発火まで送信対象から除外」する制約は不要（events 単位で送れるため、進行中の状態もダッシュボードに反映できる）
 
-### event_id の deterministic 採番
+### `event_id` と flush cursor の分離
 
-クライアントは各イベントを emit する時点で `event_id` を計算する。次のいずれかの方式を採る:
+クライアントは各イベントを emit する時点で `event_id` を一意 ID として採番する。`event_id` はサーバ側の冪等性キーであり、差分送信の cursor には使わない。
 
-- **UUIDv7（推奨）**: 時系列ソート可能で重複確率が実用上ゼロ。`event_id` を時刻と組み合わせて自然に増加させる
-- **content hash**: `sha256(canonical_attrs)` で deterministic。クライアントが同じイベントを 2 回 emit しても `event_id` が同じになるため、server は `INSERT OR IGNORE` で重複排除できる
+理由:
 
-最初は UUIDv7 を採用する（採番ロジックがシンプル）。再 emit が頻発する場合（migrate / replay）に content hash 方式を併用する。
+- 時系列ソート可能な ID を使っても、migration / replay / clock skew を考えると「送信済み境界」としては DB 挿入順の方が明確
+- content hash 型の ID を混ぜると `event_id > last_flushed_event_id` のような辞書順 cursor が破綻する
+- snapshot イベントは再 scan 時に新しい観測として積むため、同一内容の再 emit を必ず同じ `event_id` に潰す必要はない
+
+`migrate-to-events` も `event_id` は通常 event と同じ一意 ID を採番し、旧行から作った擬似イベントであることは `attributes.migration_source` / `attributes.source_row_hash` に残す。再実行時の重複防止は `source_row_hash` の UNIQUE index か migration state で担い、flush cursor とは分離する。
 
 ### 送信タイミング — 独立コマンド `agent-telemetry flush --since-last`
 
@@ -538,7 +541,7 @@ events 数が大きくなって VIEW のオンザフライ集約が重くなっ�
 1. クライアント・サーバとも一度だけ `agent-telemetry migrate-to-events` / `agent-telemetry-server migrate-to-events` を実行
    - 既存 `sessions` 行 → `agent.session.started` + `agent.session.ended` + `agent.pr.observed` の擬似イベント列に展開
    - 既存 `transcript_stats` 行 → `agent.transcript.scanned` の擬似イベントに展開
-   - `event_id` は `sha256(coding_agent || session_id || event_name)` で deterministic に振る（再実行で重複しない）
+   - `event_id` は通常 event と同じ一意 ID で振る。再実行時の重複防止は `attributes.source_row_hash = sha256(coding_agent || session_id || event_name)` を UNIQUE 扱いにするか、migration state で担う
    - `occurred_at` は対応するカラム（`timestamp` / `ended_at` 等）から推定。不明分は migration 実行時刻
 2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える
 3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを残しておき、1 リリース併走後に削除（既存ユーザに移行猶予を与える）

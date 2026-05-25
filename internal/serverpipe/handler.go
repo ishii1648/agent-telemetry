@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +112,7 @@ func NewHandler(db *sql.DB, token, dataDir string) *Handler {
 // access logging) before mounting.
 func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/metrics", h.ServeIngest)
+	mux.HandleFunc("/v1/logs", h.ServeLogs)
 }
 
 // Close releases the collisions log file if it was opened.
@@ -166,6 +168,154 @@ func (h *Handler) ServeIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+type logsPayload struct {
+	ResourceLogs []struct {
+		ScopeLogs []struct {
+			LogRecords []struct {
+				TimeUnixNano string `json:"timeUnixNano"`
+				EventName    string `json:"eventName"`
+				Attributes   []struct {
+					Key   string `json:"key"`
+					Value struct {
+						StringValue string `json:"stringValue"`
+						IntValue    string `json:"intValue"`
+						BoolValue   *bool  `json:"boolValue,omitempty"`
+					} `json:"value"`
+				} `json:"attributes"`
+			} `json:"logRecords"`
+		} `json:"scopeLogs"`
+	} `json:"resourceLogs"`
+}
+
+type logsResponse struct {
+	PartialSuccess struct {
+		RejectedLogRecords int    `json:"rejectedLogRecords"`
+		ErrorMessage       string `json:"errorMessage"`
+	} `json:"partialSuccess"`
+}
+
+func (h *Handler) ServeLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var payload logsPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	rejected, err := h.insertLogs(&payload)
+	resp := logsResponse{}
+	resp.PartialSuccess.RejectedLogRecords = rejected
+	if err != nil {
+		resp.PartialSuccess.ErrorMessage = err.Error()
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) insertLogs(p *logsPayload) (int, error) {
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO events
+		(event_id, occurred_at, received_at, session_id, coding_agent, event_name, attributes)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	rejected := 0
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, rl := range p.ResourceLogs {
+		for _, sl := range rl.ScopeLogs {
+			for _, lr := range sl.LogRecords {
+				eventID, sessionID, codingAgent, attrs := splitLogAttrs(lr.Attributes)
+				if eventID == "" || sessionID == "" || codingAgent == "" || lr.EventName == "" {
+					rejected++
+					continue
+				}
+				attrJSON, err := json.Marshal(attrs)
+				if err != nil {
+					rejected++
+					continue
+				}
+				if _, err := stmt.Exec(eventID, otlpTime(lr.TimeUnixNano), now, sessionID, codingAgent, lr.EventName, string(attrJSON)); err != nil {
+					return rejected, fmt.Errorf("insert event %s: %w", eventID, err)
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return rejected, fmt.Errorf("commit: %w", err)
+	}
+	return rejected, nil
+}
+
+func splitLogAttrs(attrs []struct {
+	Key   string `json:"key"`
+	Value struct {
+		StringValue string `json:"stringValue"`
+		IntValue    string `json:"intValue"`
+		BoolValue   *bool  `json:"boolValue,omitempty"`
+	} `json:"value"`
+}) (eventID, sessionID, codingAgent string, rest map[string]any) {
+	rest = map[string]any{}
+	for _, a := range attrs {
+		var v any
+		switch {
+		case a.Value.IntValue != "":
+			if n, err := strconv.ParseInt(a.Value.IntValue, 10, 64); err == nil {
+				v = n
+			} else {
+				v = a.Value.IntValue
+			}
+		case a.Value.BoolValue != nil:
+			v = *a.Value.BoolValue
+		default:
+			v = a.Value.StringValue
+		}
+		switch a.Key {
+		case "event_id":
+			eventID, _ = v.(string)
+		case "session_id":
+			sessionID, _ = v.(string)
+		case "coding_agent":
+			codingAgent, _ = v.(string)
+		case "local_sequence":
+			continue
+		default:
+			rest[a.Key] = v
+		}
+	}
+	return eventID, sessionID, codingAgent, rest
+}
+
+func otlpTime(ns string) string {
+	if ns == "" {
+		return time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	var n int64
+	if _, err := fmt.Sscanf(ns, "%d", &n); err != nil {
+		return ns
+	}
+	return time.Unix(0, n).UTC().Format(time.RFC3339Nano)
 }
 
 func (h *Handler) checkAuth(r *http.Request) bool {

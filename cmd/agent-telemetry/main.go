@@ -39,6 +39,10 @@ func main() {
 		runSyncDB(os.Args[2:])
 	case "push":
 		runPush(os.Args[2:])
+	case "flush":
+		runFlush(os.Args[2:])
+	case "migrate-to-events":
+		runMigrateToEvents(os.Args[2:])
 	case "setup":
 		runSetup(os.Args[2:])
 	case "doctor":
@@ -66,8 +70,11 @@ Commands:
   doctor                                 検出された agent ごとに binary / data dir / hook 登録を検証（自動修復はしない）
   backfill [--recheck] [--agent <a>]     検出された agent すべての pr_urls / is_merged / review_comments を補完
   sync-db [--agent <a>]                  検出された agent すべての JSONL/transcript → SQLite 変換（毎回フル再構築）
-  push [--since-last|--full] [--dry-run] [--agent <a>]
-                                         sync-db の集計値（sessions / transcript_stats）を [server] へ送信（オプトイン）
+	  push [--since-last|--full] [--dry-run] [--agent <a>]
+	                                         sync-db の集計値（sessions / transcript_stats）を [server] へ送信（オプトイン）
+	  flush [--since-last|--full] [--dry-run] [--agent <a>]
+	                                         events を OTLP/HTTP Logs として [server] へ送信（オプトイン）
+	  migrate-to-events [--agent <a>]        session-index / transcript から events DB を再生成
   update <session_id> <url>...           session-index.jsonl に PR URL を追加（重複排除）
   update --mark-checked <session_id>...  backfill_checked フラグをセット
   update --by-branch <repo> <branch> <url>  同一 repo+branch の全セッションに URL を追加
@@ -238,6 +245,60 @@ func runPush(args []string) {
 			os.Exit(2)
 		}
 		fmt.Fprintf(os.Stderr, "push error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runFlush(args []string) {
+	migrateLegacy()
+	agentName, args := extractAgentFlag(args)
+	opts := serverclient.FlushOptions{
+		ClientVersion: version,
+	}
+	for _, a := range args {
+		switch a {
+		case "--since-last":
+			opts.SinceLast = true
+		case "--full":
+			opts.Full = true
+		case "--dry-run":
+			opts.DryRun = true
+		default:
+			fmt.Fprintf(os.Stderr, "flush: unknown flag %q\n", a)
+			os.Exit(1)
+		}
+	}
+	if !opts.Full && !opts.SinceLast {
+		opts.SinceLast = true
+	}
+	opts.AgentName = agentName
+
+	res, err := serverclient.RunFlush(context.Background(), opts)
+	if res != nil {
+		res.Summarize(os.Stderr)
+		for _, ar := range res.PerAgent {
+			if ar.NoConfig {
+				fmt.Fprintf(os.Stderr, "flush: [server] セクションが %s に未設定です。docs/spec.md ## サーバ送信 を参照してください。\n", configpath.Preferred())
+				break
+			}
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "flush error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runMigrateToEvents(args []string) {
+	migrateLegacy()
+	agentName, _ := extractAgentFlag(args)
+	agents, err := agent.ResolveOrDetect(agentName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "migrate-to-events: %v\n", err)
+		os.Exit(1)
+	}
+	if err := syncdb.RunForAgents(agents, syncdb.DBPath()); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate-to-events error: %v\n", err)
 		os.Exit(1)
 	}
 }

@@ -65,8 +65,9 @@ agent-telemetry update <session_id> <url>...              session-index.jsonl �
 agent-telemetry update --mark-checked <session_id>...     backfill_checked フラグをセット
 agent-telemetry update --by-branch <repo> <branch> <url>  同一 repo+branch の全セッションに URL を追加
 agent-telemetry hook <event> [--agent <claude|codex>]     hook サブコマンド（settings.json / config.toml から呼ばれる、既定 claude）
+agent-telemetry push [--since-last|--full] [--dry-run]    既存実装: サーバへ sessions / transcript_stats の集計行を送信（要 [server] 設定、deprecated）
 agent-telemetry flush [--since-last|--full] [--dry-run]   未送信のイベントをサーバへ OTLP/HTTP で flush（要 [server] 設定）
-agent-telemetry migrate-to-events                         一度限り: 既存 sessions / transcript_stats 行を events に展開（旧 push 経路からの移行用）
+agent-telemetry migrate-to-events                         既存 session-index / transcript から events DB を再生成（旧 push 経路からの移行用）
 agent-telemetry version                                   version を表示
 ```
 
@@ -167,7 +168,8 @@ user = "ishii1492@gmail.com"
 
 | カラム | 型 | 説明 |
 |---|---|---|
-| `event_id` | TEXT | PRIMARY KEY。UUIDv7 もしくは `sha256(canonical attributes)`。client が deterministic に採番し、server / 再 emit でも同じ値になる（冪等性の根拠） |
+| `event_id` | TEXT | PRIMARY KEY。クライアントが採番する一意 ID。冪等性キーとして扱い、flush 差分検知の cursor には使わない |
+| `local_sequence` | INTEGER | クライアント側 DB 内の挿入順序 cursor。`flush --since-last` はこれを使う。サーバ側 DB では受信順の監査用途のみ |
 | `occurred_at` | TEXT | イベント発生時刻（ISO8601）。snapshot 系イベントは観測時点を入れる |
 | `received_at` | TEXT | サーバが受信した時刻。クライアント側 DB では空 |
 | `session_id` | TEXT | 対象セッション ID |
@@ -183,7 +185,7 @@ INDEX: `(session_id, coding_agent, occurred_at)`, `(event_name, occurred_at)`。
 
 | `event_name` | 性質 | 主な属性 |
 |---|---|---|
-| `agent.session.started` | one-shot | `agent_version`, `user_id`, `cwd`, `repo`, `branch`, `parent_session_id`, `started_at` |
+| `agent.session.started` | one-shot | `agent_version`, `user_id`, `cwd`, `repo`, `branch`, `transcript`, `parent_session_id`, `started_at` |
 | `agent.session.ended` | one-shot | `ended_at`, `end_reason` |
 | `agent.transcript.scanned` | snapshot（複数回 emit 可） | `tool_use_total`, `mid_session_msgs`, `ask_user_question`, `input_tokens`, `output_tokens`, `cache_write_tokens`, `cache_read_tokens`, `reasoning_tokens`, `model`, `is_ghost` |
 | `agent.pr.observed` | snapshot（複数回 emit 可） | `pr_url`, `pr_title`, `pr_state`, `is_merged`, `review_comments`, `changes_requested`, `pr_pinned` |
@@ -219,7 +221,7 @@ snapshot 系は同一セッションで複数行が events に残り、VIEW 側�
 | `review_comments` | INTEGER | PR レビューコメント数 |
 | `changes_requested` | INTEGER | CHANGES_REQUESTED レビュー回数 |
 
-`sessions` は events を `agent.session.started` を起点に集約した VIEW。`coding_agent` / `agent_version` / `user_id` / `cwd` / `repo` / `branch` / `parent_session_id` は `agent.session.started` の属性、`ended_at` / `end_reason` は同一セッションの `agent.session.ended` 属性、`pr_*` 系・`is_merged` / `review_comments` / `changes_requested` は最新（`MAX(occurred_at)`）の `agent.pr.observed` 属性から組み立てる。`is_subagent` は `parent_session_id != ''`、`backfill_checked` は `agent.pr.observed` が 1 件でもあるか / `pr_pinned` で導出する。論理的なキーは (`session_id`, `coding_agent`) で、events への JOIN で復元できる。
+`sessions` は events を `agent.session.started` を起点に集約した VIEW。`coding_agent` / `agent_version` / `user_id` / `cwd` / `repo` / `branch` / `transcript` / `parent_session_id` は `agent.session.started` の属性、`ended_at` / `end_reason` は同一セッションの `agent.session.ended` 属性、`pr_*` 系・`is_merged` / `review_comments` / `changes_requested` は最新（`MAX(occurred_at)`）の `agent.pr.observed` 属性から組み立てる。`is_subagent` は `parent_session_id != ''`、`backfill_checked` は `agent.pr.observed` が 1 件でもあるか / `pr_pinned` で導出する。論理的なキーは (`session_id`, `coding_agent`) で、events への JOIN で復元できる。
 
 ### `transcript_stats` テーブル
 
@@ -289,7 +291,7 @@ GROUP BY は (`pr_url`, `coding_agent`, `user_id`)。同一 PR が複数 agent /
 
 ### 送信するデータ — events のみ
 
-クライアントは `events` テーブルから `last_flushed_event_id` 以降の行を抽出して送る。`session-index.jsonl` の生行や transcript JSONL / rollout JSONL（会話本体）は **送らない**。`is_merged` / `pr_url` / `review_comments` 等の後追い更新は、backfill が新しい `agent.pr.observed` イベントを追記し、それが次の flush で送られることで反映される。
+クライアントは `events` テーブルから `last_flushed_sequence` より後に挿入された行を抽出して送る。`session-index.jsonl` の生行や transcript JSONL / rollout JSONL（会話本体）は **送らない**。`is_merged` / `pr_url` / `review_comments` 等の後追い更新は、backfill が新しい `agent.pr.observed` イベントを追記し、それが次の flush で送られることで反映される。
 
 ### クライアント側設定
 
@@ -312,8 +314,8 @@ token = "xxx"
 
 | フラグ | 説明 |
 |---|---|
-| `--since-last`（既定） | `state.json` の `last_flushed_event_id` 以降の events を OTLP/HTTP で送信 |
-| `--full` | `last_flushed_event_id` を無視して events 全体を送信（サーバ初期化や障害復旧で使う。冪等なので二重送信は害がない） |
+| `--since-last`（既定） | `state.json` の `last_flushed_sequence` より後に挿入された events を OTLP/HTTP で送信 |
+| `--full` | `last_flushed_sequence` を無視して events 全体を送信（サーバ初期化や障害復旧で使う。冪等なので二重送信は害がない） |
 | `--dry-run` | 送信せず対象件数とサイズだけ表示 |
 | `--agent <claude\|codex>` | agent を絞り込む。省略時は検出された全 agent |
 
@@ -325,13 +327,13 @@ token = "xxx"
 {
   "last_backfill_offset": 123,
   "last_meta_check": "...",
-  "last_flushed_event_id": "01HXYZ...."
+  "last_flushed_sequence": 12345
 }
 ```
 
-- `last_flushed_event_id` は最後に成功した flush で送り終えた events の最大 `event_id`（UUIDv7 は時系列ソート可能なため単純な閾値比較で差分が取れる）
-- 既存 state.json にこのフィールドが欠けていれば空文字列扱い（= 次の flush で全 events を送る）
-- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_event_id` より大きい `event_id` になり、次の flush で自動的に拾われる。SHA-256 hash 追跡や `pushed_session_versions` は不要
+- `last_flushed_sequence` は最後に成功した flush で送り終えた events の最大 `local_sequence`。`event_id` は冪等性キーであり、差分 cursor には使わない
+- 既存 state.json にこのフィールドが欠けていれば 0 扱い（= 次の flush で全 events を送る）
+- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_sequence` より大きい `local_sequence` を持ち、次の flush で自動的に拾われる。SHA-256 hash 追跡や `pushed_session_versions` は不要
 
 ### プロトコル — OTLP/HTTP Logs
 
@@ -376,7 +378,7 @@ Content-Encoding: gzip   (optional)
 
 - payload は **OTLP/HTTP JSON エンコード** に準拠する（OTel collector / Prometheus / Loki / Tempo などの標準ツールでそのまま受け取れることを優先）
 - `eventName` は本文書「`events` テーブル」の `event_name` と 1:1。属性も同じセマンティクス
-- `event_id` 属性はクライアントが deterministic に採番。サーバは `event_id` で `INSERT OR IGNORE`（重複は害なく排除される）
+- `event_id` 属性はクライアントが一意に採番。サーバは `event_id` で `INSERT OR IGNORE`（重複は害なく排除される）
 - HTTP gzip は **optional**。1 セッションあたり events 数〜十数件 × 1 KB 程度なので、無圧縮でも数百 KB に収まるケースが多い
 - 1 リクエストあたり最大 50 MB（保険）。events だけなので通常は超えない
 
@@ -431,7 +433,7 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 
 ### 旧 push 経路からの移行
 
-[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で deprecate。クライアント・サーバとも一度だけ `agent-telemetry migrate-to-events` / `agent-telemetry-server migrate-to-events` を実行し、既存 `sessions` 行 → `agent.session.started` + `agent.session.ended` + `agent.pr.observed`、`transcript_stats` 行 → `agent.transcript.scanned` のように擬似イベント列へ展開する（`occurred_at` は対応するカラムから推定、不明分はゼロ値）。展開後は `sessions` / `transcript_stats` が VIEW に置き換わり、移行コマンドは 1 リリース後に削除する。
+[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で deprecate。既存 binary 互換のため `agent-telemetry push` / `/v1/metrics` は 1 リリース併走し、新経路は `agent-telemetry flush` / `/v1/logs` を使う。クライアント側は `agent-telemetry migrate-to-events` で既存 session-index / transcript から events DB を再生成できる。サーバ側は `agent-telemetry-server migrate-to-events` で events schema を確定し、以降は `flush` で届く events を受ける。展開後は `sessions` / `transcript_stats` が VIEW として提供される。
 
 ### サーバ MVP の非目標
 

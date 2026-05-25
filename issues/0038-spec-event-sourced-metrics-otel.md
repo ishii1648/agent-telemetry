@@ -33,7 +33,7 @@ metrics は本来 append-only で、観測したものを時系列に並べる�
 append-only に移すと:
 
 - 後追い更新は「`agent.pr.observed` イベントを 1 行追記する」だけ。hash 追跡は不要
-- `event_id` の冪等性で重複排除が完結する（client 側で deterministic UUID を採番、server は `INSERT OR IGNORE`）
+- `event_id` の冪等性で重複排除が完結する（client 側で一意 ID を採番、server は `INSERT OR IGNORE`）
 - 観測軸の追加は新イベント名 / 新属性を増やすだけ。`events` table 自体の DDL は安定で、サーバ・クライアントのスキーマ同期要件が緩む
 - OTel SDK / Collector / Prometheus exporter / Grafana Loki / Tempo に乗れる
 - events を SoR にすれば、view の再定義だけで「同じ生データから別軸の集計」を作れる（reprocessing 可能）
@@ -53,20 +53,20 @@ append-only に移すと:
 ### 目指す形
 
 - **イベント schema**: 4 種類に集約する。「1 tool call = 1 event」のような細粒度は最初から取らず、Stop 完了時点の transcript 解析結果を **snapshot event** として 1 件出す方針にする。粒度が必要になったら追加イベント（例: `agent.tool.used`）を増やす
-  - `agent.session.started` — SessionStart hook で emit。attrs: `agent_version`, `user_id`, `cwd`, `repo`, `branch`, `parent_session_id`, `started_at`
+  - `agent.session.started` — SessionStart hook で emit。attrs: `agent_version`, `user_id`, `cwd`, `repo`, `branch`, `transcript`, `parent_session_id`, `started_at`
   - `agent.session.ended` — SessionEnd hook (Claude) または最終 Stop hook (Codex) で emit。attrs: `ended_at`, `end_reason`
   - `agent.transcript.scanned` — Stop hook 後 / `sync-db` が transcript を読み終わったタイミングで emit。attrs: `tool_use_total`, `mid_session_msgs`, `ask_user_question`, `input_tokens`, `output_tokens`, `cache_write_tokens`, `cache_read_tokens`, `reasoning_tokens`, `model`, `is_ghost`（**snapshot**: 同一セッションで複数回 emit されうる。view は latest-wins）
   - `agent.pr.observed` — Stop hook の early pin と backfill cycle で emit。attrs: `pr_url`, `pr_title`, `pr_state`, `is_merged`, `review_comments`, `changes_requested`, `pr_pinned`（**snapshot**: 同上）
 - **transport**: OTLP/HTTP `POST /v1/logs`（OTel Logs / Events）。client は OTel SDK で emit、server は OTLP Logs receiver を持つ
 - **server storage**: `events` テーブル（`event_id` PK, append-only, `INSERT OR IGNORE`）+ events から集約する `sessions` / `transcript_stats` / `pr_metrics` / `session_concurrency_*` VIEW（dashboard 互換性を維持）
 - **client storage**: ローカル `~/.claude/agent-telemetry.db` も同じ二層構造（`events` table が SoR、`sessions` / `transcript_stats` は VIEW）に揃える
-- **idempotency**: 各イベントに deterministic `event_id`（UUIDv7 from `session_id` + `event_name` + `occurred_at`、または `sha256(canonical_attrs)`）。`INSERT OR IGNORE` で重複排除
-- **flush 経路**: 既存 `agent-telemetry push --since-last` を `agent-telemetry flush` に rename。`state.json` の `last_flushed_event_id` を見て差分 emit。Stop hook の hot path に network I/O を載せない方針は維持（cron / launchd / systemd timer 起動）
+- **idempotency**: 各イベントに一意な `event_id` を付ける。サーバは `INSERT OR IGNORE` で重複排除し、migration の再実行対策は `source_row_hash` 等の別キーで担う
+- **flush 経路**: 既存 `agent-telemetry push --since-last` を `agent-telemetry flush` に rename。`state.json` の `last_flushed_sequence` を見て差分 emit。Stop hook の hot path に network I/O を載せない方針は維持（cron / launchd / systemd timer 起動）
 - **migration**: 一度限りの `agent-telemetry migrate-to-events` を提供。既存 `sessions` / `transcript_stats` 行を `agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed` の擬似イベント列に展開する。サーバ側にも同等のサブコマンドを置く
 
 ### 消えるもの（[0009] からの差分）
 
-- `pushed_session_versions` の SHA-256 hash 追跡 → `last_flushed_event_id` で代替
+- `pushed_session_versions` の SHA-256 hash 追跡 → `last_flushed_sequence` で代替
 - `schema_hash` mismatch によるサーバ受信拒否 → 新メトリクスは新属性の追加で表現できるため。`events` table 自体の DDL は安定。VIEW の再定義はサーバ・クライアントで非同期に行ってよい
 - `INSERT OR REPLACE` 起点の upsert dance → `INSERT OR IGNORE` の append-only ingest
 - `agent-telemetry push --full` の運用要請（新メトリクス追加時の遡及反映）→ events は既に保管されているので、サーバ側 VIEW を更新すれば過去分も自動で集計される
