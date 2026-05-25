@@ -226,12 +226,14 @@ ORDER BY local_sequence`, codingAgent, after)
 	var out []EventRow
 	for rows.Next() {
 		var e EventRow
-		if err := rows.Scan(&e.LocalSequence, &e.EventID, &e.OccurredAt, &e.SessionID, &e.CodingAgent, &e.EventName, &e.Attributes); err != nil {
+		var attrs string
+		if err := rows.Scan(&e.LocalSequence, &e.EventID, &e.OccurredAt, &e.SessionID, &e.CodingAgent, &e.EventName, &attrs); err != nil {
 			return nil, err
 		}
-		if len(e.Attributes) == 0 {
-			e.Attributes = json.RawMessage(`{}`)
+		if attrs == "" {
+			attrs = "{}"
 		}
+		e.Attributes = json.RawMessage(attrs)
 		out = append(out, e)
 	}
 	return out, rows.Err()
