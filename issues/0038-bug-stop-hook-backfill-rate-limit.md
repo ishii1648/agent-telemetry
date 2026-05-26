@@ -147,8 +147,21 @@ secondary rate limit は総量でなく**バースト/同時実行**で発火す
 window を絞った後（GC 第1層+第2層 / Phase 2 terminal 除外 / cap）の定常 footprint は pin 1 + Phase 1 0〜数件 + Phase 2 数件（1h スロットル）＝ 1 桁〜低 2 桁/Stop で、secondary 閾値に対して誤差。よって:
 
 - **落とす（over-engineering）**: 共有予算の token bucket / 会計、および打ち手 **c**（`gh api rate_limit` 事前 probe）。事前 probe 自体が 1 API 呼び出しで「小さく保つ」方針と矛盾気味。残すなら「踏んだ後の reactive cooldown」を最小実装する程度。
-- **残余 1 — 並列の concurrency 重複排除**: N 並列 worktree の同時 Stop は瞬間バーストが N 倍。ただし「予算管理」ではなく**安価な global single-flight / lock** の話。Phase 2 は既存の 1h State スロットルがプロセス間 dedup を概ね担うが、**Phase 1 はプロセス間スロットルが無い**のが残余。window が小さい前提なら **必須でなく保険**レベル。
+- **残余 1 — 並列の concurrency 重複排除**: N 並列 worktree の同時 Stop は瞬間バーストが N 倍。ただし「予算管理」ではなく**安価な global single-flight / lock** の話。Phase 2 は既存の 1h State スロットルがプロセス間 dedup を概ね担うが、**Phase 1 はプロセス間スロットルが無い**のが残余。rate limit 観点なら window が小さい前提で保険レベルだが、**`session-index.jsonl` の書き込み整合性の観点では必須**（下記「並行書き込み」節）。
 - **残余 2 — 移行直後の一括 drain（transient）**: 既存 backlog（再現環境 2390）は GC 適用前なので初回数 Stop が大バースト。bounded な一括 retire パスで対処する。予算管理とは別軸。
+
+### 確定: `session-index.jsonl` の並行書き込み安全性とロック方式
+
+async 方向（pin / backfill を fire-and-forget で並列化）に倒すと、新たに**ロスト更新**が顕在化する。`WriteAll`(`sessionindex.go:96`) は tmp+`os.Rename` で**アトミックだがロック（flock）が無い**。アトミック rename は「壊れたファイル」は防ぐが**ロスト更新は防がない**: プロセス 1 が ReadAll → 2 が ReadAll → 1 が WriteAll → 2 が WriteAll で 1 の変更が消える。同期 Stop では暗黙に直列化されていたものが、並列化で表面化する。
+
+ただし**ファイル全体を素朴にロックすると並列実行待ちが出る**。これを避けるロック方式を採る:
+
+- **① ロックは「書き込み」だけ。gh は絶対にロック外**: gh で取得した結果をメモリに溜め、最後にロックを取って書く。ロック保持は数 ms（秒オーダーの gh とは無関係）。
+- **② backfill の重い書き換えは try-lock = 取れなければ待たず skip**（blocking-wait ではない）。skip された候補は state に残り次の保持者が処理する。これで**並列実行待ちが発生しない**（「lock して待つ」ではなく「lock して譲る」）。
+- **③ item ごと書き換えを廃止し 1 run = 1 回の WriteAll にバッチ**: 現状 `runURLBackfill` は結果 1 件ごとに `Update`＋`UpdatePRMeta`（各々フル ReadAll+WriteAll）を呼ぶ（`backfill.go:230,236`）。全変更をメモリ集約し最後に 1 回書く。ロック保持窓を「件数回」→「1 回」に縮める（ロックと無関係に効く改善）。
+- **④ SessionStart の append も同じ flock を µs だけ共有**: `O_APPEND` は原子的だが、rewrite の ReadAll→WriteAll 中に append が挟まると上書きで消える。同一 flock を取れば整合し、待ちは「進行中 rewrite 1 回（数 ms）」が最大。
+
+結論: flock は使うが **try-lock-skip ＋ スコープを書き込みに限定 ＋ バッチ化 ＋ append も共有 flock**。これで待ちは「数 ms 級の書き込み 1 回ぶん」に収まり、各自が払う gh レイテンシ（秒）に対して誤差。index-record GC で N を bound すれば O(N) 書き込み自体も小さく保てる。
 
 ## 受け入れ条件
 
@@ -166,6 +179,7 @@ window を絞った後（GC 第1層+第2層 / Phase 2 terminal 除外 / cap）�
 - [ ] **Stop hook の同期パスが `gh` を 1 回も呼ばない**（pin 含む全 gh は async/detached 側。同期部分はローカル書き込みのみ）
 - [ ] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
 - [ ] 非同期化する場合、backfill の多重起動が防がれている（single-flight 等で並行バーストを誘発しない）
+- [ ] 並列 backfill / append が `session-index.jsonl` のロスト更新を起こさない（flock 共有）。かつ flock は try-lock-skip ＋ 書き込みスコープ限定 ＋ 1 run 1 WriteAll で、並列実行待ちを生まない
 
 共通:
 - [ ] Phase 2 (経路 4) の事後 refresh 経路が維持され、PR がマージ後に `is_merged = 1` へ更新される（`pr_metrics` 母集団＝ `agent_pr_*` / `agent_session_pr_*` が空にならない）。頻度・件数の制御は可だが経路自体は残す
