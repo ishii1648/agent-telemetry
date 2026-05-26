@@ -2,4 +2,4 @@
 
 package schema
 
-const Hash = "ef5b34c7b28bfd4818b96db8f5f999ec0adf19e10011dc805c5b250120f529c2"
+const Hash = "0b49d22244d79f7233424cf1a80e1ed3e5dd9a0198bbc6dbb09d20a34466c229"

@@ -599,3 +599,75 @@ func TestShortenPRURL(t *testing.T) {
 		}
 	}
 }
+
+// TestRunWithPaths_DeterministicEventID guards the append-only events store
+// against unbounded growth: the INSTEAD OF INSERT triggers derive event_id
+// deterministically from content (at_event_id) and INSERT OR IGNORE, so
+// re-running sync-db over unchanged source data must NOT append duplicate
+// events. When content actually changes (is_merged flips), exactly one new
+// snapshot row must appear and the view must reflect the latest value.
+func TestRunWithPaths_DeterministicEventID(t *testing.T) {
+	dir := t.TempDir()
+	tPath := filepath.Join(dir, "t.jsonl")
+	os.WriteFile(tPath, []byte(
+		`{"type":"user","message":{"content":"hi"}}`+"\n"+
+			`{"type":"assistant","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","name":"Read"}]}}`+"\n",
+	), 0644)
+
+	indexPath := filepath.Join(dir, "session-index.jsonl")
+	row := func(merged bool) string {
+		m := "false"
+		if merged {
+			m = "true"
+		}
+		return `{"timestamp":"2026-03-01 10:00:00","ended_at":"2026-03-01 12:00:00","session_id":"s1","cwd":"/tmp","repo":"user/repo","branch":"feat/x","pr_urls":["https://github.com/user/repo/pull/1"],"transcript":"` + tPath + `","parent_session_id":"","backfill_checked":true,"is_merged":` + m + `}` + "\n"
+	}
+	os.WriteFile(indexPath, []byte(row(false)), 0644)
+
+	dbPath := filepath.Join(dir, "agent-telemetry.db")
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	countEvents := func() int {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM events").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	first := countEvents()
+	if first == 0 {
+		t.Fatalf("expected events after first sync, got 0")
+	}
+
+	// Re-running over identical source data must not append any new events.
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := countEvents(); got != first {
+		t.Errorf("events grew on no-op re-sync: got %d, want %d (deterministic event_id should dedup)", got, first)
+	}
+
+	// Flipping is_merged is a genuine content change: exactly one new
+	// agent.pr.observed snapshot should be appended, and the view latest-wins.
+	os.WriteFile(indexPath, []byte(row(true)), 0644)
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := countEvents(); got != first+1 {
+		t.Errorf("content change should append exactly one event: got %d, want %d", got, first+1)
+	}
+	var isMerged int
+	db.QueryRow("SELECT is_merged FROM sessions WHERE session_id='s1'").Scan(&isMerged)
+	if isMerged != 1 {
+		t.Errorf("view should reflect latest is_merged: got %d, want 1", isMerged)
+	}
+}

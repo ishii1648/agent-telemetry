@@ -65,7 +65,9 @@ agent-telemetry update <session_id> <url>...              session-index.jsonl �
 agent-telemetry update --mark-checked <session_id>...     backfill_checked フラグをセット
 agent-telemetry update --by-branch <repo> <branch> <url>  同一 repo+branch の全セッションに URL を追加
 agent-telemetry hook <event> [--agent <claude|codex>]     hook サブコマンド（settings.json / config.toml から呼ばれる、既定 claude）
-agent-telemetry push [--since-last|--full] [--dry-run]    サーバへ sessions / transcript_stats の集計行を送信（要 [server] 設定）
+agent-telemetry push [--since-last|--full] [--dry-run]    既存実装: サーバへ sessions / transcript_stats の集計行を送信（要 [server] 設定、deprecated）
+agent-telemetry flush [--since-last|--full] [--dry-run]   未送信のイベントをサーバへ OTLP/HTTP で flush（要 [server] 設定）
+agent-telemetry migrate-to-events                         既存 session-index / transcript から events DB を再生成（旧 push 経路からの移行用）
 agent-telemetry version                                   version を表示
 ```
 
@@ -158,7 +160,41 @@ user = "ishii1492@gmail.com"
 
 ## SQLite データモデル
 
-`sync-db` は実行ごとに `sessions` / `transcript_stats` を `INSERT OR REPLACE` で upsert する。スキーマ DDL は埋め込みハッシュと DB 内 `schema_meta` テーブルのハッシュを比較し、不一致時のみフル再構築する（実装詳細は `docs/design.md`）。明示的なマイグレーションコマンドは持たない。
+データは **append-only な `events` テーブル** を SoR とし、`sessions` / `transcript_stats` / `pr_metrics` / `session_concurrency_*` は events を集約した **derived VIEW** として組み立てる。Stop / SessionEnd / backfill の各 hook は対応するイベントを **追記** するだけで、過去の events 行は mutation しない。`is_merged` のような後追い更新は `agent.pr.observed` イベントの追加で表現し、VIEW 側で `MAX(occurred_at)` を取って latest-wins を解決する。
+
+`sync-db` はクライアント側の transcript パース結果を `agent.transcript.scanned` イベントとして events に書き込み、必要に応じて VIEW を再定義する。`schema.sql` は events テーブル DDL と VIEW 定義を埋め込み、SHA256 ハッシュを `schema_meta` と比較して不一致時のみフル再構築する（実装詳細は `docs/design.md`）。明示的なマイグレーションコマンドは持たない（events への一回限りの初期投入だけ `agent-telemetry migrate-to-events` で行う）。
+
+### `events` テーブル
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `event_id` | TEXT | UNIQUE。イベント内容から deterministic に導出する content hash（`sha256(event_name ‖ coding_agent ‖ session_id ‖ attributes)`）。冪等性の衝突キーであり、flush 差分検知の cursor には使わない。**同一内容の再導出は同じ `event_id`** になるため `INSERT OR IGNORE` で dedup され、`sync-db` 反復でも events が増殖しない。内容が変われば別 hash → 新 snapshot row（詳細は `docs/design.md`） |
+| `local_sequence` | INTEGER | PRIMARY KEY AUTOINCREMENT。クライアント側 DB 内の挿入順序 cursor。`flush --since-last` はこれを使う。サーバ側 DB では受信順の監査用途のみ |
+| `occurred_at` | TEXT | イベント発生時刻（ISO8601）。snapshot 系イベントは観測時点を入れる |
+| `received_at` | TEXT | サーバが受信した時刻。クライアント側 DB では空 |
+| `session_id` | TEXT | 対象セッション ID |
+| `coding_agent` | TEXT | `claude` または `codex` |
+| `event_name` | TEXT | `agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed`（拡張時はここに追加） |
+| `attributes` | TEXT | JSON。各イベント名ごとの属性を flat に格納（後述「イベント名と属性」） |
+
+INDEX: `(session_id, coding_agent, event_name, occurred_at, local_sequence)`, `(event_name, occurred_at)`。
+
+書き込みは常に `INSERT OR IGNORE`。`event_id` が deterministic content hash のため、同一内容の再導出・再着信・再送はすべて同じ `event_id` に潰れて重複しない。
+
+#### イベント名と属性
+
+| `event_name` | 性質 | 主な属性 |
+|---|---|---|
+| `agent.session.started` | one-shot | `agent_version`, `user_id`, `cwd`, `repo`, `branch`, `transcript`, `parent_session_id`, `started_at` |
+| `agent.session.ended` | one-shot | `ended_at`, `end_reason` |
+| `agent.transcript.scanned` | snapshot（複数回 emit 可） | `tool_use_total`, `mid_session_msgs`, `ask_user_question`, `input_tokens`, `output_tokens`, `cache_write_tokens`, `cache_read_tokens`, `reasoning_tokens`, `model`, `is_ghost` |
+| `agent.pr.observed` | snapshot（複数回 emit 可） | `pr_url`, `pr_title`, `pr_state`, `is_merged`, `review_comments`, `changes_requested`, `pr_pinned` |
+
+snapshot 系は同一セッションで複数行が events に残り、VIEW 側で `occurred_at` 最大の 1 行を採用する。新メトリクスを増やす場合は対応する属性を増やすか、新イベント名を追加するだけでよく、events テーブル自体の DDL 変更は不要。
+
+#### 派生 VIEW としての `sessions` / `transcript_stats`
+
+以下の「`sessions` テーブル」「`transcript_stats` テーブル」のカラム定義は **VIEW の出力スキーマ** を指す。dashboard JSON / SQL クエリから見える形は append-only 移行前と同じだが、実体は events からの集約クエリ（`agent.session.started` の値 ← `agent.session.ended` の値 ← 最新 `agent.transcript.scanned` ← 最新 `agent.pr.observed`）。
 
 ### `sessions` テーブル
 
@@ -185,7 +221,7 @@ user = "ishii1492@gmail.com"
 | `review_comments` | INTEGER | PR レビューコメント数 |
 | `changes_requested` | INTEGER | CHANGES_REQUESTED レビュー回数 |
 
-PRIMARY KEY は (`session_id`, `coding_agent`) の複合キー。両 agent の UUID が万一衝突しても安全に区別できる。
+`sessions` は events を `agent.session.started` を起点に集約した VIEW。`coding_agent` / `agent_version` / `user_id` / `cwd` / `repo` / `branch` / `transcript` / `parent_session_id` は `agent.session.started` の属性、`ended_at` / `end_reason` は同一セッションの `agent.session.ended` 属性、`pr_*` 系・`is_merged` / `review_comments` / `changes_requested` は最新（`MAX(occurred_at)`）の `agent.pr.observed` 属性から組み立てる。`is_subagent` は `parent_session_id != ''`、`backfill_checked` は `agent.pr.observed` が 1 件でもあるか / `pr_pinned` で導出する。論理的なキーは (`session_id`, `coding_agent`) で、events への JOIN で復元できる。
 
 ### `transcript_stats` テーブル
 
@@ -204,7 +240,7 @@ PRIMARY KEY は (`session_id`, `coding_agent`) の複合キー。両 agent の U
 | `model` | TEXT | セッション内で最後に観測した model |
 | `is_ghost` | INTEGER | ユーザー発話相当のエントリが 0 件なら 1 |
 
-PRIMARY KEY は (`session_id`, `coding_agent`)。
+`transcript_stats` は最新（`MAX(occurred_at)`）の `agent.transcript.scanned` イベントから組み立てる VIEW。論理的なキーは (`session_id`, `coding_agent`)。snapshot 系イベントとして events に積まれるため、`sync-db --recheck` 等でクライアントが再パースして新しい snapshot を emit すると VIEW の値が自動で更新される（過去 snapshot は events に残り、replay 可能）。
 
 トークンの収集元:
 
@@ -251,11 +287,11 @@ GROUP BY は (`pr_url`, `coding_agent`, `user_id`)。同一 PR が複数 agent /
 
 サーバ送信は **オプトイン** 機能。`~/.config/agent-telemetry/config.toml` の `[server]` セクションが設定された場合のみ有効になる。設定なしのローカル単独利用は従来通り動作する（旧パス `~/.claude/agent-telemetry.toml` も fallback として読まれる）。
 
-実装方針・差分検知・配布形態の詳細は `docs/design.md ## サーバ側集約パイプライン` を参照する。本節はクライアント・サーバの外部契約のみ記述する。
+転送モデルは **append-only イベント列の OTLP/HTTP flush**。クライアントはローカル `events` テーブルから未送信行を抽出し、OTel Logs 形式でサーバへ送る。サーバは受信した events を冪等に追記し、`sessions` / `transcript_stats` / `pr_metrics` などは VIEW として組み立てる。実装方針・差分検知・配布形態の詳細は `docs/design.md ## サーバ側集約パイプライン` を参照。本節はクライアント・サーバの外部契約のみ記述する。
 
-### 送信するデータ — 集計値のみ
+### 送信するデータ — events のみ
 
-クライアントは `sync-db` 完了後の **集計値**（`sessions` 行 + `transcript_stats` 行）をサーバへ送る。`session-index.jsonl` の生行や transcript JSONL（会話本体）は **送らない**。理由と却下した代替は `docs/design.md ## サーバ側集約パイプライン` を参照。
+クライアントは `events` テーブルから `last_flushed_sequence` より後に挿入された行を抽出して送る。`session-index.jsonl` の生行や transcript JSONL / rollout JSONL（会話本体）は **送らない**。`is_merged` / `pr_url` / `review_comments` 等の後追い更新は、backfill が新しい `agent.pr.observed` イベントを追記し、それが次の flush で送られることで反映される。
 
 ### クライアント側設定
 
@@ -269,21 +305,21 @@ token = "xxx"
 
 | キー | 型 | 説明 |
 |---|---|---|
-| `endpoint` | string | サーバの base URL（パスは含めない、例 `https://telemetry.example.com`） |
+| `endpoint` | string | サーバの base URL（パスは含めない、例 `https://telemetry.example.com`）。クライアントは内部で `/v1/logs` を補完する |
 | `token` | string | Bearer 認証用 API key。サーバ起動時の `AGENT_TELEMETRY_SERVER_TOKEN` と一致させる |
 
-`[server]` セクションが欠落 / `endpoint` または `token` が空の場合、`agent-telemetry push` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。
+`[server]` セクションが欠落 / `endpoint` または `token` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。
 
-### `agent-telemetry push` のフラグ
+### `agent-telemetry flush` のフラグ
 
 | フラグ | 説明 |
 |---|---|
-| `--since-last`（既定） | `state.json` の `pushed_session_versions` を参照して差分のみ送信 |
-| `--full` | `pushed_session_versions` を無視してフルスキャン（新メトリクス追加後の遡及送信などに使う） |
+| `--since-last`（既定） | `state.json` の `last_flushed_sequence` より後に挿入された events を OTLP/HTTP で送信 |
+| `--full` | `last_flushed_sequence` を無視して events 全体を送信（サーバ初期化や障害復旧で使う。冪等なので二重送信は害がない） |
 | `--dry-run` | 送信せず対象件数とサイズだけ表示 |
 | `--agent <claude\|codex>` | agent を絞り込む。省略時は検出された全 agent |
 
-進行中セッション（`ended_at` または `end_reason` が空）は送信対象から **常に除外** する。最後の Stop 発火後にのみ push される。
+進行中セッション（`agent.session.ended` が未着）の events も送る。サーバ側 VIEW が「`session.ended` が無いセッションは `ended_at = NULL`」として表現するため、進行中の状態もダッシュボードに反映できる（旧設計と異なり、Stop 完了を待つ必要がない）。
 
 ### `agent-telemetry-state.json` への追加フィールド
 
@@ -291,52 +327,81 @@ token = "xxx"
 {
   "last_backfill_offset": 123,
   "last_meta_check": "...",
-  "pushed_session_versions": {
-    "<coding_agent>:<session_id>": "<sha256 hash>"
-  }
+  "last_flushed_sequence": 12345
 }
 ```
 
-- キーは **`<coding_agent>:<session_id>` 形式の文字列**（例: `"claude:abc-123"` / `"codex:def-456"`）。`sessions` / `transcript_stats` の PRIMARY KEY が複合キー `(session_id, coding_agent)` のため、session_id だけでキーにすると Claude / Codex 間で UUID 衝突した際に hash が上書きされ、片方の更新が誤って skip / resend される問題を避ける
-- `pushed_session_versions` の値は集計値ペイロード（`sessions` 行 + 該当 `transcript_stats` 行）の SHA-256 hash
-- backfill による後追い更新（`is_merged` / `pr_url` / `review_comments` / `pr_title` の変化）で `sessions` 行が変わると hash が一致しなくなり、再送信される
-- 既存 state.json にこのフィールドが欠けていても扱える（欠落時は空マップ扱い）
+- `last_flushed_sequence` は最後に成功した flush で送り終えた events の最大 `local_sequence`。`event_id` は冪等性キーであり、差分 cursor には使わない
+- 既存 state.json にこのフィールドが欠けていれば 0 扱い（= 次の flush で全 events を送る）
+- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_sequence` より大きい `local_sequence` を持ち、次の flush で自動的に拾われる。SHA-256 hash 追跡や `pushed_session_versions` は不要
 
-### プロトコル
+### プロトコル — OTLP/HTTP Logs
 
 ```
-POST /v1/metrics
+POST /v1/logs
 Authorization: Bearer <api_key>
 Content-Type: application/json
 Content-Encoding: gzip   (optional)
 
 {
-  "client_version": "x.y.z",
-  "schema_hash": "<sync-db スキーマ SHA-256>",
-  "sessions": [
-    { "session_id": "...", "coding_agent": "...", "agent_version": "...", "user_id": "...", ... }
-  ],
-  "transcript_stats": [
-    { "session_id": "...", "coding_agent": "...", "tool_use_total": 12, "input_tokens": 4000, ... }
-  ]
+  "resourceLogs": [{
+    "resource": {
+      "attributes": [
+        {"key": "service.name",       "value": {"stringValue": "agent-telemetry"}},
+        {"key": "service.version",    "value": {"stringValue": "x.y.z"}}
+      ]
+    },
+    "scopeLogs": [{
+      "scope": {"name": "agent-telemetry/client"},
+      "logRecords": [
+        {
+          "timeUnixNano": "1715600000000000000",
+          "observedTimeUnixNano": "1715600000000000000",
+          "severityNumber": 9,
+          "eventName": "agent.session.started",
+          "attributes": [
+            {"key": "event_id",     "value": {"stringValue": "01HXYZ..."}},
+            {"key": "session_id",   "value": {"stringValue": "..."}},
+            {"key": "coding_agent", "value": {"stringValue": "claude"}},
+            {"key": "user_id",      "value": {"stringValue": "..."}},
+            {"key": "repo",         "value": {"stringValue": "org/repo"}},
+            ...
+          ]
+        },
+        { "eventName": "agent.transcript.scanned", ... },
+        { "eventName": "agent.pr.observed", ... }
+      ]
+    }]
+  }]
 }
 ```
 
-`sessions` / `transcript_stats` の各行はクライアント `~/.claude/agent-telemetry.db` の同名テーブルから抽出した値で、本文書「SQLite データモデル」のカラム定義と一致する。
+- payload は **OTLP/HTTP JSON エンコード** に準拠する（OTel collector / Prometheus / Loki / Tempo などの標準ツールでそのまま受け取れることを優先）
+- `eventName` は本文書「`events` テーブル」の `event_name` と 1:1。属性も同じセマンティクス
+- `event_id` 属性はクライアントが一意に採番。サーバは `event_id` で `INSERT OR IGNORE`（重複は害なく排除される）
+- HTTP gzip は **optional**。1 セッションあたり events 数〜十数件 × 1 KB 程度なので、無圧縮でも数百 KB に収まるケースが多い
+- 1 リクエストあたり最大 50 MB（保険）。events だけなので通常は超えない
 
 レスポンス:
 
 ```json
 {
-  "received_sessions": 12,
-  "skipped_sessions": 0,
-  "schema_mismatch": false
+  "partialSuccess": {
+    "rejectedLogRecords": 0,
+    "errorMessage": ""
+  }
 }
 ```
 
-- `schema_hash` がサーバの DB スキーマと一致しない場合、サーバは `schema_mismatch: true` を返し受信を拒否する。クライアント / サーバ binary のバージョンを揃える必要があることをユーザに通知する
-- HTTP gzip は **optional**。集計値だけなので 1 リクエスト数 KB〜数百 KB で済むケースが多く、無圧縮でも問題ない。クライアントは payload size を見て gzip 適用を判断する
-- 1 リクエストあたり最大 50 MB（保険）。集計値だけなので通常は超えない
+OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う。クライアントの cursor 前進は **transport の成否** で判断し、partial success では再送しない（OTLP 仕様で partial success は「サーバが永続的に拒否した不正レコード」を表し、クライアントは retry しない前提）。
+
+| サーバ応答 | 意味 | クライアント挙動 |
+|---|---|---|
+| HTTP 2xx + `rejectedLogRecords == 0` | 全件受理 | `last_flushed_sequence` を送信した最大 `local_sequence` に進める |
+| HTTP 2xx + `rejectedLogRecords > 0` | 一部レコードが **永続的に拒否**（`event_id` / `session_id` / `coding_agent` / `event_name` 欠落などの validation 失敗） | サーバが `rejected.log` に記録済み。クライアントは `last_flushed_sequence` を **進め**（同じ不正データを再送しても通らず無限ループになるため retry しない）、`errorMessage` と件数を warning として stderr に出す |
+| ネットワークエラー / 非2xx（5xx / 429 / 401 等） | 配送自体が失敗 | バッチ全体を失敗扱いにし `last_flushed_sequence` を **進めない**。次回 flush で同じ範囲を再送。受理済み events は `INSERT OR IGNORE` で無害にスキップされる |
+
+`rejectedLogRecords` は reject **件数**しか返さず、どの record が拒否されたかは示さない。永続拒否は同一データの再送で解消しないため、cursor を据え置く設計は無限ループになる。よって永続拒否はサーバ側 `rejected.log` への記録に委ね、クライアントは前進する。スキーマ不一致での全拒否は廃止（events table の DDL は安定で、新メトリクスは新属性で追加可能なため）。
 
 ### サーバ binary
 
@@ -357,28 +422,33 @@ agent-telemetry-server [--data-dir <path>] [--listen <addr>]
 
 | ファイル | 形式 | 役割 |
 |---|---|---|
-| `<data_dir>/agent-telemetry.db` | SQLite | 全 user 集約 DB。`sessions` / `transcript_stats` テーブル + 派生 VIEW（`pr_metrics` 等）を本文書のスキーマで保持。受信のたびに `INSERT OR REPLACE` |
-| `<data_dir>/collisions.log` | テキスト | session_id 衝突検出ログ |
+| `<data_dir>/agent-telemetry.db` | SQLite | 全 user 集約 DB。`events` テーブル（SoR、`INSERT OR IGNORE`）+ 派生 VIEW（`sessions` / `transcript_stats` / `pr_metrics` / `session_concurrency_*`）を本文書のスキーマで保持 |
+| `<data_dir>/rejected.log` | テキスト | 不正な payload / 認証失敗のログ |
 
-サーバはクライアントから受信した値をそのまま upsert するだけで、集計や transcript 解釈は行わない。`internal/syncdb/` の集計ロジックはサーバ側では使わない（schema DDL だけ共通化する）。
+サーバはクライアントから受信した events を `event_id` で冪等に追記するだけで、transcript 解釈や集計は行わない。VIEW の中身（`sessions` 等を events からどう組み立てるか）はサーバとクライアントで共有する（`internal/syncdb/schema/schema.sql`）。
 
-サーバの SQLite は Grafana datasource として読み込まれる。datasource の `uid: agent-telemetry` を踏襲し、ローカル Grafana のダッシュボード JSON をそのまま再利用する。
+サーバの SQLite は Grafana datasource として読み込まれる。datasource の `uid: agent-telemetry` を踏襲し、ローカル Grafana のダッシュボード JSON をそのまま再利用する。VIEW の出力スキーマは旧設計と同じなので、ダッシュボード JSON 側の SQL は無変更で動く。
 
-### スキーマバージョン整合性と新メトリクス追加
+### 新メトリクス追加と遡及反映
 
-クライアントとサーバで `sync-db` のスキーマハッシュ（`internal/syncdb/schema_hash.go`）が一致している必要がある。新メトリクスを追加した場合の遡及反映手順:
+events は **events table の DDL を変えずに新属性 / 新イベント名を増やせる** ため、旧設計の「サーバ先行デプロイ → 全クライアント binary 更新 → `push --full`」運用は不要。流れ:
 
-1. サーバ binary を新スキーマでデプロイ（DDL 自動再構築）
-2. 全クライアント binary を新バージョンに更新
-3. 各クライアントで `agent-telemetry sync-db --recheck && agent-telemetry push --full` を実行（過去全セッションを新スキーマで再集計し再送信）
+1. 新属性 / 新イベントを emit するクライアントを順次配布（旧クライアントは無変更でも events を送り続ける）
+2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）
+3. 既存 events に対しては「未来の新イベントは存在しない」が、`agent.transcript.scanned` のような snapshot 系を再 emit すれば過去にも遡及で新属性が乗る
 
-クライアントが古いまま push すると、サーバが `schema_mismatch: true` を返して受信拒否する。
+`schema_hash` mismatch によるサーバ受信拒否は廃止。events table の DDL に互換破壊変更が入る場合のみ、新 endpoint（例: `/v2/logs`）を切る運用とする。
+
+### 旧 push 経路からの移行
+
+[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で deprecate。既存 binary 互換のため `agent-telemetry push` / `/v1/metrics` は 1 リリース併走し、新経路は `agent-telemetry flush` / `/v1/logs` を使う。クライアント側は `agent-telemetry migrate-to-events` で既存 session-index / transcript から events DB を再生成できる。サーバ側は `agent-telemetry-server migrate-to-events` で events schema を確定し、以降は `flush` で届く events を受ける。展開後は `sessions` / `transcript_stats` が VIEW として提供される。
 
 ### サーバ MVP の非目標
 
 - user 別の read/write 権限分離（RLS / OIDC）— 信頼境界 = チーム内を前提
-- transcript 本体のサーバ保管 — 集計値のみ送る方針なのでそもそも保管しない。会話ログを共有したいケースは別ツールで対応
+- transcript 本体のサーバ保管 — events のみを送る方針なのでそもそも保管しない。会話ログを共有したいケースは別ツールで対応
 - write API 以外の提供（read API・専用 UI）— Grafana から直接 SQLite を読む構成
+- OTel Metrics / Traces signal の受信 — Logs（events）のみで完結する。tool 使用などを Counter 化したい場合は後追いで `/v1/metrics` を追加する
 
 ---
 

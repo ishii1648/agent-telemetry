@@ -33,6 +33,9 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "migrate-to-events" {
+		return runMigrate(args[1:])
+	}
 	fs := flag.NewFlagSet("agent-telemetry-server", flag.ContinueOnError)
 	dataDir := fs.String("data-dir", "/var/lib/agent-telemetry", "directory holding agent-telemetry.db and collisions.log")
 	listen := fs.String("listen", ":8443", "HTTP listen address")
@@ -97,4 +100,23 @@ func run(args []string) error {
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+func runMigrate(args []string) error {
+	fs := flag.NewFlagSet("agent-telemetry-server migrate-to-events", flag.ContinueOnError)
+	dataDir := fs.String("data-dir", "/var/lib/agent-telemetry", "directory holding agent-telemetry.db")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	dbPath := filepath.Join(*dataDir, "agent-telemetry.db")
+	db, err := serverpipe.OpenDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+	log.Printf("migrate-to-events: ensured events schema at %s", dbPath)
+	return nil
 }
