@@ -3,7 +3,7 @@ decision_type: design
 affected_paths:
   - internal/backfill/backfill.go
   - internal/hook/stop.go
-  - cmd/agent-telemetry/hook.go
+  - cmd/agent-telemetry/main.go
 tags: [backfill, hooks, stop-hook-cost, rate-limit]
 ---
 
