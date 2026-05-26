@@ -23,7 +23,7 @@ Created: 2026-05-26
 ここから、同じ根（**高頻度イベントである Stop hook で gh をブロッキング実行している**）に由来する 2 つの症状が出ている。本 issue は両方をまとめて解く。
 
 - **問題 1 — GitHub rate limit**: 未チェックセッションが溜まっていると Stop ごとに大量の gh 呼び出しがバーストし、GitHub secondary rate limit を頻繁にヒットする。
-- **問題 2 — 応答ブロッキング**: `stop.go` は `exec.Command(...).CombinedOutput()` で backfill / sync-db の完了を待つ。Stop はユーザ応答サイクル上のブロッキングフックなので、gh 呼び出し（pin の `gh pr view` 8s timeout + backfill バッチ）が遅いとき、その間ユーザが次の入力に進めず待たされる。
+- **問題 2 — 応答ブロッキング**: `stop.go` は `exec.Command(...).CombinedOutput()` で backfill / sync-db の完了を待つ。Stop はユーザ応答サイクル上のブロッキングフックなので、gh 呼び出し（pin の `gh pr list` 8s timeout + backfill バッチ）が遅いとき、その間ユーザが次の入力に進めず待たされる。
 
 ## 根拠
 
@@ -31,7 +31,7 @@ Created: 2026-05-26
 
 - `session-index.jsonl` の総セッション数: 3632
 - うち `backfill_checked != true` & `pr_urls` 未設定: 2390
-- → Stop イベントごとに最大 2390 件分の `gh pr view` が候補になり得る
+- → Stop イベントごとに最大 2390 セッション由来の `(repo, branch)` group に対して `gh pr list` が候補になり得る
 
 ### 影響
 
@@ -130,7 +130,7 @@ Stop hook（毎ターン、同期部分は数 ms で return）
         ├─ global single-flight を try-lock → 取れなければ即 exit（待たず譲る）
         ├─ gh 群（ロック外）: pin(現セッション) + Phase1(late URL) + Phase2(open PR meta)
         │    → 結果をメモリ集約。cap / GC 第1層第2層 / Phase2 throttle をここで適用
-        ├─ per-file flock → 集約変更を 1 回の WriteAll でバッチ適用 → 解放
+        ├─ per-file flock → 最新 index を re-read → 集約差分を merge/apply → 1 回の WriteAll → 解放
         ├─ sync-db（ローカル、no gh。ここも worker 側）
         └─ global lock 解放（flock はプロセス死で自動解放＝stale lock 無し）
 ```
@@ -140,6 +140,7 @@ Stop hook（毎ターン、同期部分は数 ms で return）
 - **pin は worker 内に吸収**（pin と Phase1 はほぼ同じ `gh pr list`）。同期パスから gh が完全に消える。
 - **sync-db も worker 末尾へ**（問題 2 の sync-db 同期コストも解消）。
 - **Claude の worker トリガは Stop のみ**（Codex と対称・実装共通化）。SessionEnd は `ended_at` 書き込みのみに留め、worker トリガには使わない。最終状態の確定は最後の Stop に委ねる。
+- **single-flight は同時実行制御であり、頻度制御ではない**。Stop が連続した場合に毎回 worker が走り続けないよう、worker 側で短い cooldown を持つ。cooldown skip でも Stop 同期パスは spawn 後に待たない。
 
 2 つのロック（スコープが異なる。混同しない）:
 
@@ -185,7 +186,7 @@ cap 実装時の付帯事項（starvation 回避）:
 
 secondary rate limit は総量でなく**バースト/同時実行**で発火する。対策の本質は「自分の gh 発行を小さく保つ」ことであり、他消費者（statusline / ユーザの対話的 gh / 別 agent）の**予算を会計することではない**。
 
-window を絞った後（GC 第1層+第2層 / Phase 2 terminal 除外 / cap）の定常 footprint は pin 1 + Phase 1 0〜数件 + Phase 2 数件（1h スロットル）＝ 1 桁〜低 2 桁/Stop で、secondary 閾値に対して誤差。よって:
+window を絞った後（GC 第1層+第2層 / Phase 2 terminal 除外 / cap / worker cooldown）の定常 footprint は pin 1 + Phase 1 0〜数件 + Phase 2 数件（1h スロットル）＝ 1 桁〜低 2 桁/worker run で、secondary 閾値に対して誤差。Stop が高頻度に連続しても cooldown と single-flight により worker run 自体も間引く。よって:
 
 - **落とす（over-engineering）**: 共有予算の token bucket / 会計、および打ち手 **c**（`gh api rate_limit` 事前 probe）。事前 probe 自体が 1 API 呼び出しで「小さく保つ」方針と矛盾気味。残すなら「踏んだ後の reactive cooldown」を最小実装する程度。
 - **残余 1 — 並列の concurrency 重複排除**: N 並列 worktree の同時 Stop は瞬間バーストが N 倍。ただし「予算管理」ではなく**安価な global single-flight / lock** の話。Phase 2 は既存の 1h State スロットルがプロセス間 dedup を概ね担うが、**Phase 1 はプロセス間スロットルが無い**のが残余。rate limit 観点なら window が小さい前提で保険レベルだが、**`session-index.jsonl` の書き込み整合性の観点では必須**（下記「並行書き込み」節）。
@@ -197,18 +198,18 @@ async 方向（pin / backfill を fire-and-forget で並列化）に倒すと、
 
 ただし**ファイル全体を素朴にロックすると並列実行待ちが出る**。これを避けるロック方式を採る:
 
-- **① ロックは「書き込み」だけ。gh は絶対にロック外**: gh で取得した結果をメモリに溜め、最後にロックを取って書く。ロック保持は数 ms（秒オーダーの gh とは無関係）。
+- **① ロックは「書き込み」だけ。gh は絶対にロック外**: gh で取得した結果をメモリに溜め、最後にロックを取る。ロック内では必ず最新 index を re-read し、メモリ上の取得結果を差分として merge/apply してから 1 回だけ `WriteAll` する。ロック保持は数 ms（秒オーダーの gh とは無関係）。
 - **② backfill の重い書き換えは try-lock = 取れなければ待たず skip**（blocking-wait ではない）。skip された候補は state に残り次の保持者が処理する。これで**並列実行待ちが発生しない**（「lock して待つ」ではなく「lock して譲る」）。
-- **③ item ごと書き換えを廃止し 1 run = 1 回の WriteAll にバッチ**: 現状 `runURLBackfill` は結果 1 件ごとに `Update`＋`UpdatePRMeta`（各々フル ReadAll+WriteAll）を呼ぶ（`backfill.go:230,236`）。全変更をメモリ集約し最後に 1 回書く。ロック保持窓を「件数回」→「1 回」に縮める（ロックと無関係に効く改善）。
+- **③ item ごと書き換えを廃止し 1 run = 1 回の WriteAll にバッチ**: 現状 `runURLBackfill` は結果 1 件ごとに `Update`＋`UpdatePRMeta`（各々フル ReadAll+WriteAll）を呼ぶ（`backfill.go:230,236`）。全変更をメモリ集約し最後に最新 index へ差分適用する。ロック保持窓を「件数回」→「1 回」に縮める（ロックと無関係に効く改善）。
 - **④ SessionStart の append も同じ flock を µs だけ共有**: `O_APPEND` は原子的だが、rewrite の ReadAll→WriteAll 中に append が挟まると上書きで消える。同一 flock を取れば整合し、待ちは「進行中 rewrite 1 回（数 ms）」が最大。
 
-結論: flock は使うが **try-lock-skip ＋ スコープを書き込みに限定 ＋ バッチ化 ＋ append も共有 flock**。これで待ちは「数 ms 級の書き込み 1 回ぶん」に収まり、各自が払う gh レイテンシ（秒）に対して誤差。index-record GC で N を bound すれば O(N) 書き込み自体も小さく保てる。
+結論: flock は使うが **try-lock-skip ＋ スコープを書き込みに限定 ＋ lock 内 re-read/merge/write ＋ バッチ化 ＋ append も共有 flock**。これで待ちは「数 ms 級の書き込み 1 回ぶん」に収まり、各自が払う gh レイテンシ（秒）に対して誤差。index-record GC で N を bound すれば O(N) 書き込み自体も小さく保てる。
 
 ## 受け入れ条件
 
 問題 1（rate limit）:
 
-- [ ] Stop hook が backfill を直接呼ばないか、呼ぶとしても 1 起動あたりの `gh` 呼び出し数に明確な上限がある
+- [ ] Stop hook は同期 backfill を呼ばず、detached worker の 1 起動あたりの `gh` 呼び出し数に明確な上限がある
 - [ ] cap が Phase 1 / Phase 2 の両方に効く（Phase 1 のみ・Phase 2 のみではない）。新規セッション大量流入直後でも 1 Stop の `gh` 呼び出しが上限を超えない
 - [ ] Phase 2 が `is_merged = true` の PR を refresh 対象から除外し、open な PR のみ re-check する
 - [ ] cap 導入後も starvation しない（Phase 1 = newest-first、Phase 2 = oldest-checked-first で全件が順に処理される）
@@ -221,7 +222,8 @@ async 方向（pin / backfill を fire-and-forget で並列化）に倒すと、
 - [ ] Stop hook が `backfill --detach` を spawn して即 return し、worker 完了を待たない（同期ホットパス ≈ 10ms 未満）
 - [ ] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
 - [ ] worker が global single-flight（try-lock-skip）で、並列 Stop / 別 agent と同時に gh を撃たない（取れなければ即 exit）
-- [ ] 並列 backfill / append が `session-index.jsonl` のロスト更新を起こさない（flock 共有）。かつ flock は try-lock-skip ＋ 書き込みスコープ限定 ＋ 1 run 1 WriteAll で、並列実行待ちを生まない
+- [ ] worker が cooldown を持ち、Stop が連続しても single-flight lock 取得ごとに gh batch が走り続けない
+- [ ] 並列 backfill / append が `session-index.jsonl` のロスト更新を起こさない（flock 共有、lock 内 re-read/merge/write）。かつ flock は try-lock-skip ＋ 書き込みスコープ限定 ＋ 1 run 1 WriteAll で、並列実行待ちを生まない
 
 収束アーキ / agent 対称:
 

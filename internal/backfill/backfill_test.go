@@ -270,7 +270,13 @@ func TestRunURLBackfill_SkipsPinnedSession(t *testing.T) {
 		sessions[i].PRURLs = nil
 	}
 
-	if err := runURLBackfill(indexPath, sessions, false); err != nil {
+	batch := sessionindex.Batch{
+		PinPRs:      make(map[string]string),
+		SessionURLs: make(map[string][]string),
+		PRMetas:     make(map[string]sessionindex.PRMeta),
+		EndUpdates:  make(map[string]sessionindex.EndUpdate),
+	}
+	if err := runURLBackfill(indexPath, sessions, false, false, DefaultGHCap, &batch); err != nil {
 		t.Fatal(err)
 	}
 

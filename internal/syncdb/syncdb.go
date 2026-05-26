@@ -2,6 +2,7 @@ package syncdb
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -195,7 +196,22 @@ func runWithSources(sources []agentSource, dbPath string) error {
 			dirty = true
 		}
 		if dirty {
-			if err := sessionindex.WriteAll(src.IndexPath, raws); err != nil {
+			if _, err := sessionindex.WithLockedIndex(src.IndexPath, func(latest []json.RawMessage, latestSessions []sessionindex.Session) ([]json.RawMessage, bool, error) {
+				changed := false
+				for i := range latestSessions {
+					if latestSessions[i].SessionID == "" || latestSessions[i].UserID != "" {
+						continue
+					}
+					latestSessions[i].UserID = resolvedUser
+					updated, err := sessionindex.MarshalSession(latestSessions[i])
+					if err != nil {
+						return nil, false, err
+					}
+					latest[i] = updated
+					changed = true
+				}
+				return latest, changed, nil
+			}); err != nil {
 				return fmt.Errorf("write %s sessions: %w", src.Agent.Name, err)
 			}
 		}

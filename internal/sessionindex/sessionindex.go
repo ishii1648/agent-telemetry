@@ -90,6 +90,10 @@ func ReadAll(path string) ([]json.RawMessage, []Session, error) {
 	return raws, sessions, scanner.Err()
 }
 
+func ReadAllBytes(path string) ([]json.RawMessage, []Session, error) {
+	return ReadAll(path)
+}
+
 // WriteAll writes sessions back to the JSONL file atomically.
 // 一時ファイルに書き込んでから rename することで、書き込み途中で失敗しても
 // 既存の session-index.jsonl が truncate / 部分書き込み状態にならないようにする。
@@ -141,6 +145,18 @@ func WriteAll(path string, raws []json.RawMessage) error {
 		return err
 	}
 	return nil
+}
+
+func WriteAllBytes(path string, raws []json.RawMessage) error {
+	return WriteAll(path, raws)
+}
+
+func AppendRawLine(path string, raw json.RawMessage) error {
+	_, err := WithLockedIndex(path, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		next := append(append([]json.RawMessage(nil), raws...), raw)
+		return next, true, nil
+	})
+	return err
 }
 
 // NormalizeRepo removes trailing ".git" suffix.

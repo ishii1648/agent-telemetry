@@ -50,15 +50,6 @@ func RunStop(input *HookInput, a *agent.Agent) error {
 		a = agent.Claude()
 	}
 
-	if input != nil && input.SessionID != "" {
-		if err := pinPRForSession(a, input); err != nil {
-			// PR resolution is best-effort: a missing PR (not yet created),
-			// gh auth failure, or cwd outside a git repo must not break the
-			// hot path. backfill remains the safety net.
-			fmt.Fprintf(os.Stderr, "stop: pin PR (best-effort): %v\n", err)
-		}
-	}
-
 	if a.Name == agent.NameCodex && input != nil && input.SessionID != "" {
 		endedAt := time.Now().Format("2006-01-02 15:04:05")
 		if _, err := sessionindex.UpdateEnd(a.SessionIndexPath(), input.SessionID, endedAt, "stop"); err != nil {
@@ -66,11 +57,12 @@ func RunStop(input *HookInput, a *agent.Agent) error {
 		}
 	}
 
-	if out, err := exec.Command("agent-telemetry", "backfill", "--agent", a.Name).CombinedOutput(); err != nil {
-		return fmt.Errorf("backfill: %w\n%s", err, out)
+	args := []string{"backfill", "--detach", "--agent", a.Name}
+	if input != nil && input.SessionID != "" {
+		args = append(args, "--pin-session="+input.SessionID)
 	}
-	if out, err := exec.Command("agent-telemetry", "sync-db").CombinedOutput(); err != nil {
-		return fmt.Errorf("sync-db: %w\n%s", err, out)
+	if err := exec.Command("agent-telemetry", args...).Start(); err != nil {
+		return fmt.Errorf("backfill detach: %w", err)
 	}
 	return nil
 }
