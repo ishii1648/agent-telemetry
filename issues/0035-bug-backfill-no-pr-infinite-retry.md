@@ -40,6 +40,23 @@ Created: 2026-05-11
 - abandoned `feature/*` worktree も同様
 - ユーザに見える症状: Stop hook の応答完了後の待ち時間が無駄に伸びる、`gh` API rate limit に余分な圧
 
+### `ended_at` の信頼性（2026-05 実測、E の前提に直結）
+
+E の horizon は `ended_at` を基準にするが、`ended_at` の計測は agent で非対称（[0038](0038-bug-stop-hook-backfill-rate-limit.md) の調査）:
+
+- **Claude**: SessionEnd hook (`sessionend.go:22`) が発火時に 1 回だけ書く。kill / 端末強制クローズ / クラッシュでは発火せず空のまま。**補完経路なし**。
+- **Codex**: SessionEnd が無いので Stop hook が毎回上書き (`stop.go:62`) → 最終アクティビティ時刻。さらに `backfillCodexEndedAt` が rollout JSONL から復元。
+
+ローカル実測（237 件）:
+
+| 観点 | 値 |
+|---|---|
+| Claude の `ended_at` 空き | 32 / 207 ≈ **15%** |
+| backlog（PR 未設定 & 未 checked 76 件）中の空き | 16 / 76 ≈ **21%** |
+| Codex(相当) の空き | 0 / 30 |
+
+→ **pure-`ended_at` horizon だと、Claude の恒久的に空な ~15% が markChecked されず永久 retry のまま残る**（backlog ほど空き率が高いのが致命的）。E の基準時刻は `ended_at` 単独ではなく `COALESCE(ended_at, timestamp)` にする必要がある（後述）。
+
 ## 問題
 
 | シナリオ | 現状 (毎 Stop) | あるべき姿 |
@@ -50,16 +67,25 @@ Created: 2026-05-11
 
 ## 対応方針
 
-採用: **E（`ended_at` ベース horizon）+ G（pin 結果を同 tick 内で再利用）の組み合わせ**。
+採用: **第1層（実デフォルトブランチの admission control）+ E（horizon）+ G（pin 結果を同 tick 内で再利用）の組み合わせ**。第1層 = 入口で candidate に入れない、E = 入った candidate を時間で諦める、という 2 段の GC（[0038](0038-bug-stop-hook-backfill-rate-limit.md) の GC 設計と対応。第1層/第2層の用語は 0038 と共通）。
+
+### 第1層 — 実デフォルトブランチの admission control（新規採用）
+
+repo の**実際のデフォルトブランチ上のセッションは構造的に PR を持たない**（デフォルトブランチから PR は作らない）ので、candidate に入れず probe しない。これは却下案 D の「`main`/`master` ハードコード除外」とは別物——**名前一致ではなく repo ごとの実デフォルトブランチを動的判定**するので、`trunk`/`dev`/`develop` 等の命名多様性に左右されない（D の却下理由を回避）。E と排他ではなく補完: 第1層は構造的 never-PR を 0 秒で弾き、E は abandoned feature branch を時間で諦める。
+
+未解決の実装論点（要決定）:
+- デフォルトブランチの判定方法とコスト。`gh repo view --json defaultBranchRef` や `git symbolic-ref refs/remotes/origin/HEAD` は呼び出しコスト or ref 未設定の懸念がある。**SessionStart の `extractGitInfo` 時点（既に git を叩いている）で「このセッションの branch == repo のデフォルトブランチか」を判定して flag を session entry に持たせる**のが追加コスト最小の候補。
+- ボリューム効果は環境依存（このマシンは master 作業が多いだけで、デフォルトブランチがボリュームゾーンと一般化はできない）。採用根拠は「構造的に正しい入口フィルタ」であって volume bet ではない。
 
 ### E (主軸)
 
-`fetchPR` で `gh pr list` が空を返した group について、group 内の session のうち以下の両方を満たすものを markChecked する:
+`fetchPR` で `gh pr list` が空を返した group について、group 内の session のうち以下を満たすものを markChecked する:
 
-- `ended_at` が空でない
-- `ended_at` から 24h 以上経過している
+- 基準時刻 `COALESCE(ended_at, timestamp)` から 24h 以上経過している
 
-`ended_at` が空 / 24h 以内のセッションは markChecked しない（次 tick で再 probe = 遅延 PR 作成救済のため）。
+基準時刻 24h 以内のセッションは markChecked しない（次 tick で再 probe = 遅延 PR 作成救済のため）。
+
+**基準時刻は `ended_at` 単独ではなく `COALESCE(ended_at, timestamp)`**: Claude の ~15% は SessionEnd 不発で `ended_at` が恒久的に空（前述「`ended_at` の信頼性」）。`ended_at` 単独だとこの 15% が永久に markChecked されず、本 issue の無限 retry がそのまま残る。`ended_at` が空なら SessionStart で必ず入る `timestamp`（session 開始時刻）にフォールバックすることで全セッションが必ず age out する。フォールバックの副作用は「開始時刻基準で数時間早く諦める」だけで、retire 側に倒れるため安全。
 
 これにより:
 - main/master のような永続 PR-less group: 古い session は 24h 後に group 一括 markChecked、新規 session のみ 1 tick だけ probe → 自然収束
@@ -79,14 +105,16 @@ Stop hook の `pinPRForSession` が「PR なし」を確定した `(repo, branch
 | A: empty → 即 markChecked | 24h 以内の遅延 PR 作成を取りこぼす。retry 価値の中で最も大きい時間帯を捨てる |
 | B: 試行回数 N | session entry に counter 追加（schema 変更）。`(repo, branch)` group との運用がぎこちない（min(attempts) を取る等の追加ロジック必要）。E に対する利点なし |
 | C: `last_checked_at` フィールド追加 | schema 変更のコストに見合わない。`ended_at` の再利用で同等の効果 |
-| D: branch 名 `main` / `master` を hardcode 除外 | branch 命名は org / 個人で多様（`trunk` / `dev` / `develop`）。汎用性を損なう。empirical signal + 時間窓のほうが robust |
+| D: branch 名 `main` / `master` を **hardcode** 除外 | branch 命名は org / 個人で多様（`trunk` / `dev` / `develop`）。汎用性を損なう。**ただし「repo の実デフォルトブランチを動的判定して除外」する第1層は採用**（D が却下したのは名前ハードコードであって、デフォルトブランチ除外という発想自体ではない） |
 | F: pin が「PR なし」と判定した時点で session を即 markChecked | pin 直後 ~24h の遅延 PR 作成を救済不可。E と同じ目的を pin 側で（不適切に早く）やってしまう |
 
 ## 受け入れ条件
 
 修正された後の振る舞いを以下で検証する:
 
-- [ ] PR 未作成 main セッションは、`ended_at` から 24h 経過後の Stop hook 1 回で当該 session が `backfill_checked = true` になる
+- [ ] repo の実デフォルトブランチ上のセッションは candidate に入らず `gh pr list` が一度も呼ばれない（第1層。branch 名のハードコードではなく動的判定）
+- [ ] `ended_at` が空のセッション（SessionEnd 不発の Claude 等）でも `timestamp` フォールバックで 24h 経過後に markChecked される（pure-`ended_at` だと永久 retry する穴を塞ぐ）
+- [ ] PR 未作成 main セッションは、`COALESCE(ended_at, timestamp)` から 24h 経過後の Stop hook 1 回で当該 session が `backfill_checked = true` になる
 - [ ] 24h 以内のセッションは markChecked されず、次 tick で再 probe される（遅延 PR 作成の救済窓を維持）
 - [ ] PR 未作成の `feature/foo` セッションでも同様に 24h horizon が効く（branch 名に依存しない）
 - [ ] `(repo, branch)` グループ内に新旧 session が混在する場合、24h 経過した session のみが markChecked され、新規 session は markChecked されない（group 全体一括ではなく per-session 判定）
@@ -95,7 +123,7 @@ Stop hook の `pinPRForSession` が「PR なし」を確定した `(repo, branch
 - [ ] `docs/design.md:204-206` の「`(repo, branch)` グルーピングと `backfill_checked`」節を、`ended_at` ベース horizon を反映した記述に更新する
 - [ ] `docs/spec.md:136` の `backfill_checked` 説明を、horizon 条件を含む形に更新する
 - [ ] 既存の `internal/sessionindex/update_test.go` の `TestMarkChecked_*` を回帰させない
-- [ ] `internal/backfill/backfill.go` に horizon 判定の unit test を追加（`ended_at` 空 / 12h 前 / 36h 前 / 混在 group のケース）
+- [ ] `internal/backfill/backfill.go` に horizon 判定の unit test を追加（`ended_at` 空＋`timestamp` 36h 前→markChecked / `ended_at` 12h 前→skip / `ended_at` 36h 前→markChecked / 混在 group のケース）
 
 ## 参照
 
