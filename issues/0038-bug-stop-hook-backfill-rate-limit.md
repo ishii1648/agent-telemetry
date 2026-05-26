@@ -119,11 +119,26 @@ d. **Stop フックを軽量版にして backfill を opt-in 化**: setup 時の
 
 a を主軸（Stop hook の責務縮小）、b をフォールバック（既存ユーザ向けの暫定軽減）、d を新規 setup の挙動変更として実施するのが妥当か。c は実装コストの割に効果が薄いため後回し。
 
+### 確定: gh 呼び出し上限（cap）の方針
+
+打ち手 b の「上限」を具体化したもの。**cap は Phase 1 / Phase 2 の両方（or 1 起動全体）に効くグローバル上限**として置く。「Phase 2 のみ」では不十分——理由が Phase ごとに異なる:
+
+- **Phase 1 (`runURLBackfill`)**: candidate は別途の GC（第1層=デフォルトブランチ即時除外、第2層=`COALESCE(ended_at, timestamp)` 基準の freshness 窓。詳細は [0035](0035-bug-backfill-no-pr-infinite-retry.md)）で steady state は bound される。cap が守るのは **非定常**——backlog 消化直後・新規セッション大量流入直後（並列 worktree 等）。ここは窓の内側で起きるので GC では防げず、cap が無いと rate limit が再発する。
+- **Phase 2 (`runMetaBackfill`)**: ターゲット（`pr_urls` を持つ全 URL）は **単調増加**し、1h スロットルは間隔を絞るだけで一度走ると全 URL に `gh pr view` を撃つ。cap に加えて構造対策として **`is_merged = true`（terminal）を refresh 対象から除外**し、「open な PR のみ refresh」へ縮める（現状 `backfill.go:271-281` は is_merged を見ず全件 re-check）。
+
+cap 実装時の付帯事項（starvation 回避）:
+
+- **Phase 1**: PR が付いた可能性の高い順＝ **newest-first で N 件**。あふれた分は次 Stop に回る（窓内なのでいずれ処理される）。
+- **Phase 2**: 現状 `last_meta_check` は State にグローバル 1 個しかなく、単純 cap だと毎回同じ先頭 N 件だけ refresh して残りが永久に更新されない。**per-URL（or per-session）の last-meta-check を持たせ oldest-checked-first で N 件** 回す（cap 導入とセットの設計項目）。
+
 ## 受け入れ条件
 
 問題 1（rate limit）:
 
 - [ ] Stop hook が backfill を直接呼ばないか、呼ぶとしても 1 起動あたりの `gh` 呼び出し数に明確な上限がある
+- [ ] cap が Phase 1 / Phase 2 の両方に効く（Phase 1 のみ・Phase 2 のみではない）。新規セッション大量流入直後でも 1 Stop の `gh` 呼び出しが上限を超えない
+- [ ] Phase 2 が `is_merged = true` の PR を refresh 対象から除外し、open な PR のみ re-check する
+- [ ] cap 導入後も starvation しない（Phase 1 = newest-first、Phase 2 = oldest-checked-first で全件が順に処理される）
 - [ ] backfill バックログが 2000+ ある状態で 10 回連続 Stop しても、secondary rate limit に当たらない
 - [ ] backfill が新しいセッション（< 24h）の救済を取りこぼさない（0035 の horizon と整合）
 
