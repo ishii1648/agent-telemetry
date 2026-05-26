@@ -3,6 +3,11 @@ decision_type: design
 affected_paths:
   - internal/backfill/backfill.go
   - internal/hook/stop.go
+  - internal/hook/sessionend.go
+  - internal/sessionindex/sessionindex.go
+  - internal/sessionindex/update.go
+  - internal/syncdb/syncdb.go
+  - internal/doctor/doctor.go
   - cmd/agent-telemetry/main.go
 tags: [backfill, hooks, stop-hook-cost, rate-limit, blocking-ux]
 ---
@@ -103,22 +108,58 @@ Phase 2 の本質は「自セッションではなく、後続の任意のセッ
 
 ## 対応方針
 
-> NOTE: 以下の a〜d は **問題 1（rate limit）単独** を前提に書かれた旧整理。問題 2（ブロッキング）の追加と、Codex に `SessionEnd` が無い agent 間制約を踏まえると優先順位・主軸は組み直す必要がある（特に「a を主軸 = Stop から退避」は Codex で成立しない）。解決策の再設計は別途行う。
+下記「確定: 収束アーキテクチャ」が主軸。以下の旧 a〜d は問題 1 単独前提の初期整理で、収束モデルに吸収・更新された（履歴として残す）:
 
-複数の打ち手を組み合わせる。優先順位は a > b > c > d。
+- **a（Stop で backfill 起動しない）**: 部分採用。Stop は backfill を**同期実行しない**が、detached worker は **Stop から spawn する**（gh は worker 側で async）。「SessionEnd のみ」ではない（Codex に無いため）。
+- **b（cap・スロットル）**: 採用。「確定: gh 呼び出し上限（cap）」節で具体化。
+- **c（事前 rate_limit probe）**: **不採用**（「window 絞り込みが主レバー」節のとおり over-engineering）。
+- **d（Stop と SessionEnd を分離した opt-in hook）**: **不要**。収束モデルでは Stop が worker を spawn するだけで両 agent 対応でき、**hook 登録構成は現状維持**（settings.json 移行不要）。
 
-a. **Stop hook では backfill を起動しない**: backfill 自体は `SessionEnd` フックや明示的な `agent-telemetry backfill` コマンドのみで十分。Stop ごとの実行は過剰。Stop hook はメタデータ記録 + pin のみに絞る
+### 確定: 収束アーキテクチャ（gh 完全 async + 2 段ロック + single-flight）
 
-b. **backfill に上限・スロットルを追加**:
-   - 1 回の起動で処理する最大セッション数（例: `--max 20`）
-   - 直近 N 秒以内に backfill が走った場合はスキップする mtime ガード
-   - 呼び出し間 sleep
+中核の発見: **gh を完全に async + throttle 付き single-flight にすると低頻度 hook が不要になり、Codex に `SessionEnd` が無い制約が設計上消える**（throttle が「たまに走る」を担保するのでトリガが毎 Stop でよい）。結果、Claude / Codex のアーキは収束する。
 
-c. **`gh api rate_limit` を事前 probe**: `secondary_rate_limit.remaining` がしきい値以下なら backfill 全体を skip
+ランタイムモデル（両 agent 共通）:
 
-d. **Stop フックを軽量版にして backfill を opt-in 化**: setup 時のデフォルト hook を「Stop = メタデータ + pin のみ」「SessionEnd = backfill」に分離
+```
+Stop hook（毎ターン、同期部分は数 ms で return）
+├─ [同期] ローカル書き込みのみ（per-file flock を µs〜ms 保持）
+│    • Codex: ended_at 更新（Stop が de-facto SessionEnd）
+└─ [spawn] hook が `agent-telemetry backfill --detach` を exec + setsid して即 return
+        worker（detached, std→/dev/null or log, no-wait）
+        ├─ global single-flight を try-lock → 取れなければ即 exit（待たず譲る）
+        ├─ gh 群（ロック外）: pin(現セッション) + Phase1(late URL) + Phase2(open PR meta)
+        │    → 結果をメモリ集約。cap / GC 第1層第2層 / Phase2 throttle をここで適用
+        ├─ per-file flock → 集約変更を 1 回の WriteAll でバッチ適用 → 解放
+        ├─ sync-db（ローカル、no gh。ここも worker 側）
+        └─ global lock 解放（flock はプロセス死で自動解放＝stale lock 無し）
+```
 
-a を主軸（Stop hook の責務縮小）、b をフォールバック（既存ユーザ向けの暫定軽減）、d を新規 setup の挙動変更として実施するのが妥当か。**c（事前 rate_limit probe）は下記「window 絞り込みが主レバー」節のとおり over-engineering として落とす**（後回しではなく不採用）。
+決定事項:
+- **worker 起動 = hook が spawn**（`stop` subcommand が `backfill --detach` を exec + setsid）。責務分離が素直。同期ホットパス総コスト＝ローカル書き込み + spawn ≈ 10ms 未満。
+- **pin は worker 内に吸収**（pin と Phase1 はほぼ同じ `gh pr list`）。同期パスから gh が完全に消える。
+- **sync-db も worker 末尾へ**（問題 2 の sync-db 同期コストも解消）。
+- **Claude の worker トリガは Stop のみ**（Codex と対称・実装共通化）。SessionEnd は `ended_at` 書き込みのみに留め、worker トリガには使わない。最終状態の確定は最後の Stop に委ねる。
+
+2 つのロック（スコープが異なる。混同しない）:
+
+| ロック | スコープ | 目的 | 方式 |
+|---|---|---|---|
+| per-file flock | agent ごとの `session-index.jsonl`（Claude / Codex は別ファイル） | 書き込み整合性（ロスト更新防止） | append も worker も共有。書き込み時のみ ms 保持 |
+| global single-flight | 全 agent 共有の 1 個（例 `~/.agent-telemetry/backfill.lock`） | gh バースト制御（rate limit 残余 1） | try-lock-skip。取れなければ worker 即 exit |
+
+global を agent 横断にするのは gh secondary rate limit が**アカウント共有**だから。Claude と Codex の worker が同時に gh を撃たない。flock はプロセス死で自動解放されるので worker が kill されても stale にならない。
+
+収束後に残る agent 差分（これだけ）:
+
+| 項目 | Claude | Codex |
+|---|---|---|
+| `ended_at` 書き込み | SessionEnd hook（1 回） | Stop で毎回上書き + rollout 復元 |
+| worker トリガ | Stop のみ | Stop のみ |
+| PostToolUse（経路 2 regex scrape） | 不要 | あり（no gh、書き込みは flock 共有） |
+| backfill / GC / cap / lock / worker | 完全共通 | 完全共通 |
+
+移行 drain（残余 2）: **専用コマンド `agent-telemetry backfill --gc` を deploy 後 1 回手動実行**して既存 backlog（再現環境 2390）を horizon / 第1層で一括 markChecked（cap 無しの一括パス）。通常 worker の cap とは別経路。`doctor` から案内する。
 
 ### 確定: gh 呼び出し上限（cap）の方針
 
@@ -176,15 +217,22 @@ async 方向（pin / backfill を fire-and-forget で並列化）に倒すと、
 
 問題 2（ブロッキング）:
 
-- [ ] **Stop hook の同期パスが `gh` を 1 回も呼ばない**（pin 含む全 gh は async/detached 側。同期部分はローカル書き込みのみ）
+- [ ] **Stop hook の同期パスが `gh` を 1 回も呼ばない**（pin 含む全 gh は async/detached worker 側。同期部分はローカル書き込み + worker spawn のみ）
+- [ ] Stop hook が `backfill --detach` を spawn して即 return し、worker 完了を待たない（同期ホットパス ≈ 10ms 未満）
 - [ ] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
-- [ ] 非同期化する場合、backfill の多重起動が防がれている（single-flight 等で並行バーストを誘発しない）
+- [ ] worker が global single-flight（try-lock-skip）で、並列 Stop / 別 agent と同時に gh を撃たない（取れなければ即 exit）
 - [ ] 並列 backfill / append が `session-index.jsonl` のロスト更新を起こさない（flock 共有）。かつ flock は try-lock-skip ＋ 書き込みスコープ限定 ＋ 1 run 1 WriteAll で、並列実行待ちを生まない
+
+収束アーキ / agent 対称:
+
+- [ ] Claude / Codex とも worker トリガは Stop のみ。**hook 登録構成は現状から変更しない**（既存ユーザの settings.json 移行不要）
+- [ ] Claude の SessionEnd は `ended_at` 書き込みのみで worker をトリガしない
+- [ ] `agent-telemetry backfill --gc`（移行 drain）が既存 backlog を horizon / 第1層で一括 markChecked し、deploy 後 1 回で 2390+ を収束させられる。`doctor` が案内する
 
 共通:
 - [ ] Phase 2 (経路 4) の事後 refresh 経路が維持され、PR がマージ後に `is_merged = 1` へ更新される（`pr_metrics` 母集団＝ `agent_pr_*` / `agent_session_pr_*` が空にならない）。頻度・件数の制御は可だが経路自体は残す
-- [ ] `setup` コマンドの hook 登録が新方針に合わせて更新される（変更がある場合）。`doctor` も旧構成を検出して案内する
-- [ ] `docs/design.md` の Stop hook hot path 節と backfill 節を実態に合わせて更新
+- [ ] `doctor` が旧構成（同期 backfill を呼ぶ hook 等）を検出して案内する
+- [ ] `docs/design.md` の Stop hook hot path 節と backfill 節を収束アーキに合わせて更新
 
 ## 参照
 
