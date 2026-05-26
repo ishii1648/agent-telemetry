@@ -4,16 +4,21 @@ affected_paths:
   - internal/backfill/backfill.go
   - internal/hook/stop.go
   - cmd/agent-telemetry/main.go
-tags: [backfill, hooks, stop-hook-cost, rate-limit]
+tags: [backfill, hooks, stop-hook-cost, rate-limit, blocking-ux]
 ---
 
-# Stop hook の backfill が GitHub secondary rate limit を誘発する
+# Stop hook での高頻度 gh 実行が rate limit と応答ブロッキングを引き起こす
 
 Created: 2026-05-26
 
 ## 概要
 
-`~/.claude/settings.json` の Stop フックに登録された `agent-telemetry hook stop --agent claude` が、毎ターン `backfill + sync-db` を実行する。`backfill` は `session-index.jsonl` 内の `backfill_checked != true` かつ `pr_urls` 未設定のセッションに対して `gh pr list` / `gh pr view` を呼ぶため、未チェックセッションが溜まっていると Stop ごとに大量の gh 呼び出しが走り、GitHub secondary rate limit を頻繁にヒットする。
+`~/.claude/settings.json` の Stop フックに登録された `agent-telemetry hook stop --agent claude` が、毎ターン `backfill + sync-db` を **同期的に** 実行する。`backfill` は `session-index.jsonl` 内の `backfill_checked != true` かつ `pr_urls` 未設定のセッションに対して `gh pr list` / `gh pr view` を呼ぶ。
+
+ここから、同じ根（**高頻度イベントである Stop hook で gh をブロッキング実行している**）に由来する 2 つの症状が出ている。本 issue は両方をまとめて解く。
+
+- **問題 1 — GitHub rate limit**: 未チェックセッションが溜まっていると Stop ごとに大量の gh 呼び出しがバーストし、GitHub secondary rate limit を頻繁にヒットする。
+- **問題 2 — 応答ブロッキング**: `stop.go` は `exec.Command(...).CombinedOutput()` で backfill / sync-db の完了を待つ。Stop はユーザ応答サイクル上のブロッキングフックなので、gh 呼び出し（pin の `gh pr view` 8s timeout + backfill バッチ）が遅いとき、その間ユーザが次の入力に進めず待たされる。
 
 ## 根拠
 
@@ -25,9 +30,17 @@ Created: 2026-05-26
 
 ### 影響
 
+**問題 1（rate limit）**
+
 - primary REST API quota は 6/5000 程度しか使っていないのに secondary rate limit が発動する（総量ではなくバーストが原因）
 - Claude Code セッション中の `gh pr list` / `gh pr create` が連鎖的に失敗する
 - 発見の経緯: 別セッションで `gh pr list` が secondary rate limit に当たり、原因を辿ったところ Stop フック内の `agent-telemetry` が原因と判明
+
+**問題 2（ブロッキング）**
+
+- Stop hook が同期実行のため、backlog が溜まっているとターン終了のたびに backfill バッチ完了まで待たされ、次の入力に進めない体感遅延が出る
+- pin の `gh pr view` は best-effort だが 8s timeout を持つため、PR 解決が遅い / gh が詰まっているときは Stop ごとに最大 8s 上乗せされる
+- agent 間制約: Claude には低頻度の `SessionEnd` があるが Codex には無く（`setup.go` 参照）、Stop が事実上の SessionEnd を兼ねる。よって「Stop から退避する」だけでは Codex を救えず、Stop に留めたままブロッキングを解く解法も必要になる
 
 ### 既存 issue との関係
 
@@ -66,14 +79,18 @@ PR URL とメタデータの収集経路は **4 つ** に分かれている。�
 
 ## 問題
 
-| 観点 | 現状 | 課題 |
-|---|---|---|
-| 実行頻度 | Stop ターンごとに backfill | 一日数十〜数百回。バーストになりやすい |
-| バッチサイズ | 候補全件（未 markChecked 全部） | バックログ消化中は 1 回で 2000+ |
-| レート制御 | なし | secondary rate limit を踏むまで気付けない |
-| 監視 | なし | `gh api rate_limit` の事前 check もなし |
+| 観点 | 現状 | 課題 | 関連 |
+|---|---|---|---|
+| 実行頻度 | Stop ターンごとに backfill | 一日数十〜数百回。バーストになりやすい | 問題 1 |
+| バッチサイズ | 候補全件（未 markChecked 全部） | バックログ消化中は 1 回で 2000+ | 問題 1 |
+| レート制御 | なし | secondary rate limit を踏むまで気付けない | 問題 1 |
+| 監視 | なし | `gh api rate_limit` の事前 check もなし | 問題 1 |
+| 実行モデル | `CombinedOutput()` で同期実行 | gh 完了までユーザ応答サイクルがブロックされる | 問題 2 |
+| backfill 多重起動 | 同期のため暗黙に直列化 | 単純に非同期化すると並行 backfill でバーストが悪化する（直列化が失われる） | 問題 1 × 2 |
 
 ## 対応方針
+
+> NOTE: 以下の a〜d は **問題 1（rate limit）単独** を前提に書かれた旧整理。問題 2（ブロッキング）の追加と、Codex に `SessionEnd` が無い agent 間制約を踏まえると優先順位・主軸は組み直す必要がある（特に「a を主軸 = Stop から退避」は Codex で成立しない）。解決策の再設計は別途行う。
 
 複数の打ち手を組み合わせる。優先順位は a > b > c > d。
 
@@ -92,9 +109,18 @@ a を主軸（Stop hook の責務縮小）、b をフォールバック（既存
 
 ## 受け入れ条件
 
+問題 1（rate limit）:
+
 - [ ] Stop hook が backfill を直接呼ばないか、呼ぶとしても 1 起動あたりの `gh` 呼び出し数に明確な上限がある
 - [ ] backfill バックログが 2000+ ある状態で 10 回連続 Stop しても、secondary rate limit に当たらない
 - [ ] backfill が新しいセッション（< 24h）の救済を取りこぼさない（0035 の horizon と整合）
+
+問題 2（ブロッキング）:
+
+- [ ] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
+- [ ] 非同期化する場合、backfill の多重起動が防がれている（single-flight 等で並行バーストを誘発しない）
+
+共通:
 - [ ] `setup` コマンドの hook 登録が新方針に合わせて更新される（変更がある場合）。`doctor` も旧構成を検出して案内する
 - [ ] `docs/design.md` の Stop hook hot path 節と backfill 節を実態に合わせて更新
 
