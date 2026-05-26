@@ -34,8 +34,7 @@ Datadog の dashboard / monitor の **具体的な JSON 生成 / Terraform 化�
 
 ただし「流せる」と「Datadog で意味のある dashboard が組める」の間には次の gap があり、実際に Datadog で運用するなら設計判断が必要:
 
-- agent-telemetry のイベント名（`agent.session.started` / `agent.transcript.scanned` / `agent.pr.observed` 等）は独自 semantic convention で、Datadog の APM / Logs / Metrics いずれの既定 facet にも乗らない
-- 効率指標（`pr_metrics` の `total_tokens` / `fresh_tokens` / `per_million_tokens`）は agent-telemetry-server の **SQLite VIEW で集約** している。Datadog 側に events だけ流しても、この集約は backend 側で再現する必要がある
+- events をどの OTLP signal で送るか（OTLP **Logs**＝[0038] の決定のまま Datadog 側で Logs to Metrics するか、OTLP **Metrics** に変換して送るか）で metric 化経路が変わる。さらに効率指標（`pr_metrics` の `total_tokens` / `fresh_tokens` / `per_million_tokens`）は agent-telemetry-server の **SQLite VIEW で集約** しており、events だけ流しても集約は backend 側で再現する必要がある。なお独自イベント名が Datadog の OOTB facet に乗らないこと自体は、任意のアプリ独自テレメトリに共通の前提コストであって Datadog 固有の障害ではない
 - Grafana dashboard JSON は SQLite datasource 前提。Datadog で同じ可視化を出すなら別途 dashboard を作る必要がある（自動変換は現実的でない）
 - OTLP Logs として送る場合、attribute → Datadog tag / facet / measure の mapping を仕様化しないと、cardinality 爆発（`session_id` を tag にしてしまう等）や、せっかくの数値属性が `@input_tokens` のような log attribute として埋もれる事態を招く
 
@@ -45,23 +44,20 @@ Datadog の dashboard / monitor の **具体的な JSON 生成 / Terraform 化�
 
 ## 問題
 
-[0038] が完了した時点で残る、Datadog 連携固有の障害を 4 つに整理する。
+[0038] が完了した時点で残る、Datadog 連携固有の障害を 3 つに整理する。
 
-### 1. event 名が独自 semantic convention
+### 1. 送信形式（Logs か Metrics か）と集約の置き場所
 
-[0038] で定義される event 名は agent-telemetry 内部の概念で命名されており、Datadog の OOTB integration からは認識されない:
+当初は「event 名が独自 semantic convention」と「集約が SQLite VIEW に閉じている」を別問題に分けていたが、実体は **「events をどの OTLP signal で送り、`pr_metrics` 相当の集約をどこで作るか」という一本の設計判断** に畳める。
 
-- `agent.session.started` / `agent.session.ended` — APM の `service.name` / `span.kind` には自動マッピングされない
-- `agent.transcript.scanned` — snapshot 系イベントで latest-wins。Datadog の Log Patterns / Metrics generation には自然に乗らない
-- `agent.pr.observed` — PR 状態の snapshot で、これも latest-wins
+まず event 名（`agent.session.started` / `agent.transcript.scanned` / `agent.pr.observed` 等）が独自命名で Datadog の OOTB facet に乗らない点は、**Datadog 固有の障害ではなく、任意のアプリ独自テレメトリに共通の前提コスト** でしかない。OOTB integration は Postgres / nginx など既知ミドルウェア向けであり、独自イベントは命名が何であれ自前で facet / metric / dashboard を定義する。命名を OTel 標準に寄せてもこのコストは消えない（→ `gen_ai.*` 寄せの検討は後述のとおり却下）。
 
-結果として、Datadog の **Logs Explorer** に流しても「ただの構造化ログ」として扱われ、metric として扱うには [Logs to Metrics](https://docs.datadoghq.com/logs/log_configuration/logs_to_metrics/) または **OTLP Metrics に変換した上で送る** 必要がある。後者を取るなら、現在 OTLP **Logs** で emit している方針（[0038] の決定）との整合性をどう取るかが論点になる。
+実際に決めるべきは送信形式と集約の置き場所:
 
-### 2. 集約が server 側 SQLite VIEW に閉じている
+- [0038] は OTLP **Logs** で emit する決定。Logs のままなら Datadog 側で [Logs to Metrics](https://docs.datadoghq.com/logs/log_configuration/logs_to_metrics/) で metric 化する
+- あるいは `pr_metrics` 相当を **OTLP Metrics に変換して送る**。Datadog は素直に metric として受けるが、OTLP Logs で emit する [0038] の決定との整合性をどう取るかが論点になる
 
-`pr_metrics` / `session_concurrency_*` などの「ユーザにとって意味のある指標」は、events を **agent-telemetry-server の SQLite VIEW** で SQL 集約することで生成されている。Datadog に events を流すだけでは、Datadog 上でこれらは存在しない。
-
-選択肢:
+そのうえで `pr_metrics` / `session_concurrency_*` の集約は現状 **agent-telemetry-server の SQLite VIEW** に閉じており、Datadog に events を流すだけでは Datadog 上に存在しない。集約の置き場所として次の選択肢がある:
 
 - **(a) backend 側で再構築**: Datadog の formula / Logs to Metrics で `total_tokens = input + output + cache_write + cache_read + reasoning` のような集約を再定義する。merged 限定・subagent 除外・ghost 除外・運用ノイズリポジトリ除外のフィルタも Datadog 側で書き直す
 - **(b) pre-aggregated metric を送る**: client / server で SQLite VIEW を評価した結果を OTLP **Metrics** として別経路で送る。Datadog は素直に metric として受ける
@@ -69,7 +65,9 @@ Datadog の dashboard / monitor の **具体的な JSON 生成 / Terraform 化�
 
 (a) は Datadog の式言語に集約定義が散らばるため、SQL VIEW との同期維持が運用負荷になる。(b) は pre-aggregated metric を 2 経路で持つ複雑性。(c) は最小限の投資で済むが、Datadog の monitoring 価値を取り切れない。
 
-### 3. Grafana dashboard JSON が SQLite 前提
+> **却下: event 名を OTel `gen_ai.*` semantic conventions に寄せる案。** `gen_ai.*` は個々の LLM 呼び出しを記述する規約であり、agent-telemetry の中核概念（PR 単位のトークン効率・transcript scan の latest-wins snapshot）は構造的にマップできない。部分的に寄せても二重命名が増えるだけで OOTB 認識の利得が出ないため採らない。独自命名は維持し、facet / metric は自前定義する前提で進める。
+
+### 2. Grafana dashboard JSON が SQLite 前提
 
 `grafana/dashboards/agent-telemetry.json` は datasource `uid: agent-telemetry`（SQLite）に対する SQL クエリで書かれている。Datadog に流すからといって Grafana 版が不要になるわけではない（ローカル単独利用は引き続き SQLite で完結する）が、Datadog 版を作るなら次の判断が要る:
 
@@ -77,7 +75,7 @@ Datadog の dashboard / monitor の **具体的な JSON 生成 / Terraform 化�
 - Datadog 版で再現する pane を絞る（pr_metrics の主要 4 指標 + concurrency + agent 比較に留める等）
 - Grafana 版を「ローカル / OSS 個人用」、Datadog 版を「チーム集約」と用途分離する
 
-### 4. attribute → Datadog tag / facet mapping の仕様化が未整備
+### 3. attribute → Datadog tag / facet mapping の仕様化が未整備
 
 OTLP Logs を Datadog に送ると、各 attribute は Datadog の log attribute（`@key`）にマップされる。これを **tag / facet / measure** に昇格しないと、検索・集計・monitor 対象として一級にならない。一方で `session_id` のような高 cardinality 属性を tag にすると Datadog の課金 / index 設計を破壊する。
 
@@ -134,7 +132,7 @@ Datadog 連携を **first-class** で扱うかどうかをまず決める。3 �
 
 #### facet / tag / measure
 
-「問題 4」で挙げた mapping を Datadog `data/processors`（または Logs Pipeline の Remapper）で次のように定義する想定:
+「問題 3」で挙げた mapping を Datadog `data/processors`（または Logs Pipeline の Remapper）で次のように定義する想定:
 
 - tag: `service` / `env` / `version` / `coding_agent` / `model` / `repo` / `task_type` / `end_reason` / `pr_state`
 - facet（数値以外、tag に昇格しないもの）: `branch` / `pr_url` / `user_id` / `session_id` / `parent_session_id`
@@ -147,7 +145,7 @@ Datadog 連携を **first-class** で扱うかどうかをまず決める。3 �
 本 issue 自体は spec/docs の更新と方針確定までを想定し、実装は次の child issue に分解する。順序は依存関係に従う:
 
 1. **OTel Collector ファンアウト構成の確立**: `deploy/otel-collector/` 相当（or docs の how-to のみ）に Datadog exporter + SQLite ingest（agent-telemetry-server）への dual export を書く。client 側 `[server] endpoint` 設定の意味を Collector 向けに整理する
-2. **attribute → Datadog tag/facet/measure mapping を `docs/spec.md` に追記**: 「問題 4」の対応表を仕様として固定。Collector processor のサンプル設定も spec に同梱する
+2. **attribute → Datadog tag/facet/measure mapping を `docs/spec.md` に追記**: 「問題 3」の対応表を仕様として固定。Collector processor のサンプル設定も spec に同梱する
 3. **`docs/metrics.md` に Datadog 上の再構築指針を追記**: 各メトリクスについて「Datadog 上では Logs to Metrics で生成 / OTLP measure をそのまま使う / 集約は Datadog formula で再定義」のどれを取るかを明示
 4. **Datadog dashboard サンプルの提供**: agent-telemetry org 用の dashboard JSON（Terraform 化は任意）を `examples/datadog/` に同梱する（本 issue の scope **外**、別 issue で扱う）
 5. **`docs/design.md` に server / Collector / Datadog の責務分担を追記**: 「server は OTLP receiver + SQLite ingest だけ。Datadog 側集約は Collector + Datadog backend が担う」という分担を明文化
