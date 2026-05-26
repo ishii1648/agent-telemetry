@@ -39,7 +39,8 @@ Created: 2026-05-26
 **問題 2（ブロッキング）**
 
 - Stop hook が同期実行のため、backlog が溜まっているとターン終了のたびに backfill バッチ完了まで待たされ、次の入力に進めない体感遅延が出る
-- pin の `gh pr view` は best-effort だが 8s timeout を持つため、PR 解決が遅い / gh が詰まっているときは Stop ごとに最大 8s 上乗せされる
+- **gh の per-call レイテンシ自体が floor**: cap で件数を絞っても、同期のままなら N 件 × (gh CLI 起動 + ネットワーク RTT) が wall-clock で積む。**cap は rate limit（バースト）用、async は blocking 用で役割が直交**——cap では blocking 時間は消えない
+- **pin が同期かつ最初に無条件で走る**: `RunStop`(`stop.go:54`) は backfill より前に `pinPRForSession`（同期 `gh pr list`、8s timeout）を呼ぶ。よって backfill をいくら async/cap/GC しても、**un-pinned セッションの pin レイテンシ floor は一切減らない**。pin を「ダッシュボード即時性のため同期に残す」正当化は成り立たない（ダッシュボードはターン中に見るものではなく、即時 vs 数秒後の UX 価値が無い）
 - agent 間制約: Claude には低頻度の `SessionEnd` があるが Codex には無く（`setup.go` 参照）、Stop が事実上の SessionEnd を兼ねる。よって「Stop から退避する」だけでは Codex を救えず、Stop に留めたままブロッキングを解く解法も必要になる
 
 ### 既存 issue との関係
@@ -117,7 +118,7 @@ c. **`gh api rate_limit` を事前 probe**: `secondary_rate_limit.remaining` が
 
 d. **Stop フックを軽量版にして backfill を opt-in 化**: setup 時のデフォルト hook を「Stop = メタデータ + pin のみ」「SessionEnd = backfill」に分離
 
-a を主軸（Stop hook の責務縮小）、b をフォールバック（既存ユーザ向けの暫定軽減）、d を新規 setup の挙動変更として実施するのが妥当か。c は実装コストの割に効果が薄いため後回し。
+a を主軸（Stop hook の責務縮小）、b をフォールバック（既存ユーザ向けの暫定軽減）、d を新規 setup の挙動変更として実施するのが妥当か。**c（事前 rate_limit probe）は下記「window 絞り込みが主レバー」節のとおり over-engineering として落とす**（後回しではなく不採用）。
 
 ### 確定: gh 呼び出し上限（cap）の方針
 
@@ -130,6 +131,24 @@ cap 実装時の付帯事項（starvation 回避）:
 
 - **Phase 1**: PR が付いた可能性の高い順＝ **newest-first で N 件**。あふれた分は次 Stop に回る（窓内なのでいずれ処理される）。
 - **Phase 2**: 現状 `last_meta_check` は State にグローバル 1 個しかなく、単純 cap だと毎回同じ先頭 N 件だけ refresh して残りが永久に更新されない。**per-URL（or per-session）の last-meta-check を持たせ oldest-checked-first で N 件** 回す（cap 導入とセットの設計項目）。
+
+### 確定: 問題 2 の解決原則 — 同期ホットパスに gh をゼロにする
+
+問題 2 の解は「backfill を async 化する」ではなく **「Stop の同期部分はローカル書き込み（sub-ms）だけにし、pin を含む全 gh を fire-and-forget に出す」**。
+
+- cap（rate limit 用）と async（blocking 用）は **役割が直交**。cap で件数を絞っても同期実行なら gh per-call レイテンシが積むため、blocking は cap では消えない。
+- **pin も async 側へ**。pin を同期に残す正当化（ダッシュボード即時性）は成り立たない（前述）。同期に残してよいのは `ended_at` / メタのローカル書き込みのみ。
+- 「同期のまま速い共通パス（throttle skip 時のみ速い）」案は、実際に走る時に gh レイテンシが積むので不採用。gh を含む処理は throttle 有無に関わらず async/detached に出す。
+
+### 確定: rate limit 対策は「window 絞り込み」が主レバー。共有予算管理は不要
+
+secondary rate limit は総量でなく**バースト/同時実行**で発火する。対策の本質は「自分の gh 発行を小さく保つ」ことであり、他消費者（statusline / ユーザの対話的 gh / 別 agent）の**予算を会計することではない**。
+
+window を絞った後（GC 第1層+第2層 / Phase 2 terminal 除外 / cap）の定常 footprint は pin 1 + Phase 1 0〜数件 + Phase 2 数件（1h スロットル）＝ 1 桁〜低 2 桁/Stop で、secondary 閾値に対して誤差。よって:
+
+- **落とす（over-engineering）**: 共有予算の token bucket / 会計、および打ち手 **c**（`gh api rate_limit` 事前 probe）。事前 probe 自体が 1 API 呼び出しで「小さく保つ」方針と矛盾気味。残すなら「踏んだ後の reactive cooldown」を最小実装する程度。
+- **残余 1 — 並列の concurrency 重複排除**: N 並列 worktree の同時 Stop は瞬間バーストが N 倍。ただし「予算管理」ではなく**安価な global single-flight / lock** の話。Phase 2 は既存の 1h State スロットルがプロセス間 dedup を概ね担うが、**Phase 1 はプロセス間スロットルが無い**のが残余。window が小さい前提なら **必須でなく保険**レベル。
+- **残余 2 — 移行直後の一括 drain（transient）**: 既存 backlog（再現環境 2390）は GC 適用前なので初回数 Stop が大バースト。bounded な一括 retire パスで対処する。予算管理とは別軸。
 
 ## 受け入れ条件
 
@@ -144,6 +163,7 @@ cap 実装時の付帯事項（starvation 回避）:
 
 問題 2（ブロッキング）:
 
+- [ ] **Stop hook の同期パスが `gh` を 1 回も呼ばない**（pin 含む全 gh は async/detached 側。同期部分はローカル書き込みのみ）
 - [ ] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
 - [ ] 非同期化する場合、backfill の多重起動が防がれている（single-flight 等で並行バーストを誘発しない）
 
