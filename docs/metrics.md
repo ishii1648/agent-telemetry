@@ -222,16 +222,16 @@ agent 跨ぎでは `model` / `agent_version` の混在で平均化が壊れや�
 │ gh pr list / pr view     │── C ──┘            │
 └──────────────────────────┘                    ▼
                                           ┌─────────┐
-┌──────────────────────────┐              │ sync-db │── INSERT OR REPLACE ──→ SQLite
-│ transcript JSONL(.zst)   │── B ────────→│         │   (sessions
-└──────────────────────────┘              └─────────┘    + transcript_stats)
-                                                              │
-                                                          D (VIEW)
+┌──────────────────────────┐              │ sync-db │── INSERT OR IGNORE ──→ SQLite
+│ transcript JSONL(.zst)   │── B ────────→│         │   (events;
+└──────────────────────────┘              └─────────┘    sessions /
+                                                              │       transcript_stats
+                                                          D (VIEW)        は VIEW)
                                                               ↓
                                                       pr_metrics 等
 ```
 
-A と C はどちらも session-index.jsonl に書き込むが、A は hook が即時に書く揮発しない事実（時刻・branch・cwd 等）、C は外部 API で後から確定する状態（PR 状態）を担う。B は session-index.jsonl を経由せず直接 SQLite に集計値を書く。D は SQLite に蓄積した値を VIEW で組み合わせるだけで新しい I/O は発生しない。
+A と C はどちらも session-index.jsonl に書き込むが、A は hook が即時に書く揮発しない事実（時刻・branch・cwd 等）、C は外部 API で後から確定する状態（PR 状態）を担う。B は session-index.jsonl を経由せず transcript を sync-db が直接読み、append-only な `events` テーブルに deterministic な `event_id`（content hash）で `INSERT OR IGNORE` 追記する（同一内容の再 sync は dedup される）。D は events に蓄積した値を VIEW（`sessions` / `transcript_stats` / `pr_metrics` 等）で組み合わせるだけで新しい I/O は発生しない。
 
 ### A. Hook 書き込み
 

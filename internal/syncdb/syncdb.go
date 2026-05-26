@@ -76,11 +76,50 @@ func ensureSchema(db *sql.DB) error {
 	if err == nil && current == schema.Hash {
 		return nil
 	}
+	if err := dropLegacyRelations(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec(schema.SQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if _, err := db.Exec("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_hash', ?)", schema.Hash); err != nil {
 		return fmt.Errorf("write schema hash: %w", err)
+	}
+	return nil
+}
+
+func dropLegacyRelations(db *sql.DB) error {
+	rows, err := db.Query(`SELECT type, name FROM sqlite_master WHERE name IN ('sessions', 'transcript_stats')`)
+	if err != nil {
+		return fmt.Errorf("inspect legacy relations: %w", err)
+	}
+	defer rows.Close()
+	type rel struct {
+		typ  string
+		name string
+	}
+	var rels []rel
+	for rows.Next() {
+		var r rel
+		if err := rows.Scan(&r.typ, &r.name); err != nil {
+			return err
+		}
+		rels = append(rels, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range rels {
+		switch r.typ {
+		case "table":
+			if _, err := db.Exec("DROP TABLE IF EXISTS " + r.name); err != nil {
+				return fmt.Errorf("drop table %s: %w", r.name, err)
+			}
+		case "view":
+			if _, err := db.Exec("DROP VIEW IF EXISTS " + r.name); err != nil {
+				return fmt.Errorf("drop view %s: %w", r.name, err)
+			}
+		}
 	}
 	return nil
 }

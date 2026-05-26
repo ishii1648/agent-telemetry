@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,9 +92,11 @@ type Handler struct {
 	DB             *sql.DB
 	Token          string
 	CollisionsPath string
+	RejectedPath   string
 
 	mu          sync.Mutex
 	collisionsW io.WriteCloser
+	rejectedW   io.WriteCloser
 }
 
 // NewHandler wires up the http.Handler. Token must be non-empty —
@@ -103,6 +106,7 @@ func NewHandler(db *sql.DB, token, dataDir string) *Handler {
 		DB:             db,
 		Token:          token,
 		CollisionsPath: filepath.Join(dataDir, "collisions.log"),
+		RejectedPath:   filepath.Join(dataDir, "rejected.log"),
 	}
 }
 
@@ -111,18 +115,25 @@ func NewHandler(db *sql.DB, token, dataDir string) *Handler {
 // access logging) before mounting.
 func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/metrics", h.ServeIngest)
+	mux.HandleFunc("/v1/logs", h.ServeLogs)
 }
 
-// Close releases the collisions log file if it was opened.
+// Close releases the collisions / rejected log files if they were opened.
 func (h *Handler) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	var err error
 	if h.collisionsW != nil {
-		err := h.collisionsW.Close()
+		err = h.collisionsW.Close()
 		h.collisionsW = nil
-		return err
 	}
-	return nil
+	if h.rejectedW != nil {
+		if cerr := h.rejectedW.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		h.rejectedW = nil
+	}
+	return err
 }
 
 func (h *Handler) ServeIngest(w http.ResponseWriter, r *http.Request) {
@@ -166,6 +177,167 @@ func (h *Handler) ServeIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+type logsPayload struct {
+	ResourceLogs []struct {
+		ScopeLogs []struct {
+			LogRecords []struct {
+				TimeUnixNano string `json:"timeUnixNano"`
+				EventName    string `json:"eventName"`
+				Attributes   []struct {
+					Key   string `json:"key"`
+					Value struct {
+						StringValue string `json:"stringValue"`
+						IntValue    string `json:"intValue"`
+						BoolValue   *bool  `json:"boolValue,omitempty"`
+					} `json:"value"`
+				} `json:"attributes"`
+			} `json:"logRecords"`
+		} `json:"scopeLogs"`
+	} `json:"resourceLogs"`
+}
+
+type logsResponse struct {
+	PartialSuccess struct {
+		RejectedLogRecords int    `json:"rejectedLogRecords"`
+		ErrorMessage       string `json:"errorMessage"`
+	} `json:"partialSuccess"`
+}
+
+func (h *Handler) ServeLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var payload logsPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	rejected, reasons, err := h.insertLogs(&payload)
+	if len(reasons) > 0 {
+		h.recordRejected(reasons)
+	}
+	resp := logsResponse{}
+	resp.PartialSuccess.RejectedLogRecords = rejected
+	if err != nil {
+		resp.PartialSuccess.ErrorMessage = err.Error()
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	if rejected > 0 {
+		resp.PartialSuccess.ErrorMessage = fmt.Sprintf("%d log records rejected (logged to rejected.log)", rejected)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// insertLogs appends valid log records to events (INSERT OR IGNORE for
+// idempotency). Records failing validation (missing required attrs) are
+// permanently rejected: counted, described in reasons (for rejected.log), and
+// skipped — never retried, matching OTLP partial-success semantics.
+func (h *Handler) insertLogs(p *logsPayload) (int, []string, error) {
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO events
+		(event_id, occurred_at, received_at, session_id, coding_agent, event_name, attributes)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer stmt.Close()
+
+	rejected := 0
+	var reasons []string
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, rl := range p.ResourceLogs {
+		for _, sl := range rl.ScopeLogs {
+			for _, lr := range sl.LogRecords {
+				eventID, sessionID, codingAgent, attrs := splitLogAttrs(lr.Attributes)
+				if eventID == "" || sessionID == "" || codingAgent == "" || lr.EventName == "" {
+					rejected++
+					reasons = append(reasons, fmt.Sprintf("missing required attribute (event_id=%q session_id=%q coding_agent=%q event_name=%q)", eventID, sessionID, codingAgent, lr.EventName))
+					continue
+				}
+				attrJSON, err := json.Marshal(attrs)
+				if err != nil {
+					rejected++
+					reasons = append(reasons, fmt.Sprintf("event_id=%s: marshal attributes: %v", eventID, err))
+					continue
+				}
+				if _, err := stmt.Exec(eventID, otlpTime(lr.TimeUnixNano), now, sessionID, codingAgent, lr.EventName, string(attrJSON)); err != nil {
+					return rejected, reasons, fmt.Errorf("insert event %s: %w", eventID, err)
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return rejected, reasons, fmt.Errorf("commit: %w", err)
+	}
+	return rejected, reasons, nil
+}
+
+func splitLogAttrs(attrs []struct {
+	Key   string `json:"key"`
+	Value struct {
+		StringValue string `json:"stringValue"`
+		IntValue    string `json:"intValue"`
+		BoolValue   *bool  `json:"boolValue,omitempty"`
+	} `json:"value"`
+}) (eventID, sessionID, codingAgent string, rest map[string]any) {
+	rest = map[string]any{}
+	for _, a := range attrs {
+		var v any
+		switch {
+		case a.Value.IntValue != "":
+			if n, err := strconv.ParseInt(a.Value.IntValue, 10, 64); err == nil {
+				v = n
+			} else {
+				v = a.Value.IntValue
+			}
+		case a.Value.BoolValue != nil:
+			v = *a.Value.BoolValue
+		default:
+			v = a.Value.StringValue
+		}
+		switch a.Key {
+		case "event_id":
+			eventID, _ = v.(string)
+		case "session_id":
+			sessionID, _ = v.(string)
+		case "coding_agent":
+			codingAgent, _ = v.(string)
+		case "local_sequence":
+			continue
+		default:
+			rest[a.Key] = v
+		}
+	}
+	return eventID, sessionID, codingAgent, rest
+}
+
+func otlpTime(ns string) string {
+	if ns == "" {
+		return time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	var n int64
+	if _, err := fmt.Sscanf(ns, "%d", &n); err != nil {
+		return ns
+	}
+	return time.Unix(0, n).UTC().Format(time.RFC3339Nano)
 }
 
 func (h *Handler) checkAuth(r *http.Request) bool {
@@ -317,6 +489,32 @@ func (h *Handler) recordCollisions(pairs [][2]string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, p := range pairs {
 		fmt.Fprintf(h.collisionsW, "%s coding_agent=%s session_id=%s\n", now, p[0], p[1])
+	}
+}
+
+// recordRejected appends permanently-rejected OTLP log records to rejected.log
+// so the data the client dropped (cursor advanced past it) leaves an audit
+// trail an operator can inspect.
+func (h *Handler) recordRejected(reasons []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.rejectedW == nil {
+		if err := os.MkdirAll(filepath.Dir(h.RejectedPath), 0o755); err != nil {
+			log.Printf("rejected.log mkdir: %v", err)
+			return
+		}
+		f, err := os.OpenFile(h.RejectedPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Printf("rejected.log open: %v", err)
+			return
+		}
+		h.rejectedW = f
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, r := range reasons {
+		fmt.Fprintf(h.rejectedW, "%s %s\n", now, r)
 	}
 }
 

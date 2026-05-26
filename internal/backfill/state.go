@@ -19,6 +19,7 @@ type State struct {
 	LastBackfillOffset    int               `json:"last_backfill_offset"`
 	LastMetaCheck         time.Time         `json:"last_meta_check"`
 	PushedSessionVersions map[string]string `json:"pushed_session_versions,omitempty"`
+	LastFlushedSequence   int64             `json:"last_flushed_sequence,omitempty"`
 }
 
 // StatePath returns ~/.claude/agent-telemetry-state.json (Claude default).

@@ -158,23 +158,29 @@ PR と session の紐づけは `Stop` hook 時点で `gh pr list --head <branch>
 
 ## データ変換層
 
-### `sync-db` の incremental UPSERT 戦略
+### `sync-db` の incremental イベント追記戦略
 
-`sync-db` は通常実行で `sessions` / `transcript_stats` を `INSERT OR REPLACE` するだけで、テーブル/VIEW の DROP & CREATE は行わない。スキーマ DDL は `internal/syncdb/schema.sql` に集約し、SHA256 ハッシュを `go:generate` で `schema_hash.go` に埋め込む。起動時に埋め込みハッシュと DB の `schema_meta` テーブルに保存されたハッシュを比較する:
+`sync-db` は通常実行で `events` テーブルに `INSERT OR IGNORE` でイベントを追記するだけで、テーブル / VIEW の DROP & CREATE は行わない。スキーマ DDL は `internal/syncdb/schema.sql` に集約し（events テーブル DDL + 派生 VIEW 定義）、SHA256 ハッシュを `go:generate` で `schema_hash.go` に埋め込む。起動時に埋め込みハッシュと DB の `schema_meta` テーブルに保存されたハッシュを比較する:
 
-| 状態 | DDL 実行 | 行の書き込み |
+| 状態 | DDL 実行 | events への書き込み |
 |---|---|---|
-| ハッシュ一致 | しない | `INSERT OR REPLACE` のみ |
-| ハッシュ不一致 / `schema_meta` 不在 | `schema.sql` を全実行（既存 VIEW/TABLE を DROP & CREATE）| `INSERT OR REPLACE` 後に新ハッシュを `schema_meta` へ書き込む |
+| ハッシュ一致 | しない | `INSERT OR IGNORE` のみ |
+| ハッシュ不一致 / `schema_meta` 不在 | `schema.sql` を全実行（VIEW を DROP & CREATE。events テーブルは temp に rename → 新 DDL で再作成 → 行を流し込む）| `INSERT OR IGNORE` 後に新ハッシュを `schema_meta` へ書き込む |
 
 理由:
 
-- ソース・オブ・レコードは `session-index.jsonl` と transcript JSONL であり、SQLite はあくまで集計キャッシュ
-- スキーマ変更時の互換コードを抱えなくて済む（DDL 自体はハッシュ不一致時にのみフル再構築する）
-- DB 破損時はファイルを消して再実行すれば回復する
-- DDL を毎回実行しないため、`sync-db` 実行中も Grafana のクエリは VIEW を見失わない（race condition の解消）
+- ソース・オブ・レコードは `session-index.jsonl` と transcript JSONL。`events` table はそれらから組み立てた **構造化キャッシュ**（SoR ではなく derive 可能なため、最悪削除して `sync-db --recheck` で再生成できる）
+- VIEW 定義の変更は events 再投入を伴わない（VIEW を DROP & CREATE するだけで済む）。events table の DDL が変わるケースだけが「重い」マイグレーション
+- DB 破損時はファイルを消して `sync-db --recheck` で回復する
+- VIEW を毎回再定義しないため、`sync-db` 実行中も Grafana のクエリは VIEW を見失わない
 
-中間ファイルが SoR である構造は、hook の書き込みを軽量に保つためでもある。hook はセッション中に同期実行されるため、JSONL への追記だけに留める。構造化変換は `sync-db` に委譲する。
+新メトリクスの追加は次の 3 通り:
+
+- **既存イベントに属性を追加** — `agent.transcript.scanned` に新フィールドを増やす。events DDL は変更不要、VIEW 定義のみ更新
+- **新イベント名を追加** — `agent.tool.used` のような細粒度イベントを増やす場合。events DDL は変更不要、新 VIEW を作るか既存 VIEW を `event_name = '...'` で JOIN
+- **events table の DDL 変更** — 想定されるのは index 追加など。`schema_hash` 不一致でフル再構築
+
+中間ファイルが SoR である構造は、hook の書き込みを軽量に保つためでもある。hook はセッション中に同期実行されるため、JSONL への追記だけに留める。events への追記と OTel emit は `sync-db` / `flush` に委譲する。
 
 `schema.sql` の編集忘れによるハッシュ未更新を防ぐため、CI（`.github/workflows/schema-hash.yml`）で `go generate ./... && git diff --exit-code` を実行する。
 
@@ -379,53 +385,53 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 
 ## サーバ側集約パイプライン
 
-### 全体方針
+### 全体方針 — append-only events + OTLP/HTTP
 
-ローカル `~/.claude/agent-telemetry.db` に閉じていたメトリクスを、複数マシン・複数ユーザのデータを統合できるサーバへ送る経路を追加する。クライアントは `sync-db` 完了後の **集計値のみ** を push し、サーバはそれをクライアントと同一の SQLite スキーマでそのまま upsert する。集計（transcript パース・PR 集計）はクライアント側で完結し、サーバは「dumb ingest layer」として責務を最小化する。ローカル Grafana とサーバ Grafana が同じダッシュボード JSON を共有できるよう、サーバの DB スキーマはクライアントと同一のものを使う。
+ローカル `~/.claude/agent-telemetry.db` に閉じていたメトリクスを、複数マシン・複数ユーザのデータを統合できるサーバへ送る経路を、**append-only なイベント列の OTLP/HTTP 転送** として設計する。クライアントはローカルで蓄積した `events` テーブルから未送信行を抽出して OTel Logs として送り、サーバは `event_id` で冪等に追記する。`sessions` / `transcript_stats` / `pr_metrics` 等の集計はサーバ・クライアントの両方で **events からの VIEW** として組み立てる。
 
-### 送信するもの — `sessions` 行 + `transcript_stats` 行
+旧設計（`sessions` / `transcript_stats` 行を `POST /v1/metrics` で upsert）は [0009] / [0028]-[0031] で実装したが、`is_merged` / `pr_url` / `review_comments` 等の後追い更新を `pushed_session_versions` の SHA-256 hash 追跡で実現せざるを得ず、また `schema_hash` 不一致でサーバが受信拒否する設計が新メトリクス追加時の運用負荷を生んでいた。これらの摩擦はすべて「mutable な行で状態を表現していた」ことに起因しており、metrics 本来の append-only な性質に揃えれば消える ([0038]).
 
-クライアントは `~/.claude/agent-telemetry.db` の `sessions` と `transcript_stats` から差分行を抽出して送る。`session-index.jsonl` の生行・transcript JSONL（会話本体）・rollout JSONL は **送らない**。
+### 送信するもの — events のみ
+
+クライアントは `~/.claude/agent-telemetry.db` の `events` から差分行を抽出して OTel Logs として送る。`session-index.jsonl` の生行・transcript JSONL（会話本体）・rollout JSONL は **送らない**。後追い更新（`is_merged` 等）は **新しい `agent.pr.observed` イベントを追記する** ことで表現し、過去 events 行の mutation はしない。サーバ側 VIEW が同一 `(session_id, coding_agent)` で `MAX(occurred_at)` の `agent.pr.observed` を採用するため、最新状態が自動的に反映される。
 
 理由:
 
-- 送信サイズが圧倒的に小さい（1 セッションあたり 1〜2 KB、月数 MB）
-- サーバ側の集計負荷がゼロ。`internal/syncdb/` を持たず、受信値の `INSERT OR REPLACE` だけ
-- transcript（会話本体）がサーバに渡らないため、プライバシー観点の議論が不要になる
-- transcript / rollout の保管はクライアント手元に残るので、新メトリクスを追加したくなった場合は「全クライアントを新 binary に更新 → 各クライアントで `sync-db --recheck && push --full`」で遡及反映できる
+- 送信サイズは依然として小さい（1 セッションあたり events 数〜十数件 × 1 KB 程度。月数 MB）
+- サーバ側に集計ロジックを持たない点は変わらない（OTLP Logs receiver + `INSERT OR IGNORE` のみ）
+- transcript（会話本体）はサーバに渡らないため、プライバシー観点は旧設計と同じく議論不要
+- 過去 events が server / client の両方に残るので、新メトリクスを増やす場合は VIEW の再定義だけで遡及反映できる（旧設計で必要だった「全クライアントを新 binary に更新 → `push --full`」運用は不要になる）
 
 ### 採用しなかった代替
 
-- **raw JSONL 転送 + サーバ側 `internal/syncdb/` 再実行**: 当初の第一候補。サーバ側で過去 transcript から新メトリクスを再集計できる利点があったが、(1) 送信サイズが 1 セッション数 MB〜数十 MB に膨らむ、(2) サーバが transcript を保管することになりプライバシー観点とストレージ運用の議論が必須になる、(3) サーバ側で transcript パース処理のメンテナンスが発生する、の 3 点が大きい。指標追加の遡及反映は前述のクライアント binary 配布経路で代替できるため、軽量な集計値転送を優先した
-- **OTLP / Prometheus remote write**: agent-telemetry のデータは PR 単位の構造化レコードで、`is_merged` / `pr_url` / `review_comments` が backfill で後追い更新される。append-only に近い OTLP 経路では遡及更新の表現が面倒。ローカル SQLite + Grafana スタックと OTel collector / Mimir スタックの二重メンテナンスも避けたい。`docs/metrics.md` の OpenMetrics カタログは観察軸の整理として残るが、収集経路の固定化は意味しない
-- **`agent-telemetry-server` でも `internal/syncdb/` 全体を共通化**: 集計値送信に切り替えたためサーバ側で集計ロジックは不要。共通化対象は schema DDL（`schema.sql`）だけで十分
+- **旧設計（`sessions` 行 upsert + SHA-256 hash 追跡）の維持**: 後追い更新のたびに行 hash を計算 → 比較 → 再送、というロジックが本質的に「mutable state を transport で表現する」hack で、events 1 件追記で済む話を複雑化していた。新メトリクス追加時の `schema_mismatch` 全停止も運用負荷が大きい
+- **OTLP Metrics signal の採用**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため Logs（events）に統一する。後で Counter が必要になった時点で `/v1/metrics` を追加する
+- **raw JSONL 転送 + サーバ側 transcript 解析**: 送信サイズ膨張・プライバシー観点・サーバ側のパーサ保守の 3 点が大きく、旧設計の議論で既に却下されている（[0009]）。append-only 化でもこの判断は変わらない
+- **イベント table を持たず、行 mutation で済ます append-only シミュレーション**: 一見「集計行に `updated_at` を持たせて INSERT OR REPLACE すれば append-only っぽくなる」が、過去の状態を保てないので replay ができず、events table に置き換えるべき以上のものは生まれない
 
-### プロトコル — 独自 HTTP JSON
+### プロトコル — OTLP/HTTP Logs
+
+OTel SDK / Collector エコシステムに乗ることを優先し、独自 JSON ではなく **OTLP/HTTP JSON エンコード** を採用する。クライアントは `go.opentelemetry.io/otel/sdk/log` + `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp` を使い、`/v1/logs` に POST する。サーバは自前の OTLP Logs receiver を `internal/serverpipe/` に持つ（OTel Collector を間に挟まないことで運用構成を単純化する）。
 
 ```
-POST /v1/metrics
+POST /v1/logs
 Authorization: Bearer <api_key>
 Content-Type: application/json
 Content-Encoding: gzip   (optional)
 
-{
-  "client_version": "x.y.z",
-  "schema_hash": "<sync-db スキーマ SHA-256>",
-  "sessions": [
-    { "session_id": "...", "coding_agent": "...", ... }
-  ],
-  "transcript_stats": [
-    { "session_id": "...", "coding_agent": "...", ... }
-  ]
-}
+(OTLP/HTTP Logs payload — resourceLogs[*].scopeLogs[*].logRecords[*])
 ```
 
-- 各行のスキーマは `docs/spec.md ## SQLite データモデル` の `sessions` / `transcript_stats` テーブルと完全一致
-- `schema_hash` はクライアント `internal/syncdb/schema_hash.go` の埋め込み値。サーバ DB の `schema_meta` ハッシュと一致しない場合、サーバは `schema_mismatch: true` を返して受信拒否
-- HTTP gzip は **optional**（集計値だけなので無圧縮でも数 KB〜数百 KB で収まる）。クライアントは payload size を見て gzip 適用を判断
-- 1 リクエスト 50 MB 上限（保険）。集計値だけなので通常は超えない
+各 logRecord は次の semantic に従う:
 
-### 差分検知 — `state.json` の `pushed_session_versions`
+- `eventName` = `agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed`
+- `attributes` に `event_id` / `session_id` / `coding_agent` と、イベント固有属性を flat に格納
+- `timeUnixNano` = `occurred_at` の epoch nano
+- `body` は使わない（属性に統一）
+
+サーバの ingest ハンドラは payload を分解して events table に `INSERT OR IGNORE`。受信形式が OTLP なので、将来 OTel Collector を経由する構成や、Loki / Tempo などへの fanout も自然に追加できる。
+
+### 差分検知 — `state.json` の `last_flushed_sequence`
 
 `agent-telemetry-state.json` に新フィールドを追加する:
 
@@ -433,27 +439,38 @@ Content-Encoding: gzip   (optional)
 {
   "last_backfill_offset": 123,
   "last_meta_check": "...",
-  "pushed_session_versions": {
-    "<coding_agent>:<session_id>": "<sha256 of sessions row + transcript_stats row>"
-  }
+  "last_flushed_sequence": 12345
 }
 ```
 
-- キーは `<coding_agent>:<session_id>` 形式の文字列（例: `"claude:abc-123"`）。`sessions` / `transcript_stats` の PRIMARY KEY が `(session_id, coding_agent)` の複合キーなので、session_id 単独だと Claude / Codex 間で UUID 衝突した際に hash が上書きされる。session_id 自身は外部出力（Grafana 表示等）で生 UUID のまま扱うが、`pushed_session_versions` は内部状態なので prefix 化する（外部出力には漏れない）
-- 各 push 時に対象セッションの `sessions` 行 + `transcript_stats` 行を JSON canonicalize → SHA-256 → `pushed_session_versions` と比較
-- hash 一致 → 既送信、スキップ
-- hash 不一致 → 後追い更新あり、再送信
-- backfill が `is_merged` / `pr_url` / `review_comments` / `pr_title` を更新すると `sessions` 行の hash が変わり、再送信される
-- 進行中セッション（`ended_at` または `end_reason` が空）は送信対象外
-- `agent-telemetry push --full` は `pushed_session_versions` を無視してフルスキャンする（新メトリクス追加後の遡及送信などに使用）
+- クライアント側 `events.local_sequence` は挿入順に増える整数。クライアントは `events` から `local_sequence > last_flushed_sequence` の行を抽出して送る
+- cursor 前進は **transport の成否** で決める（OTLP partialSuccess では再送しない）:
+  - **HTTP 2xx**（`rejectedLogRecords` の値に関わらず）→ `last_flushed_sequence` を送信した最大 `local_sequence` に進める。`rejectedLogRecords > 0` は「サーバが永続的に拒否した不正レコード」（validation 失敗で `rejected.log` に記録済み）であり、OTLP 仕様上 retry しない前提。cursor を据え置くと同じ不正データを無限再送する無限ループになるため、件数を warning に出して前進する（`internal/serverclient/flush.go`）
+  - **ネットワークエラー / 非2xx（5xx / 429 / 401）** → 配送失敗。`last_flushed_sequence` を **進めず** 次回 flush で同じ範囲を再送する。受理済み events は server 側 `INSERT OR IGNORE` で無害にスキップされるので全件再送は安全
+- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_sequence` より大きい `local_sequence` になり、次の flush で自動的に拾われる。SHA-256 hash 計算は不要
+- 既存 state.json にこのフィールドが欠けていれば 0 扱い（次の flush で全 events を送る。サーバ側で冪等にスキップされる）
+- 進行中セッション（`agent.session.ended` 未着）の events も送る。旧設計のように「最後の Stop 発火まで送信対象から除外」する制約は不要（events 単位で送れるため、進行中の状態もダッシュボードに反映できる）
 
-### 送信タイミング — 独立コマンド `agent-telemetry push --since-last`
+### `event_id` の deterministic 採番（content hash）
 
-Stop hook 経路には載せない:
+`event_id` は **イベント内容から deterministic に導出する content hash**。`sessions` / `transcript_stats` への INSERT を events に変換する INSTEAD OF INSERT トリガ（`internal/syncdb/schema/schema.sql`）が、`at_event_id(event_name ‖ coding_agent ‖ session_id ‖ attributes_json)` を呼んで採番する（`at_event_id` は SHA-256 hex を返す deterministic scalar function。client / server 双方が import する `internal/syncdb/schema` の `funcs.go` で登録し、トリガ発火時に解決される。read 専用の Grafana / 生 sqlite3 はトリガを起こさないので関数を必要としない）。
+
+トリガの INSERT は **`INSERT OR IGNORE`**。これにより:
+
+- **同一内容の再導出は dedup される**: `sync-db` は session-index の全セッションを毎回 `INSERT OR REPLACE INTO sessions` で流すが、内容が変わらなければ `event_id` が一致して events に積まれない。これがないとランダム ID 採番では sync-db 実行のたびに 1 セッション ×4 イベントが無限増殖し、flush も重複再送する（[0038] のレビューで顕在化）
+- **内容が変わった snapshot は新 row として積まれる**: `is_merged` の反転や再 scan で attributes が変われば hash が変わり、新しい `event_id` の row が追記される。VIEW は `MAX(local_sequence)` で latest-wins を取る
+- 一発もの（`agent.session.started` / `ended`）も content hash なので、後追いで `user_id` 等が埋め戻された場合は新 row が積まれて latest-wins で反映される
+
+`event_id` はサーバ側の冪等性キー（`INSERT OR IGNORE` の衝突キー）であり、**差分送信の cursor には使わない**。理由は content hash が時系列ソート不可で、`event_id > last_flushed_*` のような辞書順 cursor が破綻するため。cursor は採番方式と無関係に単調増加する `local_sequence` が担う（前節）。
+
+`migrate-to-events` は実体としては `sync-db` と同じ経路（`syncdb.RunForAgents`）を一度走らせるだけで、同じ deterministic `event_id` で events を再生成する。content hash により再実行しても重複しないため、別途 `source_row_hash` のような重複防止キーは持たない。
+
+### 送信タイミング — 独立コマンド `agent-telemetry flush --since-last`
+
+Stop hook 経路には載せない方針は維持する。理由は旧設計と同じ:
 
 - Stop hook は既に `backfill` + `sync-db` を同期実行しており、ネット I/O を追加すると latency 影響が拡大する
 - 送信失敗が Stop hook の挙動に直接影響すると、デバッグ困難な fail mode を生む
-- 過去に launchd を撤廃した経緯（[issues/closed/0020-design-backfill-evolution-to-stop-hook.md](../issues/closed/0020-design-backfill-evolution-to-stop-hook.md)）は「Claude Code 外の唯一の手作業を残すと UX が悪化する」が、サーバ送信は **オプトイン**。サーバを使わないユーザに新たな手作業を要求しない
 
 ユーザは以下のいずれかで起動する:
 
@@ -464,17 +481,9 @@ Stop hook 経路には載せない:
 
 ### 認証 — 単一 API key
 
-サーバ起動時に `AGENT_TELEMETRY_SERVER_TOKEN` 環境変数で API key を渡す。クライアントは `~/.config/agent-telemetry/config.toml`（旧 `~/.claude/agent-telemetry.toml` を fallback）の `[server]` セクションで同値を持つ。
+旧設計と同じ。サーバ起動時に `AGENT_TELEMETRY_SERVER_TOKEN` 環境変数で API key を渡し、クライアントは `~/.config/agent-telemetry/config.toml` の `[server] token` で同値を持つ。`user_id`（人物識別）は events の `agent.session.started` 属性に含まれる。**API key の認証**（信頼境界）と **`user_id` 経路**（集計軸）は責務を分ける。
 
-```toml
-[server]
-endpoint = "https://telemetry.example.com"
-token = "xxx"
-```
-
-`user_id`（人物識別）は payload の `sessions` 行に含まれる。**API key の認証**（信頼境界）と **`user_id` 経路**（集計軸）は責務を分ける。チーム内信頼を前提とし、人物単位の write 制限や OIDC は需要が出てから追加する。
-
-### サーバ側 — dumb ingest API
+### サーバ側 — OTLP Logs receiver + events table
 
 新設するパッケージ:
 
@@ -482,63 +491,79 @@ token = "xxx"
 cmd/
   agent-telemetry-server/main.go     # HTTP server エントリポイント
 internal/
-  serverpipe/                        # ingest ハンドラ（受信 → schema_hash 検証 → INSERT OR REPLACE）
+  serverpipe/                        # OTLP Logs receiver（受信 → INSERT OR IGNORE）
 ```
 
 サーバ側のデータ配置:
 
 ```
 <server_data_dir>/
-  agent-telemetry.db                 # 全 user 集約 SQLite
-  collisions.log                     # session_id 衝突ログ
+  agent-telemetry.db                 # 全 user 集約 SQLite (events table + VIEW)
+  rejected.log                       # 認証失敗 / 不正 payload のログ
 ```
 
 ingest ハンドラの責務:
 
 1. Bearer token を検証
-2. `schema_hash` をサーバ DB の `schema_meta` と比較。不一致なら `schema_mismatch: true` を返して受信拒否
-3. 受信した `sessions` / `transcript_stats` 行を `(session_id, coding_agent)` PK で `INSERT OR REPLACE`
-4. レスポンスとして受信件数 / スキップ件数 / `schema_mismatch` を返す
+2. OTLP Logs payload をパースして `eventName` / `attributes` / `timeUnixNano` を取り出す
+3. events table に `INSERT OR IGNORE`（`event_id` PK で重複排除）
+4. OTLP/HTTP の標準 `partialSuccess` レスポンスを返す（`rejectedLogRecords`、`errorMessage`）
 
-`internal/syncdb/schema.sql` をサーバ binary にも埋め込み、起動時に `schema_meta` ハッシュ比較で DDL 再構築する仕組みはクライアントと同じ。**集計ロジック（transcript パース等）はサーバ側に存在しない**。
+`internal/syncdb/schema.sql`（events DDL + 派生 VIEW 定義）をサーバ binary にも埋め込み、起動時に `schema_meta` ハッシュ比較で DDL 再構築する仕組みはクライアントと同じ。`schema_hash` 不一致でクライアント送信を全停止させるロジックは持たない（events table の DDL は安定で、新メトリクスは新属性の追加で表現できるため）。
 
-サーバの SQLite は Grafana datasource として読み込まれる。本番形態は k8s pod を想定し、Grafana の **設定資産**（`grafana/dashboards/agent-telemetry.json` と `grafana/provisioning/datasources/*.yaml`）はローカル `docker-compose.yaml` の volume mount と k8s ConfigMap mount の **両方から同じファイルを参照** する。これによりダッシュボード変更が両環境に同時反映され、二重メンテナンスを避ける。datasource の `uid: agent-telemetry` を踏襲することでクエリ JSON もそのまま動く。配布手段（docker-compose / k8s）自体は揃えず、それぞれの環境ネイティブな形を取る。
+サーバの SQLite は Grafana datasource として読み込まれる。本番形態は k8s pod を想定し、Grafana の **設定資産**（`grafana/dashboards/agent-telemetry.json` と `grafana/provisioning/datasources/*.yaml`）はローカル `docker-compose.yaml` の volume mount と k8s ConfigMap mount の **両方から同じファイルを参照** する。これによりダッシュボード変更が両環境に同時反映され、二重メンテナンスを避ける。datasource の `uid: agent-telemetry` を踏襲し、VIEW の出力スキーマも旧設計と同じなのでクエリ JSON は無変更で動く。
 
-### スキーマバージョン整合性と新メトリクス追加
+### 新メトリクス追加の運用
 
-クライアントとサーバで `internal/syncdb/schema_hash.go` の埋め込み値が一致している必要がある。新メトリクスを追加した場合の遡及反映手順:
+旧設計の「サーバ先行デプロイ → 全クライアント binary 更新 → `push --full`」運用は不要になる。流れ:
 
-1. サーバ binary を新スキーマでデプロイ（起動時に DDL 自動再構築）
-2. 全クライアント binary を新バージョンに更新
-3. 各クライアントで `agent-telemetry sync-db --recheck && agent-telemetry push --full` を実行（過去全セッションを新スキーマで再集計し再送信）
+1. 新属性 / 新イベントを emit するクライアント binary を順次配布（旧クライアントは無変更でも既存 events を送り続ける）
+2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）。サーバ起動時に `schema_meta` ハッシュ比較で VIEW が再定義される
+3. 既存セッションについて新属性を遡及反映したい場合は、クライアントで `sync-db --recheck` を実行すると `agent.transcript.scanned` 等の snapshot イベントが新属性付きで再 emit される。次の `flush` で events に新行が追記され、VIEW の latest-wins で過去セッションも新カラムが埋まる
 
-クライアントが古いまま push すると、サーバが `schema_mismatch: true` を返して受信拒否する。**サーバはクライアントよりも先に新スキーマに上げる必要がある**（クライアント先行で push されると古いスキーマで永続化される懸念があるため）。
+events table の DDL に互換破壊変更を入れる場合のみ、新 endpoint（例: `/v2/logs`）を切るか、`migrate-to-events` のような明示的 migration を用意する運用とする。
 
 ### 衝突セッションの扱い
 
-複数マシンの同一ユーザで session_id が衝突する確率は UUID として実用上ゼロ。物理コピーされた DB を別マシンから再 push したケースだけが実際の衝突源になる。サーバは `(session_id, coding_agent)` PK で `INSERT OR REPLACE` する（最後に届いたものが勝つ）。衝突検出時は `<server_data>/collisions.log` に記録する。
+複数マシンの同一ユーザで session_id が衝突する確率は UUID として実用上ゼロ。物理コピーされた DB を別マシンから再 flush したケースだけが実際の衝突源になる。サーバは `event_id` PK で `INSERT OR IGNORE` する（同一 events は重複排除される）。本当に異なる events が同一 session_id で来た場合（衝突）は events に両方残り、VIEW 側の `MAX(occurred_at)` で最新が採用される。衝突セッションの可視化が必要になった時点で別 VIEW を追加する。
+
+### VIEW の materialization
+
+`sessions` / `transcript_stats` / `pr_metrics` / `session_concurrency_*` は最初は単純な SQL VIEW として定義する。events が増えてもダッシュボードのクエリレイテンシが許容範囲内なら materialization は不要。
+
+events 数が大きくなって VIEW のオンザフライ集約が重くなった場合の選択肢:
+
+- **trigger ベースのマテリアライズドテーブル**: events への INSERT 時に対応する `sessions_mv` / `transcript_stats_mv` 行を upsert する trigger を貼る。クエリは MV テーブルを見る
+- **バッチリフレッシュ**: 定期的に `INSERT OR REPLACE INTO sessions_mv SELECT * FROM sessions` で MV を更新
+
+最初はオンザフライ VIEW で進め、ベンチマークで顕在化したら materialization に切り替える。
+
+### 旧 push 経路からの移行
+
+[0028] / [0029] で実装した「`sessions` 行 / `transcript_stats` 行を `POST /v1/metrics` で送る」経路は本仕様で deprecate する。
+
+1. クライアント・サーバとも一度だけ `agent-telemetry migrate-to-events` / `agent-telemetry-server migrate-to-events` を実行
+   - 既存 `sessions` 行 → `agent.session.started` + `agent.session.ended` + `agent.pr.observed` の擬似イベント列に展開
+   - 既存 `transcript_stats` 行 → `agent.transcript.scanned` の擬似イベントに展開
+   - `event_id` は通常 event と同じ deterministic content hash（`at_event_id`）で振る。content hash が再実行時の重複防止を兼ねるため、別途 `source_row_hash` のようなキーは持たない（前節「`event_id` の deterministic 採番」）
+   - `occurred_at` は対応するカラム（`timestamp` / `ended_at` 等）から推定。不明分は migration 実行時刻
+   - 実体は `sync-db` と同じ経路（`syncdb.RunForAgents`）を一度走らせるだけ。既存 `sessions` / `transcript_stats` 行ではなく session-index / transcript を読み直して events を deterministic に再生成する
+2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える
+3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを残しておき、1 リリース併走後に削除（既存ユーザに移行猶予を与える）
 
 ### 配布形態 — Go binary + Docker image + k8s manifest
 
-| 形態 | 提供物 | 想定 |
-|---|---|---|
-| Go binary | `cmd/agent-telemetry-server/`（goreleaser で配布） | Linux VPS / bare metal で systemd unit 経由起動。`contrib/systemd/agent-telemetry-server.service` を同梱 |
-| Docker image | `Dockerfile.server`（GitHub Container Registry `ghcr.io/ishii1648/agent-telemetry-server` で配布、main push と tag push で自動更新） | k8s pod が pull する正本イメージ。ローカル動作確認時は `docker run` でも使える |
-| k8s manifest | `deploy/k8s/`（Kustomize: base + overlays/local + overlays/production） | 本番デプロイの正本。Deployment（server / Grafana）、Service、ConfigMap（dashboard JSON / datasource provisioning）、PVC（共有 SQLite）、Secret（API key）を提供 |
-
-`docker-compose.server.yml` は **作らない**。本番が k8s 想定なので二重メンテナンスを避ける。ローカル動作確認は `kind` / `minikube` で同じ manifest を回せばよい。
-
-Grafana の設定資産（dashboard JSON / datasource provisioning yaml）はローカル `docker-compose.yaml` と k8s ConfigMap の両方から参照される 1 セットで、変更は両環境に同時反映される。
+旧設計と同じ。`cmd/agent-telemetry-server/` を goreleaser で配布し、Docker image を `ghcr.io/ishii1648/agent-telemetry-server` で自動更新、k8s manifest を `deploy/k8s/` に Kustomize ベースで提供する。OTLP Logs receiver は単純な HTTP server なので、TLS 終端は Ingress / k8s Service / リバースプロキシ側に寄せる。
 
 ### 送信量とストレージ
 
-| ケース | サイズ（集計値のみ、無圧縮） |
+| ケース | サイズ（events のみ、無圧縮） |
 |---|---|
-| 個人 1 日（10〜30 セッション × 1〜2 KB） | 10〜60 KB |
-| 個人 1 ヶ月 | 300 KB〜1.8 MB |
-| 5 人チーム 1 ヶ月 | 1.5〜9 MB |
+| 個人 1 日（10〜30 セッション × events 数〜十数件 × 1 KB） | 30〜400 KB |
+| 個人 1 ヶ月 | 1〜12 MB |
+| 5 人チーム 1 ヶ月 | 5〜60 MB |
 
-集計値だけなのでネットワーク・ストレージともに極小。GC は実用上不要（数年分でも数百 MB 規模）。
+events 単位なので旧設計（集計値のみ）より体積は数倍だが、ネットワーク・ストレージともに依然として極小。GC は実用上不要（数年分でも数 GB 規模）。
 
 ---
 
@@ -550,7 +575,7 @@ Grafana の設定資産（dashboard JSON / datasource provisioning yaml）はロ
 - transcript のパス取得失敗時は当該セッションの `transcript_stats` が空になるが、`sessions` 行は残る
 - Codex の SessionEnd 不在を Stop hook で代替するため、Stop hook を経由せずプロセスが kill された場合は最後の Stop 発火時刻が `ended_at` になる（rollout JSONL 最終 event での補正は backfill 経由）
 - Codex の `ask_user_question` 相当指標が無いため、agent を跨いだ「仕様不明瞭さ」比較はできない
-- サーバ送信を有効化する場合、`agent-telemetry push --since-last` の定期起動を cron / launchd / systemd timer で自前運用する必要がある（Stop hook hot path に乗せないことの代償）
-- 進行中セッション（`ended_at` 空）はサーバ送信対象外。最後の Stop 発火後にしか push されない
-- クライアントとサーバで `internal/syncdb/` のスキーマハッシュが一致している必要がある。新メトリクス追加時はサーバを先にデプロイし、全クライアントを更新後に `push --full` で遡及反映する運用が必要
+- サーバ送信を有効化する場合、`agent-telemetry flush --since-last` の定期起動を cron / launchd / systemd timer で自前運用する必要がある（Stop hook hot path に乗せないことの代償）
+- backfill が後追い更新を検出した時点で新しい `agent.pr.observed` イベントを events に追記する責務がクライアント側にある。backfill が動かないと最新状態がサーバへ反映されない
+- events のオンザフライ VIEW 集約は events 数が大きくなるとクエリレイテンシに効く。materialization 切替の閾値は実測で決める（最初は VIEW のまま運用）
 - サーバ認証は単一 API key。複数ユーザでの read/write 権限分離（user 別 RLS、OIDC 等）は将来課題
