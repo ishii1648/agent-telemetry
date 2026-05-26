@@ -444,22 +444,26 @@ Content-Encoding: gzip   (optional)
 ```
 
 - クライアント側 `events.local_sequence` は挿入順に増える整数。クライアントは `events` から `local_sequence > last_flushed_sequence` の行を抽出して送る
-- 送信成功時に `last_flushed_sequence` を更新する（最大の `local_sequence` に進める）
+- cursor 前進は **transport の成否** で決める（OTLP partialSuccess では再送しない）:
+  - **HTTP 2xx**（`rejectedLogRecords` の値に関わらず）→ `last_flushed_sequence` を送信した最大 `local_sequence` に進める。`rejectedLogRecords > 0` は「サーバが永続的に拒否した不正レコード」（validation 失敗で `rejected.log` に記録済み）であり、OTLP 仕様上 retry しない前提。cursor を据え置くと同じ不正データを無限再送する無限ループになるため、件数を warning に出して前進する（`internal/serverclient/flush.go`）
+  - **ネットワークエラー / 非2xx（5xx / 429 / 401）** → 配送失敗。`last_flushed_sequence` を **進めず** 次回 flush で同じ範囲を再送する。受理済み events は server 側 `INSERT OR IGNORE` で無害にスキップされるので全件再送は安全
 - backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_sequence` より大きい `local_sequence` になり、次の flush で自動的に拾われる。SHA-256 hash 計算は不要
 - 既存 state.json にこのフィールドが欠けていれば 0 扱い（次の flush で全 events を送る。サーバ側で冪等にスキップされる）
 - 進行中セッション（`agent.session.ended` 未着）の events も送る。旧設計のように「最後の Stop 発火まで送信対象から除外」する制約は不要（events 単位で送れるため、進行中の状態もダッシュボードに反映できる）
 
-### `event_id` と flush cursor の分離
+### `event_id` の deterministic 採番（content hash）
 
-クライアントは各イベントを emit する時点で `event_id` を一意 ID として採番する。`event_id` はサーバ側の冪等性キーであり、差分送信の cursor には使わない。
+`event_id` は **イベント内容から deterministic に導出する content hash**。`sessions` / `transcript_stats` への INSERT を events に変換する INSTEAD OF INSERT トリガ（`internal/syncdb/schema/schema.sql`）が、`at_event_id(event_name ‖ coding_agent ‖ session_id ‖ attributes_json)` を呼んで採番する（`at_event_id` は SHA-256 hex を返す deterministic scalar function。client / server 双方が import する `internal/syncdb/schema` の `funcs.go` で登録し、トリガ発火時に解決される。read 専用の Grafana / 生 sqlite3 はトリガを起こさないので関数を必要としない）。
 
-理由:
+トリガの INSERT は **`INSERT OR IGNORE`**。これにより:
 
-- 時系列ソート可能な ID を使っても、migration / replay / clock skew を考えると「送信済み境界」としては DB 挿入順の方が明確
-- content hash 型の ID を混ぜると `event_id > last_flushed_event_id` のような辞書順 cursor が破綻する
-- snapshot イベントは再 scan 時に新しい観測として積むため、同一内容の再 emit を必ず同じ `event_id` に潰す必要はない
+- **同一内容の再導出は dedup される**: `sync-db` は session-index の全セッションを毎回 `INSERT OR REPLACE INTO sessions` で流すが、内容が変わらなければ `event_id` が一致して events に積まれない。これがないとランダム ID 採番では sync-db 実行のたびに 1 セッション ×4 イベントが無限増殖し、flush も重複再送する（[0038] のレビューで顕在化）
+- **内容が変わった snapshot は新 row として積まれる**: `is_merged` の反転や再 scan で attributes が変われば hash が変わり、新しい `event_id` の row が追記される。VIEW は `MAX(local_sequence)` で latest-wins を取る
+- 一発もの（`agent.session.started` / `ended`）も content hash なので、後追いで `user_id` 等が埋め戻された場合は新 row が積まれて latest-wins で反映される
 
-`migrate-to-events` も `event_id` は通常 event と同じ一意 ID を採番し、旧行から作った擬似イベントであることは `attributes.migration_source` / `attributes.source_row_hash` に残す。再実行時の重複防止は `source_row_hash` の UNIQUE index か migration state で担い、flush cursor とは分離する。
+`event_id` はサーバ側の冪等性キー（`INSERT OR IGNORE` の衝突キー）であり、**差分送信の cursor には使わない**。理由は content hash が時系列ソート不可で、`event_id > last_flushed_*` のような辞書順 cursor が破綻するため。cursor は採番方式と無関係に単調増加する `local_sequence` が担う（前節）。
+
+`migrate-to-events` は実体としては `sync-db` と同じ経路（`syncdb.RunForAgents`）を一度走らせるだけで、同じ deterministic `event_id` で events を再生成する。content hash により再実行しても重複しないため、別途 `source_row_hash` のような重複防止キーは持たない。
 
 ### 送信タイミング — 独立コマンド `agent-telemetry flush --since-last`
 
@@ -541,8 +545,9 @@ events 数が大きくなって VIEW のオンザフライ集約が重くなっ�
 1. クライアント・サーバとも一度だけ `agent-telemetry migrate-to-events` / `agent-telemetry-server migrate-to-events` を実行
    - 既存 `sessions` 行 → `agent.session.started` + `agent.session.ended` + `agent.pr.observed` の擬似イベント列に展開
    - 既存 `transcript_stats` 行 → `agent.transcript.scanned` の擬似イベントに展開
-   - `event_id` は通常 event と同じ一意 ID で振る。再実行時の重複防止は `attributes.source_row_hash = sha256(coding_agent || session_id || event_name)` を UNIQUE 扱いにするか、migration state で担う
+   - `event_id` は通常 event と同じ deterministic content hash（`at_event_id`）で振る。content hash が再実行時の重複防止を兼ねるため、別途 `source_row_hash` のようなキーは持たない（前節「`event_id` の deterministic 採番」）
    - `occurred_at` は対応するカラム（`timestamp` / `ended_at` 等）から推定。不明分は migration 実行時刻
+   - 実体は `sync-db` と同じ経路（`syncdb.RunForAgents`）を一度走らせるだけ。既存 `sessions` / `transcript_stats` 行ではなく session-index / transcript を読み直して events を deterministic に再生成する
 2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える
 3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを残しておき、1 リリース併走後に削除（既存ユーザに移行猶予を与える）
 

@@ -37,15 +37,16 @@ type FlushResult struct {
 }
 
 type FlushAgentResult struct {
-	Eligible     int
-	Sent         int
-	Skipped      int
-	Batches      int
-	PayloadBytes int64
-	Rejected     int
-	NoConfig     bool
-	StateUpdated bool
-	DryRun       bool
+	Eligible      int
+	Sent          int
+	Skipped       int
+	Batches       int
+	PayloadBytes  int64
+	Rejected      int
+	RejectedError string
+	NoConfig      bool
+	StateUpdated  bool
+	DryRun        bool
 }
 
 type EventRow struct {
@@ -195,12 +196,21 @@ func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, cfg Serve
 	for _, b := range batches {
 		resp, sentBytes, err := postLogsBatch(ctx, opts.HTTPClient, endpoint, cfg.Token, b)
 		ar.PayloadBytes += int64(sentBytes)
+		// A transport failure (network error / non-2xx) means the batch never
+		// landed: return without advancing the cursor so the next flush resends
+		// the same range. postLogsBatch already maps >=400 to an error.
 		if err != nil {
 			return ar, err
 		}
+		// HTTP 2xx + rejectedLogRecords>0 is OTLP partial success: the server
+		// permanently rejected those records (failed validation — missing
+		// event_id/session_id/etc.) and logged them. Per the OTLP spec a partial
+		// success MUST NOT be retried; resending the same malformed records would
+		// loop forever. So we count them, surface a warning, and let the cursor
+		// advance past the batch. See docs/spec.md ## プロトコル.
 		ar.Rejected += resp.PartialSuccess.RejectedLogRecords
-		if resp.PartialSuccess.RejectedLogRecords > 0 {
-			return ar, fmt.Errorf("server rejected %d log records: %s", resp.PartialSuccess.RejectedLogRecords, resp.PartialSuccess.ErrorMessage)
+		if resp.PartialSuccess.RejectedLogRecords > 0 && resp.PartialSuccess.ErrorMessage != "" {
+			ar.RejectedError = resp.PartialSuccess.ErrorMessage
 		}
 	}
 	if len(events) > 0 {
@@ -434,6 +444,12 @@ func (r *FlushResult) Summarize(w io.Writer) {
 		default:
 			fmt.Fprintf(w, "flush[%s]: eligible=%d sent=%d skipped=%d batches=%d payload=%d bytes rejected=%d\n",
 				name, ar.Eligible, ar.Sent, ar.Skipped, ar.Batches, ar.PayloadBytes, ar.Rejected)
+			if ar.Rejected > 0 {
+				// Rejected records are permanently dropped (cursor advanced past
+				// them); warn so the operator can inspect the server's rejected.log.
+				fmt.Fprintf(w, "  warning: %d records permanently rejected by server (not retried): %s\n",
+					ar.Rejected, ar.RejectedError)
+			}
 		}
 	}
 }

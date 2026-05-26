@@ -131,12 +131,29 @@ SELECT
     COALESCE(json_extract(attributes, '$.is_ghost'), 0) AS is_ghost
 FROM latest_stats;
 
+-- These INSTEAD OF INSERT triggers let sync-db (and the legacy /v1/metrics
+-- upsert) keep writing whole sessions / transcript_stats rows while the events
+-- table is the actual store. event_id is derived deterministically from the
+-- event content via at_event_id() (registered in funcs.go) and inserts use
+-- INSERT OR IGNORE, so re-running sync-db over unchanged data dedups instead of
+-- appending a fresh random-id row every time. A genuine content change yields a
+-- new hash → new snapshot row → views resolve latest-wins via MAX(local_sequence).
 CREATE TRIGGER sessions_insert_events
 INSTEAD OF INSERT ON sessions
 BEGIN
-    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    INSERT OR IGNORE INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
     VALUES (
-        lower(hex(randomblob(16))),
+        at_event_id('agent.session.started' || char(31) || NEW.coding_agent || char(31) || NEW.session_id || char(31) ||
+            json_object(
+                'agent_version', NEW.agent_version,
+                'user_id', NEW.user_id,
+                'cwd', NEW.cwd,
+                'repo', NEW.repo,
+                'branch', NEW.branch,
+                'transcript', NEW.transcript,
+                'parent_session_id', NEW.parent_session_id,
+                'started_at', NEW.timestamp
+            )),
         COALESCE(NULLIF(NEW.timestamp, ''), datetime('now')),
         NEW.session_id,
         NEW.coding_agent,
@@ -153,9 +170,10 @@ BEGIN
         )
     );
 
-    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    INSERT OR IGNORE INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
     SELECT
-        lower(hex(randomblob(16))),
+        at_event_id('agent.session.ended' || char(31) || NEW.coding_agent || char(31) || NEW.session_id || char(31) ||
+            json_object('ended_at', NEW.ended_at, 'end_reason', NEW.end_reason)),
         COALESCE(NULLIF(NEW.ended_at, ''), datetime('now')),
         NEW.session_id,
         NEW.coding_agent,
@@ -163,9 +181,19 @@ BEGIN
         json_object('ended_at', NEW.ended_at, 'end_reason', NEW.end_reason)
     WHERE NEW.ended_at != '' OR NEW.end_reason != '';
 
-    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    INSERT OR IGNORE INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
     VALUES (
-        lower(hex(randomblob(16))),
+        at_event_id('agent.pr.observed' || char(31) || NEW.coding_agent || char(31) || NEW.session_id || char(31) ||
+            json_object(
+                'pr_url', NEW.pr_url,
+                'pr_title', NEW.pr_title,
+                'pr_state', CASE WHEN NEW.is_merged = 1 THEN 'merged' ELSE '' END,
+                'is_merged', NEW.is_merged,
+                'review_comments', NEW.review_comments,
+                'changes_requested', NEW.changes_requested,
+                'pr_pinned', CASE WHEN NEW.pr_url != '' THEN 1 ELSE 0 END,
+                'backfill_checked', NEW.backfill_checked
+            )),
         datetime('now'),
         NEW.session_id,
         NEW.coding_agent,
@@ -186,9 +214,21 @@ END;
 CREATE TRIGGER transcript_stats_insert_events
 INSTEAD OF INSERT ON transcript_stats
 BEGIN
-    INSERT INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
+    INSERT OR IGNORE INTO events (event_id, occurred_at, session_id, coding_agent, event_name, attributes)
     VALUES (
-        lower(hex(randomblob(16))),
+        at_event_id('agent.transcript.scanned' || char(31) || NEW.coding_agent || char(31) || NEW.session_id || char(31) ||
+            json_object(
+                'tool_use_total', NEW.tool_use_total,
+                'mid_session_msgs', NEW.mid_session_msgs,
+                'ask_user_question', NEW.ask_user_question,
+                'input_tokens', NEW.input_tokens,
+                'output_tokens', NEW.output_tokens,
+                'cache_write_tokens', NEW.cache_write_tokens,
+                'cache_read_tokens', NEW.cache_read_tokens,
+                'reasoning_tokens', NEW.reasoning_tokens,
+                'model', NEW.model,
+                'is_ghost', NEW.is_ghost
+            )),
         datetime('now'),
         NEW.session_id,
         NEW.coding_agent,

@@ -60,7 +60,7 @@ append-only に移すと:
 - **transport**: OTLP/HTTP `POST /v1/logs`（OTel Logs / Events）。client は OTel SDK で emit、server は OTLP Logs receiver を持つ
 - **server storage**: `events` テーブル（`event_id` PK, append-only, `INSERT OR IGNORE`）+ events から集約する `sessions` / `transcript_stats` / `pr_metrics` / `session_concurrency_*` VIEW（dashboard 互換性を維持）
 - **client storage**: ローカル `~/.claude/agent-telemetry.db` も同じ二層構造（`events` table が SoR、`sessions` / `transcript_stats` は VIEW）に揃える
-- **idempotency**: 各イベントに一意な `event_id` を付ける。サーバは `INSERT OR IGNORE` で重複排除し、migration の再実行対策は `source_row_hash` 等の別キーで担う
+- **idempotency**: 各イベントに deterministic な `event_id`（content hash `sha256(event_name ‖ coding_agent ‖ session_id ‖ attributes)`）を付ける。サーバ・クライアントとも `INSERT OR IGNORE` で重複排除。同一内容の再導出（sync-db 反復 / migration 再実行 / 再送）はすべて同じ `event_id` に潰れるため、`source_row_hash` 等の別キーは不要（実装で確定）。当初は「一意 ID + source_row_hash」案だったが、ランダム ID では sync-db 反復で events が無限増殖するため content hash に変更した
 - **flush 経路**: 既存 `agent-telemetry push --since-last` を `agent-telemetry flush` に rename。`state.json` の `last_flushed_sequence` を見て差分 emit。Stop hook の hot path に network I/O を載せない方針は維持（cron / launchd / systemd timer 起動）
 - **migration**: 一度限りの `agent-telemetry migrate-to-events` を提供。既存 `sessions` / `transcript_stats` 行を `agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed` の擬似イベント列に展開する。サーバ側にも同等のサブコマンドを置く
 

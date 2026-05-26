@@ -168,8 +168,8 @@ user = "ishii1492@gmail.com"
 
 | カラム | 型 | 説明 |
 |---|---|---|
-| `event_id` | TEXT | PRIMARY KEY。クライアントが採番する一意 ID。冪等性キーとして扱い、flush 差分検知の cursor には使わない |
-| `local_sequence` | INTEGER | クライアント側 DB 内の挿入順序 cursor。`flush --since-last` はこれを使う。サーバ側 DB では受信順の監査用途のみ |
+| `event_id` | TEXT | UNIQUE。イベント内容から deterministic に導出する content hash（`sha256(event_name ‖ coding_agent ‖ session_id ‖ attributes)`）。冪等性の衝突キーであり、flush 差分検知の cursor には使わない。**同一内容の再導出は同じ `event_id`** になるため `INSERT OR IGNORE` で dedup され、`sync-db` 反復でも events が増殖しない。内容が変われば別 hash → 新 snapshot row（詳細は `docs/design.md`） |
+| `local_sequence` | INTEGER | PRIMARY KEY AUTOINCREMENT。クライアント側 DB 内の挿入順序 cursor。`flush --since-last` はこれを使う。サーバ側 DB では受信順の監査用途のみ |
 | `occurred_at` | TEXT | イベント発生時刻（ISO8601）。snapshot 系イベントは観測時点を入れる |
 | `received_at` | TEXT | サーバが受信した時刻。クライアント側 DB では空 |
 | `session_id` | TEXT | 対象セッション ID |
@@ -177,9 +177,9 @@ user = "ishii1492@gmail.com"
 | `event_name` | TEXT | `agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed`（拡張時はここに追加） |
 | `attributes` | TEXT | JSON。各イベント名ごとの属性を flat に格納（後述「イベント名と属性」） |
 
-INDEX: `(session_id, coding_agent, occurred_at)`, `(event_name, occurred_at)`。
+INDEX: `(session_id, coding_agent, event_name, occurred_at, local_sequence)`, `(event_name, occurred_at)`。
 
-書き込みは常に `INSERT OR IGNORE`。同一 `event_id` が再着信しても重複しない。
+書き込みは常に `INSERT OR IGNORE`。`event_id` が deterministic content hash のため、同一内容の再導出・再着信・再送はすべて同じ `event_id` に潰れて重複しない。
 
 #### イベント名と属性
 
@@ -393,7 +393,15 @@ Content-Encoding: gzip   (optional)
 }
 ```
 
-OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う。クライアントは `rejectedLogRecords` を見て failed 件数を確認できる。スキーマ不一致での全拒否は廃止（events table の DDL は安定で、新メトリクスは新属性で追加可能なため）。
+OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う。クライアントの cursor 前進は **transport の成否** で判断し、partial success では再送しない（OTLP 仕様で partial success は「サーバが永続的に拒否した不正レコード」を表し、クライアントは retry しない前提）。
+
+| サーバ応答 | 意味 | クライアント挙動 |
+|---|---|---|
+| HTTP 2xx + `rejectedLogRecords == 0` | 全件受理 | `last_flushed_sequence` を送信した最大 `local_sequence` に進める |
+| HTTP 2xx + `rejectedLogRecords > 0` | 一部レコードが **永続的に拒否**（`event_id` / `session_id` / `coding_agent` / `event_name` 欠落などの validation 失敗） | サーバが `rejected.log` に記録済み。クライアントは `last_flushed_sequence` を **進め**（同じ不正データを再送しても通らず無限ループになるため retry しない）、`errorMessage` と件数を warning として stderr に出す |
+| ネットワークエラー / 非2xx（5xx / 429 / 401 等） | 配送自体が失敗 | バッチ全体を失敗扱いにし `last_flushed_sequence` を **進めない**。次回 flush で同じ範囲を再送。受理済み events は `INSERT OR IGNORE` で無害にスキップされる |
+
+`rejectedLogRecords` は reject **件数**しか返さず、どの record が拒否されたかは示さない。永続拒否は同一データの再送で解消しないため、cursor を据え置く設計は無限ループになる。よって永続拒否はサーバ側 `rejected.log` への記録に委ね、クライアントは前進する。スキーマ不一致での全拒否は廃止（events table の DDL は安定で、新メトリクスは新属性で追加可能なため）。
 
 ### サーバ binary
 
