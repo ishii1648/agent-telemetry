@@ -69,13 +69,25 @@ PR URL とメタデータの収集経路は **4 つ** に分かれている。�
 - **経路 1 (pin)** は 1 セッション 1 回かつ pinned 済みは skip なので、定常状態では Stop ごとに 1 回しか叩かれない。0035 とは独立に効くので残してよい。
 - **経路 2 (regex)** は `gh` を呼ばないのでコスト無関係。
 
+### 制約: 経路 4 (Phase 2) は merged-PR metrics の唯一の事後 refresh 経路
+
+`is_merged` / `review_comments` / `changes_requested` / `pr_title` を書く `UpdatePRMeta` は経路 1 (`stop.go:158`) / 経路 3 (`backfill.go:236`) / 経路 4 (`backfill.go:346`) の 3 つから呼ばれるが、**URL 確定後にメタを再取得できるのは経路 4 (Phase 2) だけ**。経路 1 は `pr_pinned` で skip、経路 3 は `len(pr_urls)==0` のセッションのみ対象なので、一度 URL が紐づいたセッションには二度と触れない。
+
+これがクリティカルなのは、**経路 1・3 が seed するのは作業中スナップショット**だから:
+
+- pin / Phase 1 が走るのはコーディング作業中で、その時点で PR は通常 **まだマージされておらず**（マージはレビュー後＝後日）、レビューコメントも CHANGES_REQUESTED も 0。
+- `pr_metrics` VIEW は **`is_merged = 1` を WHERE フィルタ**にしている（`schema.sql:150,167`、`metrics.md:41`）。
+- → Phase 2 を止めると `is_merged` が 1 に上がらず、PR が集計母集団に入らない。失われるのは review 数だけでなく **`agent_pr_*` / `pr_metrics` ダッシュボード一式**。
+
+Phase 2 の本質は「自セッションではなく、後続の任意のセッションの Stop で過去 PR をマージされるまで再チェックし続ける **cross-session refresh**」。よって高頻度 Stop で広く薄く回る現設計には合理性があり、**頻度・件数の制御は可だが経路自体を削ると metrics が壊れる**。打ち手 a（backfill を SessionEnd / 明示コマンドのみ）は、Codex に SessionEnd が無く、Claude でも SessionEnd 時点では大半が未マージという理由で、この制約と正面衝突する。
+
 ### 対応方針との関係
 
 - 打ち手 **a** = 経路 3+4 を Stop hook から外す（経路 1 と 2 は残す）。
 - 打ち手 **b** = 経路 3+4 を Stop hook で呼ぶがレート制御を入れる。
 - 打ち手 **d** = `setup` のデフォルト hook を「Stop = 経路 1+2、SessionEnd = 経路 3+4」に分離する。
 
-経路 1（pin）を残せば、ユーザが直近のセッションでダッシュボードを見るときに PR が既に紐づいているという UX は維持される。経路 3+4 を遅延・スロットルしてもダッシュボードの新鮮度はせいぜい数分〜SessionEnd まで遅れるだけで、ユースケース上の損失は小さい。
+経路 1（pin）を残せば、ユーザが直近のセッションでダッシュボードを見るときに PR が既に紐づいているという UX は維持される。経路 3（Phase 1, URL の late binding）は遅延・スロットルしてもダッシュボードの新鮮度がせいぜい数分〜SessionEnd まで遅れるだけで損失は小さい。一方 **経路 4（Phase 2, メタ refresh）は性質上 cross-session かつ後日に効く**ため「遅延しても数分」ではなく、上記制約のとおり経路を残したうえで件数上限をかける形にする必要がある。
 
 ## 問題
 
@@ -121,6 +133,7 @@ a を主軸（Stop hook の責務縮小）、b をフォールバック（既存
 - [ ] 非同期化する場合、backfill の多重起動が防がれている（single-flight 等で並行バーストを誘発しない）
 
 共通:
+- [ ] Phase 2 (経路 4) の事後 refresh 経路が維持され、PR がマージ後に `is_merged = 1` へ更新される（`pr_metrics` 母集団＝ `agent_pr_*` / `agent_session_pr_*` が空にならない）。頻度・件数の制御は可だが経路自体は残す
 - [ ] `setup` コマンドの hook 登録が新方針に合わせて更新される（変更がある場合）。`doctor` も旧構成を検出して案内する
 - [ ] `docs/design.md` の Stop hook hot path 節と backfill 節を実態に合わせて更新
 
