@@ -371,4 +371,6 @@ agent-telemetry sync-db --recheck
 agent-telemetry flush --since-last
 ```
 
-過去 events は server / client の両方に残っているので、サーバ側 VIEW を更新すれば過去分も自動で再集計されます（events の latest-wins 解決）。`events` テーブルの DDL に互換破壊変更を入れる場合のみ、新 endpoint（例: `/v2/logs`）を切る運用とします。
+**新メトリクスの大半は schema 変更を伴いません**。属性は events の JSON に入るため、新属性を増やすだけならクライアント binary を差し替えるだけで済み、サーバ DB は無変更で受け続けます。
+
+> **VIEW / DDL を変更するときの注意**: `schema.sql`（VIEW 定義・index 等）を変更すると埋め込み `schema_hash` が変わり、サーバ起動時の `schema_meta` 比較で不一致になります。現状の `EnsureSchema` は不一致時に `schema.sql` を再適用し、その先頭で `DROP TABLE events` してから作り直すため、**サーバ集約 DB の events は一度全消去されます**。クライアントはローカル `events` を保持しているので、復旧は全クライアントで `agent-telemetry flush --full` を実行して再投入します（`INSERT OR IGNORE` で冪等）。本番では VIEW 変更をまとめて行い、変更デプロイ前に events を退避（DB バックアップ）するか、全クライアントの `flush --full` を段取りしてください。`events` テーブル本体の DDL に互換破壊変更を入れる場合は、新 endpoint（例: `/v2/logs`）を切る運用とします。

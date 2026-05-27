@@ -550,10 +550,14 @@ ingest ハンドラの責務:
 旧設計の「サーバ先行デプロイ → 全クライアント binary 更新 → `push --full`」運用は不要になる。流れ:
 
 1. 新属性 / 新イベントを emit するクライアント binary を順次配布（旧クライアントは無変更でも既存 events を送り続ける）
-2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）。サーバ起動時に `schema_meta` ハッシュ比較で VIEW が再定義される
+2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）。サーバ起動時に `schema_meta` ハッシュ比較で `schema.sql` が再適用され VIEW が再定義される
 3. 既存セッションについて新属性を遡及反映したい場合は、クライアントで `sync-db --recheck` を実行すると `agent.transcript.scanned` 等の snapshot イベントが新属性付きで再 emit される。次の `flush` で events に新行が追記され、VIEW の latest-wins で過去セッションも新カラムが埋まる
 
-events table の DDL に互換破壊変更を入れる場合のみ、新 endpoint（例: `/v2/logs`）を切るか、`migrate-to-events` のような明示的 migration を用意する運用とする。
+新メトリクスの大半は **events の JSON 属性追加だけで完結し schema.sql を触らない**ため、上記 1 のクライアント差し替えのみで済む（サーバ DB 無変更）。
+
+> **既知の制約（要フォローアップ）**: 上記 2 のように `schema.sql`（VIEW / index）を変更すると `schema_hash` が変わり、サーバの `EnsureSchema`（`internal/serverpipe/db.go`）は不一致時に `schema.sql` を再適用する。その SQL は冒頭で `DROP TABLE events` してから作り直すため、**現状はサーバ集約 events が全消去される**。クライアントはローカル `events` を SoR として保持しているので全クライアントの `flush --full` で復旧可能（`INSERT OR IGNORE` で冪等）だが、無自覚にデプロイすると一時的にダッシュボードが空になる。本来は events table と VIEW/trigger の DDL を分離し、VIEW のみの変更では events を drop しない再定義に留めるべき。サーバ schema 進化を非破壊にする改修は今後の課題として本節に記録する（events table の DDL は安定という前提が成り立つうちは顕在化しないが、VIEW 追加時の運用手順は上記注記に従う）。
+
+events table 本体の DDL に互換破壊変更を入れる場合のみ、新 endpoint（例: `/v2/logs`）を切るか、`migrate-to-events` のような明示的 migration を用意する運用とする。
 
 ### 衝突セッションの扱い
 
