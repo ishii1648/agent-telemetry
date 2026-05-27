@@ -241,6 +241,14 @@ func runURLBackfill(indexPath string, sessions []sessionindex.Session, recheck b
 		if s.PRPinned {
 			continue
 		}
+		// 第1層 admission control: repo の実デフォルトブランチ上のセッションは
+		// 構造的に PR を持たない（デフォルトブランチから PR は作らない）。candidate
+		// に入れず `gh pr list` を一度も呼ばない。`backfill_checked` ではなく
+		// `is_default_branch` フラグが永続スキップを担うので recheck でも除外する。
+		// フラグ未設定の過去セッションは引き続き第2層（horizon）+ `--gc` で収束する。
+		if s.IsDefaultBranch {
+			continue
+		}
 		if len(s.PRURLs) == 0 && (!s.BackfillChecked || recheck) {
 			entries = append(entries, s)
 		}
@@ -525,7 +533,9 @@ func runPinBackfill(sessions []sessionindex.Session, sessionID string, batch *se
 		if s.SessionID != sessionID {
 			continue
 		}
-		if s.PRPinned || s.Branch == "" {
+		// 第1層 admission control: 現セッションがデフォルトブランチ上なら pin の
+		// `gh pr list` も呼ばない（構造的に PR を持たないため空振り確定）。
+		if s.PRPinned || s.Branch == "" || s.IsDefaultBranch {
 			return 0, nil
 		}
 		r := fetchPR(group{repo: s.Repo, branch: s.Branch, entries: []sessionindex.Session{s}})

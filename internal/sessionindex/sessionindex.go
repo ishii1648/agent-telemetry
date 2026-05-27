@@ -18,6 +18,7 @@ type Session struct {
 	CWD              string   `json:"cwd"`
 	Repo             string   `json:"repo"`
 	Branch           string   `json:"branch"`
+	IsDefaultBranch  bool     `json:"is_default_branch,omitempty"`
 	PRURLs           []string `json:"pr_urls"`
 	PRPinned         bool     `json:"pr_pinned,omitempty"`
 	PRTitle          string   `json:"pr_title,omitempty"`

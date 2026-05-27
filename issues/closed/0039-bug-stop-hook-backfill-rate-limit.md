@@ -52,7 +52,7 @@ Created: 2026-05-26
 
 ### 既存 issue との関係
 
-[0035-bug-backfill-no-pr-infinite-retry.md](../0035-bug-backfill-no-pr-infinite-retry.md) は「PR 未作成ブランチが毎 Stop で probe される」問題で、24h horizon で markChecked する方向で対応方針が確定済み。ただし 0035 が解決しても以下は残るため本 issue が必要:
+[0035-bug-backfill-no-pr-infinite-retry.md](0035-bug-backfill-no-pr-infinite-retry.md) は「PR 未作成ブランチが毎 Stop で probe される」問題で、24h horizon で markChecked する方向で対応方針が確定済み。ただし 0035 が解決しても以下は残るため本 issue が必要:
 
 - markChecked がまだ立っていない期間（特に backlog 消化中）に Stop hook が毎ターン大量の `gh` を叩く問題は別途レート制御が必要
 - そもそも「Stop フックという高頻度イベントで backfill を走らせる」設計選択自体が再考対象
@@ -168,7 +168,7 @@ global を agent 横断にするのは gh secondary rate limit が**アカウン
 
 打ち手 b の「上限」を具体化したもの。**cap は Phase 1 / Phase 2 の両方（or 1 起動全体）に効くグローバル上限**として置く。「Phase 2 のみ」では不十分——理由が Phase ごとに異なる:
 
-- **Phase 1 (`runURLBackfill`)**: candidate は別途の GC（第1層=デフォルトブランチ即時除外、第2層=`COALESCE(ended_at, timestamp)` 基準の freshness 窓。詳細は [0035](../0035-bug-backfill-no-pr-infinite-retry.md)）で steady state は bound される。cap が守るのは **非定常**——backlog 消化直後・新規セッション大量流入直後（並列 worktree 等）。ここは窓の内側で起きるので GC では防げず、cap が無いと rate limit が再発する。
+- **Phase 1 (`runURLBackfill`)**: candidate は別途の GC（第1層=デフォルトブランチ即時除外、第2層=`COALESCE(ended_at, timestamp)` 基準の freshness 窓。詳細は [0035](0035-bug-backfill-no-pr-infinite-retry.md)）で steady state は bound される。cap が守るのは **非定常**——backlog 消化直後・新規セッション大量流入直後（並列 worktree 等）。ここは窓の内側で起きるので GC では防げず、cap が無いと rate limit が再発する。
 - **Phase 2 (`runMetaBackfill`)**: ターゲット（`pr_urls` を持つ全 URL）は **単調増加**し、1h スロットルは間隔を絞るだけで一度走ると全 URL に `gh pr view` を撃つ。cap に加えて構造対策として **`is_merged = true`（terminal）を refresh 対象から除外**し、「open な PR のみ refresh」へ縮める（現状 `backfill.go:271-281` は is_merged を見ず全件 re-check）。
 
 cap 実装時の付帯事項（starvation 回避）:
@@ -240,7 +240,7 @@ async 方向（pin / backfill を fire-and-forget で並列化）に倒すと、
 
 ## 参照
 
-- 関連 issue: [0035-bug-backfill-no-pr-infinite-retry.md](../0035-bug-backfill-no-pr-infinite-retry.md)（24h horizon で markChecked する別アプローチ）
+- 関連 issue: [0035-bug-backfill-no-pr-infinite-retry.md](0035-bug-backfill-no-pr-infinite-retry.md)（24h horizon で markChecked する別アプローチ）
 - 関連: [0020-design-backfill-evolution-to-stop-hook.md](0020-design-backfill-evolution-to-stop-hook.md)（cron → Stop hook 移行の経緯）
 - 暫定対処済の類例: statusline.js の `gh pr view` には別途 10 分キャッシュを入れている
 
@@ -263,4 +263,4 @@ Completed: 2026-05-27
 - 「backlog 2000+ で 10 連続 Stop しても secondary rate limit に当たらない」は実機での経験的確認項目で、設計（cap + single-flight + cooldown + `--gc` drain）で担保しているが本 PR では再現環境での実測まではしていない。
 - 「`doctor` が旧構成（同期 backfill を呼ぶ hook）を検出」は **moot**: 収束モデルは hook 登録構成を変更しない（Stop は従来どおり `agent-telemetry hook stop`、挙動だけバイナリ内で async 化）ため検出すべき設定差分が存在しない。代わりに backlog → `--gc` の案内で移行を支援する。
 
-第1層（実デフォルトブランチの admission control）は [0035](../0035-bug-backfill-no-pr-infinite-retry.md) の担当で本 issue では未着手（`--gc` は horizon=第2層のみで収束させる）。
+第1層（実デフォルトブランチの admission control）は [0035](0035-bug-backfill-no-pr-infinite-retry.md) の担当で本 issue では未着手（`--gc` は horizon=第2層のみで収束させる）。
