@@ -84,14 +84,14 @@ OTLP Logs を外部 backend に送ると、各 attribute は backend の log att
 |---|---|
 | (3) やらない | 設定可能な OTLP export を持てば、ユーザは**任意の宛先に自分で向けられる**。(3) は能力に**内包**され、独立した「やらない」選択肢ではなくなる |
 | (1) client 直送 | その export を backend Intake に向ける **デプロイレシピ** |
-| (2) Collector ファンアウト | その export を Collector に向け、Collector が SQLite ingest + backend に fanout する **デプロイレシピ** |
+| (2) Collector ファンアウト | その export を Collector に向け、Collector が**選んだ宛先に fanout する デプロイレシピ**（backend のみ / backend + SQLite ingest / 複数 backend など任意。SQLite ingest は Grafana を併用する場合の任意の 1 宛先で必須ではない） |
 
 **両レシピをサポートする。** 使い分けの指針:
 
 | 規模 | レシピ | 根拠 |
 |---|---|---|
 | 個人 / 小チーム（想定主用途） | **direct** | 追加プロセス無し。client の OTLP exporter を backend に向け、submit-only の credential を自分のマシンに置くだけ。Datadog RUM 同様、client-side telemetry は正当なパターン |
-| team / 多 client | **collector** | Collector が credential を 1 箇所で保持し、**client は backend credential を一切持たない**。SQLite ingest と backend への fanout / buffer / retry を一貫処理 |
+| team / 多 client | **collector** | Collector が credential を 1 箇所で保持し、**client は backend credential を一切持たない**。選んだ宛先（backend、必要なら SQLite ingest も）への fanout / buffer / retry を一貫処理 |
 
 > **なぜ team では collector か（credential モデルの帰結）**: Datadog の ingestion API key (`DD-API-KEY`) は **org-wide でスコープ不可**（scopes は read/管理用の Application key にのみ適用、[API and Application Keys](https://docs.datadoghq.com/account_management/api-app-keys/)）。「ログ送信のみ」の key は作れない。submit 専用ではあるが、漏洩時は org 全体 rotate・濫用（コスト増幅）の blast-radius が残り、RUM client token のような app スコープ / 公開耐性 / 個別失効は無い。RUM が安全なのは token そのものではなく「**信頼できない多数クライアントは強い秘密を持たず、信頼できる intake だけが特権 submit する**」アーキテクチャ由来であり、それを OTLP で再現するのが collector レシピ（client は秘密なし＝RUM 等価）。個人は公開環境ではないので direct + submit-only key で十分。
 
@@ -122,7 +122,7 @@ Grafana 版（`grafana/dashboards/agent-telemetry.json`、SQLite datasource 前�
 
 本 issue 自体は spec/docs の更新と方針確定までを想定し、実装は次の child issue に分解する。順序は依存関係に従う:
 
-1. **設定可能な OTLP export 能力 + 2 デプロイレシピの確立（A、backend 非依存）**: client の OTLP exporter を **設定可能な宛先（複数 endpoint + auth header）** に向けられるようにする。docs に **direct レシピ**（client → backend Intake 直送、submit-only credential を client 設定に）と **collector レシピ**（`deploy/otel-collector/` or how-to で SQLite ingest + backend exporter への fanout、client は Collector に向けるだけ）を同梱。**最初の backend として Datadog を例示**する
+1. **設定可能な OTLP export 能力 + 2 デプロイレシピの確立（A、backend 非依存）**: client の OTLP exporter を **設定可能な宛先（複数 endpoint + auth header）** に向けられるようにする。docs に **direct レシピ**（client → backend Intake 直送、submit-only credential を client 設定に）と **collector レシピ**（`deploy/otel-collector/` or how-to で、選んだ宛先への fanout。SQLite ingest exporter は Grafana 併用時の任意の 1 宛先で必須ではない。client は Collector に向けるだけ）を同梱。**最初の backend として Datadog を例示**する
 2. **attribute の意味分類を `docs/spec.md` に追記（B、backend 非依存 + Datadog リファレンス）**: 対応表を仕様本体として固定し、**2 配布形式**（direct 用の Datadog Logs Pipeline 設定 / collector 用の Collector processor サンプル）を同梱する
 3. **`docs/metrics.md` にユーザ向け再構築ガイドを追記（任意）**: 各メトリクスについて「Logs to Metrics 相当で生成 / OTLP measure をそのまま使う / backend 側の式で再定義」のどれでユーザが組めるかを参考として明示
 4. **`docs/design.md` に client / server / (Collector) / 外部 backend の責務分担を追記**: 「client は設定可能な OTLP export を担う。server は OTLP receiver + SQLite ingest だけ。外部 backend 側集約はユーザが担う。collector レシピを採る場合のみ Collector が fanout と意味分類の昇格を担う（direct レシピでは backend 側 Pipeline が担う）」という分担を明文化
