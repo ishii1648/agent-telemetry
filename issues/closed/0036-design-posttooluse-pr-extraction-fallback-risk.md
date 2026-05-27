@@ -4,6 +4,7 @@ affected_paths:
   - internal/hook/posttooluse.go
   - internal/sessionindex/update.go
 tags: [hooks, pr-binding, posttooluse, retro-revisit]
+closed_at: 2026-05-28
 ---
 
 # PostToolUse の PR URL 抽出が pin 失敗時に他人の PR を紐づけるリスク
@@ -82,3 +83,18 @@ pin が失敗するシナリオでは `pr_pinned: false` のままで PostToolUs
   - `internal/sessionindex/update.go:39-78` (`Update`、`pr_pinned` チェック)
   - `internal/sessionindex/update.go:88-129` (`PinPR`、`pr_urls` 置換)
 - 既存ドキュメント: `docs/design.md:137-142` (pin 設計), `docs/design.md:215-221` (`pr_urls` 採用ルール)
+
+Completed: 2026-05-28
+
+## 解決方法
+
+案 A を採用した。PostToolUse の PR URL 抽出は `tool_input.command` が `gh pr create` で始まる Bash 実行に限定し、`gh pr view` / `gh pr list` / 任意に貼られた PR URL は `pr_urls` に追記しない。
+
+これにより `gh pr create` stdout を拾う pin 失敗時の軽量 fallback は残しつつ、PostToolUse の無差別 regex が他人の PR URL を session に残す経路を閉じた。pin 成功時は従来どおり `pr_pinned: true` により URL 追記が no-op になるため挙動は変わらない。
+
+`docs/spec.md` と `docs/design.md` には、PostToolUse 抽出のスコープと pin 失敗時の fallback 境界を反映した。
+
+## 採用しなかった代替
+
+- 案 B（PostToolUse 抽出の完全削除）は不採用。`gh pr create` 直後の stdout を拾える価値があり、抽出対象を作成コマンドに限定すれば主要な汚染リスクは避けられるため。
+- 案 C（現状維持）は不採用。pin 失敗経路は複数あり、pin 成功率の観測が無い状態で無差別抽出を残すのは 0001 の再発リスクを説明できないため。

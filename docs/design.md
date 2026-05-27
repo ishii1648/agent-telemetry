@@ -139,11 +139,13 @@ spawn の要点:
 
 PR と session の紐づけは worker 内の `runPinBackfill` が `gh pr list --head <branch>` を 1 回叩いて確定する（Stop が `--pin-session=<id>` で対象セッションを渡す）。1 件取れた場合は `pr_urls` を `[<url>]` で置き換え、`pr_pinned: true` を立てる。pinned 状態に入ったセッションは以降 PostToolUse / `update` / `backfill` の URL 追記をすべて拒否する。late binding（後続 tick の Phase 1 経由）は **PR 未作成のままセッションが終わったケースのフォールバック** として残す。
 
+PostToolUse の PR URL 抽出は `tool_input.command` の先頭が `gh pr create` のときだけ実行する。これは `gh pr create` 直後の stdout に含まれる URL を、Stop/worker の pin が失敗した場合の軽量フォールバックとして拾うための限定経路である。`gh pr view` / `gh pr list` / ユーザが貼った任意の URL など、PR 作成以外の Bash 出力は `pr_urls` に追記しない。
+
 worker 起動が Stop に対して非同期になったため early binding はターン直後ではなく数 ms〜次の worker run のタイミングで効くが、ダッシュボードはターン中に見るものではないので即時性は不要（pin の同期実行は正当化されない）。
 
 このルールが解決する誤接続:
 
-- **PostToolUse 正規表現の汚染** — `gh pr view 999` や `gh pr list` の出力、ユーザが Bash で他人の PR URL を貼ったケースで `pr_urls` 末尾に無関係な PR が付き、`sync-db` が末尾を採用するため誤った PR に紐づく問題。pin 後はすべての append が no-op になるため塞がる。
+- **PostToolUse 正規表現の汚染** — `gh pr view 999` や `gh pr list` の出力、ユーザが Bash で他人の PR URL を貼ったケースで `pr_urls` 末尾に無関係な PR が付き、`sync-db` が末尾を採用するため誤った PR に紐づく問題。pin 後はすべての append が no-op になり、pin 前 / pin 失敗時も PostToolUse が `gh pr create` 以外の出力を抽出しないため塞がる。
 - **ブランチ再利用** — 同一ブランチで別 PR を使い回す運用で、新 PR の URL が古いセッションに付与される問題。pin の時点で `(repo, branch)` 解決を済ませているため、後から作られた別 PR の影響を受けない。
 
 実装の要点:
@@ -151,6 +153,7 @@ worker 起動が Stop に対して非同期になったため early binding は�
 - pin 経路は `internal/sessionindex.PinPR`（worker のバッチ集約経由で `applyPinPR`）に集約。`pr_urls` の追加 (`Update` / `UpdateByBranch`) は内部で `PRPinned == true` をスキップする。
 - pin の lookup は Phase 1 と同じ `gh pr list --head <branch> --author @me --state all --limit 1` を `cwd` で実行する。よって pin した URL と Phase 1 が同 run で解決する URL は一致する。
 - `cwd` 不在 / git リポジトリでない / branch 空 / `gh` がエラーの場合は best-effort で skip し、worker を落とさない。fallback として Phase 1 が次 run で再試行する。
+- PostToolUse の fallback は `gh pr create` stdout だけを拾う。`gh` wrapper / alias / `hub pr create` / browser flow のような別経路は拾わず、必要なら `agent-telemetry update <session_id> <url>` で手動補完する。
 - `Phase 2` の meta 取得は pinned セッションも対象に含める（`is_merged` / `review_comments` の更新は継続したい）。pin で抑止するのは **URL の追記だけ**。
 
 ### `session-index.jsonl` の追記モデル
@@ -252,7 +255,7 @@ PR が存在しないブランチ（`main` / `master` 等）は初回チェッ�
 
 `update` / `backfill` が PR URL を追記する順序が結果に影響するため、辞書順ソートはしない。
 
-通常の運用では worker の pin により `pr_urls` は要素 1 件で確定する（前述「PR の確定は worker で early binding」）。late binding（pin 失敗 → Phase 1 経由）でも要素 1 件になる。複数要素になるのは、pin 前に PostToolUse の正規表現で複数 URL がスクレイプされた極端なケースに限られ、pin 後は `[<確定 URL>]` で置き換えられるため一過性で残らない。
+通常の運用では worker の pin により `pr_urls` は要素 1 件で確定する（前述「PR の確定は worker で early binding」）。late binding（pin 失敗 → Phase 1 経由）でも要素 1 件になる。複数要素になるのは、`gh pr create` の出力に複数の GitHub PR URL が含まれる異常ケースに限られ、pin 後は `[<確定 URL>]` で置き換えられるため一過性で残らない。
 
 ### transcript パース
 

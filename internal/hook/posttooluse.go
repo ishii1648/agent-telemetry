@@ -3,6 +3,7 @@ package hook
 import (
 	"encoding/json"
 	"regexp"
+	"strings"
 
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 	"github.com/ishii1648/agent-telemetry/internal/sessionindex"
@@ -15,10 +16,10 @@ var prURLRe = regexp.MustCompile(`https://github\.com/[^/\s]+/[^/\s]+/pull/\d+`)
 
 // RunPostToolUse handles the PostToolUse hook event. The Claude variant
 // historically only logs tool annotations; the Codex variant additionally
-// scans `tool_response` for newly created PR URLs and appends them to
-// session-index.jsonl so backfill can attach merge metadata next run.
+// scans `gh pr create` output for newly created PR URLs and appends them
+// to session-index.jsonl so backfill can attach merge metadata next run.
 //
-// Failure to find a URL is normal (most tools return non-PR output) and
+// Failure to find a URL is normal (most tools are not PR creation) and
 // must not surface as an error — that would break Codex's hook chain on
 // every Bash call.
 func RunPostToolUse(input *HookInput, a *agent.Agent) error {
@@ -26,6 +27,10 @@ func RunPostToolUse(input *HookInput, a *agent.Agent) error {
 		a = agent.Claude()
 	}
 	if input == nil || input.SessionID == "" {
+		return nil
+	}
+
+	if !isGHPRCreateCommand(input.ToolInput) {
 		return nil
 	}
 
@@ -59,4 +64,18 @@ func extractPRURLs(payload json.RawMessage) []string {
 		out = append(out, u)
 	}
 	return out
+}
+
+func isGHPRCreateCommand(payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	var in struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return false
+	}
+	fields := strings.Fields(in.Command)
+	return len(fields) >= 3 && fields[0] == "gh" && fields[1] == "pr" && fields[2] == "create"
 }
