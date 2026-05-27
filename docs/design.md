@@ -440,7 +440,7 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 ### 採用しなかった代替
 
 - **旧設計（`sessions` 行 upsert + SHA-256 hash 追跡）の維持**: 後追い更新のたびに行 hash を計算 → 比較 → 再送、というロジックが本質的に「mutable state を transport で表現する」hack で、events 1 件追記で済む話を複雑化していた。新メトリクス追加時の `schema_mismatch` 全停止も運用負荷が大きい
-- **OTLP Metrics signal の採用**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため Logs（events）に統一する。後で Counter が必要になった時点で別途 OTLP Metrics signal の endpoint を追加する
+- **OTLP Metrics signal の採用（server への内部転送では不採用 / 外部 backend 向けは [0040] で部分採用）**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため **server への内部転送は Logs（events）に統一する**。ただし外部 observability backend（Datadog 等）は record 間 join をしないため、events を流すだけでは `pr_metrics`（`session_id` で cross-event join + latest-wins + sum している）を再現できない。このため [0040] では **client がローカル VIEW で集約した `pr_metrics` を OTLP Metrics gauge として外部 backend にのみ送る経路を併用する**決定をした（server 経路は Logs のまま据え置き）。「後で Metrics が必要になれば endpoint を追加する」という当初の含みの発動であり、実装は [0040] の child issue で行う
 - **raw JSONL 転送 + サーバ側 transcript 解析**: 送信サイズ膨張・プライバシー観点・サーバ側のパーサ保守の 3 点が大きく、旧設計の議論で既に却下されている（[0009]）。append-only 化でもこの判断は変わらない
 - **イベント table を持たず、行 mutation で済ます append-only シミュレーション**: 一見「集計行に `updated_at` を持たせて INSERT OR REPLACE すれば append-only っぽくなる」が、過去の状態を保てないので replay ができず、events table に置き換えるべき以上のものは生まれない
 
