@@ -32,7 +32,7 @@ import (
 // stderr message.
 var warnWriter io.Writer = os.Stderr
 
-// warnOnce dedups the migration warning within a single process. push is
+// warnOnce dedups the migration warning within a single process. flush is
 // invoked from cron / launchd / systemd timers — repeating the warning
 // each time userid and serverclient both touch the config would double the
 // log noise without adding signal.
@@ -63,7 +63,7 @@ func Legacy() string {
 //  2. Otherwise if the legacy path exists, return it AND emit a one-time
 //     migration warning to stderr.
 //  3. Otherwise return the preferred path. Callers treat ENOENT as
-//     "no config" (cron-safe — push must not fail when the user hasn't
+//     "no config" (cron-safe — flush must not fail when the user hasn't
 //     opted into server upload).
 //
 // Resolve is safe to call multiple times in one process; only the first
