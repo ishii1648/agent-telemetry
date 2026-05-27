@@ -139,11 +139,13 @@ spawn の要点:
 
 PR と session の紐づけは worker 内の `runPinBackfill` が `gh pr list --head <branch>` を 1 回叩いて確定する（Stop が `--pin-session=<id>` で対象セッションを渡す）。1 件取れた場合は `pr_urls` を `[<url>]` で置き換え、`pr_pinned: true` を立てる。pinned 状態に入ったセッションは以降 PostToolUse / `update` / `backfill` の URL 追記をすべて拒否する。late binding（後続 tick の Phase 1 経由）は **PR 未作成のままセッションが終わったケースのフォールバック** として残す。
 
+PostToolUse の PR URL 抽出は `tool_input.command` の先頭が `gh pr create` のときだけ実行する。これは `gh pr create` 直後の stdout に含まれる URL を、Stop/worker の pin が失敗した場合の軽量フォールバックとして拾うための限定経路である。`gh pr view` / `gh pr list` / ユーザが貼った任意の URL など、PR 作成以外の Bash 出力は `pr_urls` に追記しない。
+
 worker 起動が Stop に対して非同期になったため early binding はターン直後ではなく数 ms〜次の worker run のタイミングで効くが、ダッシュボードはターン中に見るものではないので即時性は不要（pin の同期実行は正当化されない）。
 
 このルールが解決する誤接続:
 
-- **PostToolUse 正規表現の汚染** — `gh pr view 999` や `gh pr list` の出力、ユーザが Bash で他人の PR URL を貼ったケースで `pr_urls` 末尾に無関係な PR が付き、`sync-db` が末尾を採用するため誤った PR に紐づく問題。pin 後はすべての append が no-op になるため塞がる。
+- **PostToolUse 正規表現の汚染** — `gh pr view 999` や `gh pr list` の出力、ユーザが Bash で他人の PR URL を貼ったケースで `pr_urls` 末尾に無関係な PR が付き、`sync-db` が末尾を採用するため誤った PR に紐づく問題。pin 後はすべての append が no-op になり、pin 前 / pin 失敗時も PostToolUse が `gh pr create` 以外の出力を抽出しないため塞がる。
 - **ブランチ再利用** — 同一ブランチで別 PR を使い回す運用で、新 PR の URL が古いセッションに付与される問題。pin の時点で `(repo, branch)` 解決を済ませているため、後から作られた別 PR の影響を受けない。
 
 実装の要点:
@@ -151,6 +153,7 @@ worker 起動が Stop に対して非同期になったため early binding は�
 - pin 経路は `internal/sessionindex.PinPR`（worker のバッチ集約経由で `applyPinPR`）に集約。`pr_urls` の追加 (`Update` / `UpdateByBranch`) は内部で `PRPinned == true` をスキップする。
 - pin の lookup は Phase 1 と同じ `gh pr list --head <branch> --author @me --state all --limit 1` を `cwd` で実行する。よって pin した URL と Phase 1 が同 run で解決する URL は一致する。
 - `cwd` 不在 / git リポジトリでない / branch 空 / `gh` がエラーの場合は best-effort で skip し、worker を落とさない。fallback として Phase 1 が次 run で再試行する。
+- PostToolUse の fallback は `gh pr create` stdout だけを拾う。`gh` wrapper / alias / `hub pr create` / browser flow のような別経路は拾わず、必要なら `agent-telemetry update <session_id> <url>` で手動補完する。
 - `Phase 2` の meta 取得は pinned セッションも対象に含める（`is_merged` / `review_comments` の更新は継続したい）。pin で抑止するのは **URL の追記だけ**。
 
 ### `session-index.jsonl` の追記モデル
@@ -223,7 +226,7 @@ GitHub の secondary rate limit は総量でなく **バースト / 同時実行
 
 ### 移行 drain `backfill --gc`
 
-deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。
+deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。backlog のカウント（`countBacklog`）は backfill candidate と同じフィルタを使い、`is_default_branch` のセッションを除外する——第1層で構造除外されるデフォルトブランチは `--gc` でも markChecked されないため、数えると解消不能な `--gc` 案内になってしまう。
 
 ### PR タイトルの取得
 
@@ -233,11 +236,15 @@ backfill は `gh pr list` / `gh pr view` の `--json` 引数に `title` を含�
 
 空文字列での上書きはしない。`gh` が title を返さなかった（タイトルが空 / API エラーで取得失敗）場合に既存の `pr_title` を消さないため、`UpdatePRMeta` は `prTitle == ""` のとき `pr_title` フィールドを書き換えずスキップする。
 
-### `(repo, branch)` グルーピングと `backfill_checked`
+### `(repo, branch)` グルーピングと候補の絞り込み（第1層 admission control + 第2層 horizon）
 
-backfill は `pr_urls` が空のセッションを `(repo, branch)` でグループ化し、`gh pr list` を 1 回だけ実行する。同一ブランチで複数セッションがあっても API 呼び出しは 1 回。
+backfill は `pr_urls` が空のセッションを `(repo, branch)` でグループ化し、`gh pr list` を 1 回だけ実行する。同一ブランチで複数セッションがあっても API 呼び出しは 1 回。「PR が未作成のまま放置されたブランチ」を毎 Stop で無限に再 probe しないため、候補は 2 段で絞る（[issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。
 
-PR が存在しないブランチ（`main` / `master` 等）は初回チェック後に `backfill_checked: true` をセットして永続スキップする。これがないと PR を作らないリポジトリの `master` のような大量エントリが毎回 8 秒の空振りを起こす。
+**第1層 — 実デフォルトブランチの admission control**: repo の**実際のデフォルトブランチ上のセッションは構造的に PR を持たない**（デフォルトブランチから PR は作らない）ので、そもそも候補に入れず `gh pr list` を一度も呼ばない。判定は SessionStart の `extractGitInfo`（既に git を叩いている）で `git symbolic-ref refs/remotes/origin/HEAD` を使って repo ごとの実デフォルトブランチを動的に求め、現セッションの branch と一致するかを `is_default_branch` フラグとして session entry に焼き付ける（gh API は呼ばない）。origin/HEAD 未設定の repo に限り慣習的な `main` / `master` へフォールバックする。**branch 名 `main` / `master` のハードコード除外は採用しない**——`trunk` / `dev` / `develop` 等の命名多様性に対応するため、名前一致ではなく実デフォルトブランチの動的判定にする。`is_default_branch` を持つセッションは Phase 1 の候補収集でも pin（現セッションの `gh pr list`）でも除外され、`backfill_checked` ではなくこのフラグが永続スキップを担うので `--recheck` でも候補に入らない。
+
+**第2層 — `COALESCE(ended_at, timestamp)` の 24h horizon**: 第1層を通過した候補（abandoned な feature ブランチ等）は、基準時刻から 24h 以上経過していれば `backfill_checked: true` をセットして以降スキップする（`shouldMarkChecked`）。基準時刻は `ended_at` 単独ではなく `COALESCE(ended_at, timestamp)`——Claude の ~15% は SessionEnd 不発で `ended_at` が恒久的に空になるため、空なら SessionStart で必ず入る `timestamp` にフォールバックして全セッションが必ず age out するようにする。24h 以内は markChecked せず次 run で再 probe する（完了直後の遅延 PR 作成を救済する窓）。
+
+両者は排他でなく補完: 第1層が構造的 never-PR を 0 秒で弾き、第2層が時間経過した abandoned ブランチを retire する。第1層は新規セッション向けの入口フィルタなので、`is_default_branch` フラグを持たない過去のデフォルトブランチセッションは引き続き第2層 + `backfill --gc` で収束する（過去分を遡ってフラグ付けはしない）。`is_default_branch` は backfill が読む `session-index.jsonl` にのみ持たせ、ダッシュボード用途が無いため `sessions` テーブル（DB）へは伝播しない。
 
 ### 並列化
 
@@ -252,7 +259,7 @@ PR が存在しないブランチ（`main` / `master` 等）は初回チェッ�
 
 `update` / `backfill` が PR URL を追記する順序が結果に影響するため、辞書順ソートはしない。
 
-通常の運用では worker の pin により `pr_urls` は要素 1 件で確定する（前述「PR の確定は worker で early binding」）。late binding（pin 失敗 → Phase 1 経由）でも要素 1 件になる。複数要素になるのは、pin 前に PostToolUse の正規表現で複数 URL がスクレイプされた極端なケースに限られ、pin 後は `[<確定 URL>]` で置き換えられるため一過性で残らない。
+通常の運用では worker の pin により `pr_urls` は要素 1 件で確定する（前述「PR の確定は worker で early binding」）。late binding（pin 失敗 → Phase 1 経由）でも要素 1 件になる。複数要素になるのは、`gh pr create` の出力に複数の GitHub PR URL が含まれる異常ケースに限られ、pin 後は `[<確定 URL>]` で置き換えられるため一過性で残らない。
 
 ### transcript パース
 
@@ -433,7 +440,7 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 ### 採用しなかった代替
 
 - **旧設計（`sessions` 行 upsert + SHA-256 hash 追跡）の維持**: 後追い更新のたびに行 hash を計算 → 比較 → 再送、というロジックが本質的に「mutable state を transport で表現する」hack で、events 1 件追記で済む話を複雑化していた。新メトリクス追加時の `schema_mismatch` 全停止も運用負荷が大きい
-- **OTLP Metrics signal の採用**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため Logs（events）に統一する。後で Counter が必要になった時点で `/v1/metrics` を追加する
+- **OTLP Metrics signal の採用**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため Logs（events）に統一する。後で Counter が必要になった時点で別途 OTLP Metrics signal の endpoint を追加する
 - **raw JSONL 転送 + サーバ側 transcript 解析**: 送信サイズ膨張・プライバシー観点・サーバ側のパーサ保守の 3 点が大きく、旧設計の議論で既に却下されている（[0009]）。append-only 化でもこの判断は変わらない
 - **イベント table を持たず、行 mutation で済ます append-only シミュレーション**: 一見「集計行に `updated_at` を持たせて INSERT OR REPLACE すれば append-only っぽくなる」が、過去の状態を保てないので replay ができず、events table に置き換えるべき以上のものは生まれない
 
@@ -546,10 +553,14 @@ ingest ハンドラの責務:
 旧設計の「サーバ先行デプロイ → 全クライアント binary 更新 → `push --full`」運用は不要になる。流れ:
 
 1. 新属性 / 新イベントを emit するクライアント binary を順次配布（旧クライアントは無変更でも既存 events を送り続ける）
-2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）。サーバ起動時に `schema_meta` ハッシュ比較で VIEW が再定義される
+2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）。サーバ起動時に `schema_meta` ハッシュ比較で `schema.sql` が再適用され VIEW が再定義される
 3. 既存セッションについて新属性を遡及反映したい場合は、クライアントで `sync-db --recheck` を実行すると `agent.transcript.scanned` 等の snapshot イベントが新属性付きで再 emit される。次の `flush` で events に新行が追記され、VIEW の latest-wins で過去セッションも新カラムが埋まる
 
-events table の DDL に互換破壊変更を入れる場合のみ、新 endpoint（例: `/v2/logs`）を切るか、`migrate-to-events` のような明示的 migration を用意する運用とする。
+新メトリクスの大半は **events の JSON 属性追加だけで完結し schema.sql を触らない**ため、上記 1 のクライアント差し替えのみで済む（サーバ DB 無変更）。
+
+> **既知の制約（要フォローアップ）**: 上記 2 のように `schema.sql`（VIEW / index）を変更すると `schema_hash` が変わり、サーバの `EnsureSchema`（`internal/serverpipe/db.go`）は不一致時に `schema.sql` を再適用する。その SQL は冒頭で `DROP TABLE events` してから作り直すため、**現状はサーバ集約 events が全消去される**。クライアントはローカル `events` を SoR として保持しているので全クライアントの `flush --full` で復旧可能（`INSERT OR IGNORE` で冪等）だが、無自覚にデプロイすると一時的にダッシュボードが空になる。本来は events table と VIEW/trigger の DDL を分離し、VIEW のみの変更では events を drop しない再定義に留めるべき。サーバ schema 進化を非破壊にする改修は今後の課題として本節に記録する（events table の DDL は安定という前提が成り立つうちは顕在化しないが、VIEW 追加時の運用手順は上記注記に従う）。
+
+events table 本体の DDL に互換破壊変更を入れる場合のみ、新 endpoint（例: `/v2/logs`）を切るか、`migrate-to-events` のような明示的 migration を用意する運用とする。
 
 ### 衝突セッションの扱い
 
@@ -566,9 +577,9 @@ events 数が大きくなって VIEW のオンザフライ集約が重くなっ�
 
 最初はオンザフライ VIEW で進め、ベンチマークで顕在化したら materialization に切り替える。
 
-### 旧 push 経路からの移行
+### 旧 push 経路からの移行（完了）
 
-[0028] / [0029] で実装した「`sessions` 行 / `transcript_stats` 行を `POST /v1/metrics` で送る」経路は本仕様で deprecate する。
+[0028] / [0029] で実装した「`sessions` 行 / `transcript_stats` 行を `POST /v1/metrics` で送る」経路は本仕様で廃止済み。移行は次の手順で完了した:
 
 1. クライアント・サーバとも一度だけ `agent-telemetry migrate-to-events` / `agent-telemetry-server migrate-to-events` を実行
    - 既存 `sessions` 行 → `agent.session.started` + `agent.session.ended` + `agent.pr.observed` の擬似イベント列に展開
@@ -576,8 +587,8 @@ events 数が大きくなって VIEW のオンザフライ集約が重くなっ�
    - `event_id` は通常 event と同じ deterministic content hash（`at_event_id`）で振る。content hash が再実行時の重複防止を兼ねるため、別途 `source_row_hash` のようなキーは持たない（前節「`event_id` の deterministic 採番」）
    - `occurred_at` は対応するカラム（`timestamp` / `ended_at` 等）から推定。不明分は migration 実行時刻
    - 実体は `sync-db` と同じ経路（`syncdb.RunForAgents`）を一度走らせるだけ。既存 `sessions` / `transcript_stats` 行ではなく session-index / transcript を読み直して events を deterministic に再生成する
-2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える
-3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを残しておき、1 リリース併走後に削除（既存ユーザに移行猶予を与える）
+2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える（`INSTEAD OF INSERT` トリガで `sync-db` の行書き込みを events へリダイレクト）
+3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを **v0.0.10 で 1 リリース併走させ、次リリース（[0038] 完了 PR）で削除した**。あわせて client の `serverclient.Run` / `Payload` / `SplitBatches` / `schema_hash` mismatch (`ErrSchemaMismatch`)、server の `ServeIngest` / `INSERT OR REPLACE` upsert / `findCollidingSessions` / `collisions.log`、`state.json` の `pushed_session_versions` を撤去。`sync-db` が書き込みに使う `INSTEAD OF INSERT` トリガと `schema_meta` の DDL バージョニングは現行経路で必要なため残す
 
 ### 配布形態 — Go binary + Docker image + k8s manifest
 

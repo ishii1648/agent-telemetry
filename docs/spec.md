@@ -48,7 +48,7 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 |---|---|---|
 | `SessionStart` (`startup\|resume`) | `agent-telemetry hook session-start --agent codex` | セッション開始メタデータを `~/.codex/session-index.jsonl` に追記 |
 | `Stop` | `agent-telemetry hook stop --agent codex` | 応答完了時に `ended_at` を同期更新し（Codex の de-facto SessionEnd）、`backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側 |
-| `PostToolUse` | `agent-telemetry hook post-tool-use --agent codex` | `tool_response` から PR URL を抽出し `pr_urls` に追記（`pr_pinned: true` のセッションでは無視される） |
+| `PostToolUse` | `agent-telemetry hook post-tool-use --agent codex` | `tool_input.command` が `gh pr create` のときだけ `tool_response` から PR URL を抽出し `pr_urls` に追記（`pr_pinned: true` のセッションでは無視される） |
 
 `Stop` hook の同期パスはローカル書き込み（Codex の `ended_at` のみ）と worker spawn だけで、`gh` を 1 回も呼ばず数 ms で return する。`gh` を伴う処理は detached worker に退避し、worker 側で global single-flight（同時実行抑制）・cooldown（頻度抑制）・gh cap（1 起動の件数上限）でレート制御する。両 agent とも worker トリガは Stop のみで、hook 登録構成は従来から変更しない。詳細は `docs/design.md ## Stop hook の非同期 worker 起動`。
 
@@ -65,9 +65,8 @@ agent-telemetry update <session_id> <url>...              session-index.jsonl �
 agent-telemetry update --mark-checked <session_id>...     backfill_checked フラグをセット
 agent-telemetry update --by-branch <repo> <branch> <url>  同一 repo+branch の全セッションに URL を追加
 agent-telemetry hook <event> [--agent <claude|codex>]     hook サブコマンド（settings.json / config.toml から呼ばれる、既定 claude）
-agent-telemetry push [--since-last|--full] [--dry-run]    既存実装: サーバへ sessions / transcript_stats の集計行を送信（要 [server] 設定、deprecated）
 agent-telemetry flush [--since-last|--full] [--dry-run]   未送信のイベントをサーバへ OTLP/HTTP で flush（要 [server] 設定）
-agent-telemetry migrate-to-events                         既存 session-index / transcript から events DB を再生成（旧 push 経路からの移行用）
+agent-telemetry migrate-to-events                         既存 session-index / transcript から events DB を再生成
 agent-telemetry version                                   version を表示
 ```
 
@@ -115,6 +114,7 @@ agent ごとに収集元を分離し、SQLite DB は単一に集約する。
   "cwd": "/path/to/project",
   "repo": "org/repo",
   "branch": "feature-xxx",
+  "is_default_branch": false,
   "pr_urls": ["https://github.com/org/repo/pull/123"],
   "pr_pinned": true,
   "pr_title": "feat: add metrics dashboard",
@@ -132,10 +132,11 @@ agent ごとに収集元を分離し、SQLite DB は単一に集約する。
 - `coding_agent` は `claude` または `codex`。欠落時は `claude` として扱う（後方互換）。
 - `agent_version` は agent 自身が報告するバージョン文字列（取得不能なら空文字列）。バージョン跨ぎでの効率比較に使う。
 - `user_id` はセッションを記録したユーザの識別子。SessionStart hook が後述の優先順位で解決して埋める。欠落時は `unknown` として扱う（後方互換）。`sync-db` は欠落レコードに対して現在の解決値で埋め戻し、JSONL にも書き戻す。
-- `pr_urls` は PostToolUse / Stop / `update` / `backfill` から重複排除しつつ追記される。`sync-db` は配列の最後の 1 件を採用する。
+- `pr_urls` は PostToolUse / Stop / `update` / `backfill` から重複排除しつつ追記される。PostToolUse は `gh pr create` の出力だけを抽出対象にする。`sync-db` は配列の最後の 1 件を採用する。
 - `pr_pinned: true` は backfill worker が `gh pr list --head <branch>` で確定した PR にセッションが束縛されたことを示す（Stop が `--pin-session` で対象を渡し、worker 内の pin が解決する）。pinned レコードに対しては PostToolUse / `update` / `backfill` の URL 追記は **すべて no-op** になる（誤接続防止）。欠落時は `false` として扱う（後方互換）。
 - `pr_title` は backfill が `gh pr view --json title` で取得する PR タイトル。欠落時 / 取得失敗時は空文字列として扱う（後方互換）。
-- `backfill_checked: true` のレコードは backfill で再 API 呼び出しされない。PR が存在しないブランチで永続スキップされる。
+- `is_default_branch: true` は SessionStart 時点でこのセッションの branch が repo の**実デフォルトブランチ**（`git symbolic-ref refs/remotes/origin/HEAD` で動的判定。未設定時のみ `main` / `master` フォールバック）だったことを示す。デフォルトブランチは構造的に PR を持たないので、backfill は候補に入れず `gh pr list` を一度も呼ばない（第1層 admission control）。欠落 / `false` 時は通常のセッションとして扱う（後方互換）。branch 名のハードコードではなく動的判定なので `trunk` / `dev` 等にも対応する。
+- `backfill_checked: true` のレコードは backfill で再 API 呼び出しされない。`gh pr list` が空を返したグループのうち `COALESCE(ended_at, timestamp)` から 24h 以上経過したセッション（第2層 horizon）にセットされ、abandoned ブランチを時間で retire する。`is_default_branch` を持たない過去のデフォルトブランチセッションもこの horizon + `backfill --gc` で収束する。
 - Codex の場合: `end_reason` は Stop hook の最終発火を記録するため `stop` 固定。`transcript` は `~/.codex/sessions/.../rollout-*.jsonl[.zst]` のフルパス。
 - 後方互換: 古いレコードに新フィールドが欠けていても扱える（欠落値は 0 / false / 空文字列、`user_id` のみ `unknown`）。
 
@@ -439,16 +440,18 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 
 `schema_hash` mismatch によるサーバ受信拒否は廃止。events table の DDL に互換破壊変更が入る場合のみ、新 endpoint（例: `/v2/logs`）を切る運用とする。
 
-### 旧 push 経路からの移行
+### 旧 push 経路からの移行（完了）
 
-[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で deprecate。既存 binary 互換のため `agent-telemetry push` / `/v1/metrics` は 1 リリース併走し、新経路は `agent-telemetry flush` / `/v1/logs` を使う。クライアント側は `agent-telemetry migrate-to-events` で既存 session-index / transcript から events DB を再生成できる。サーバ側は `agent-telemetry-server migrate-to-events` で events schema を確定し、以降は `flush` で届く events を受ける。展開後は `sessions` / `transcript_stats` が VIEW として提供される。
+[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で廃止済み。`agent-telemetry push` / `agent-telemetry-server` の `/v1/metrics` ハンドラ・`schema_hash` mismatch 受信拒否・`INSERT OR REPLACE` upsert・`collisions.log` は **v0.0.10 を 1 リリース併走させたのち削除した**（[0038]）。現行はクライアント `agent-telemetry flush` → サーバ `/v1/logs`（OTLP/HTTP Logs）の一本のみ。
+
+移行が必要なユーザは旧 push 経路を含む v0.0.10 のうちに `agent-telemetry migrate-to-events`（session-index / transcript から events DB を再生成）と `agent-telemetry-server migrate-to-events`（events schema 確定）を済ませる。展開後は `sessions` / `transcript_stats` が events 由来の VIEW として提供される。
 
 ### サーバ MVP の非目標
 
 - user 別の read/write 権限分離（RLS / OIDC）— 信頼境界 = チーム内を前提
 - transcript 本体のサーバ保管 — events のみを送る方針なのでそもそも保管しない。会話ログを共有したいケースは別ツールで対応
 - write API 以外の提供（read API・専用 UI）— Grafana から直接 SQLite を読む構成
-- OTel Metrics / Traces signal の受信 — Logs（events）のみで完結する。tool 使用などを Counter 化したい場合は後追いで `/v1/metrics` を追加する
+- OTel Metrics / Traces signal の受信 — Logs（events）のみで完結する。tool 使用などを Counter 化したい場合は後追いで Metrics signal の endpoint を追加する
 
 ---
 

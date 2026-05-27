@@ -244,7 +244,11 @@ func countBacklog(a *agent.Agent) int {
 	}
 	n := 0
 	for _, s := range sessions {
-		if !s.PRPinned && len(s.PRURLs) == 0 && !s.BackfillChecked {
+		// Mirror the backfill candidate filter (runURLBackfill): default-branch
+		// sessions are structurally never PR candidates, so they are never
+		// markChecked nor retired by `--gc`. Counting them would inflate the
+		// backlog into an unresolvable `--gc` hint.
+		if !s.PRPinned && len(s.PRURLs) == 0 && !s.BackfillChecked && !s.IsDefaultBranch {
 			n++
 		}
 	}

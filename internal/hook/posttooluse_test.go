@@ -37,6 +37,28 @@ func TestExtractPRURLs(t *testing.T) {
 	}
 }
 
+func TestIsGHPRCreateCommand(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"gh pr create", `{"command":"gh pr create --draft"}`, true},
+		{"leading spaces", `{"command":"  gh pr create"}`, true},
+		{"gh pr view ignored", `{"command":"gh pr view 42"}`, false},
+		{"echo ignored", `{"command":"echo gh pr create"}`, false},
+		{"missing command", `{"description":"gh pr create"}`, false},
+		{"invalid json", `{`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isGHPRCreateCommand(json.RawMessage(c.in)); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestRunPostToolUse_AppendsURL(t *testing.T) {
 	dir := t.TempDir()
 	a := &agent.Agent{Name: agent.NameCodex, DataDir: dir}
@@ -49,6 +71,7 @@ func TestRunPostToolUse_AppendsURL(t *testing.T) {
 	}
 
 	input := &HookInput{
+		ToolInput:    json.RawMessage(`{"command":"gh pr create --draft"}`),
 		SessionID:    "s1",
 		ToolResponse: json.RawMessage(`{"stdout":"created https://github.com/u/r/pull/7"}`),
 	}
@@ -75,7 +98,11 @@ func TestRunPostToolUse_NoURLIsNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	input := &HookInput{SessionID: "s1", ToolResponse: json.RawMessage(`{"stdout":"hello"}`)}
+	input := &HookInput{
+		SessionID:    "s1",
+		ToolInput:    json.RawMessage(`{"command":"gh pr create --draft"}`),
+		ToolResponse: json.RawMessage(`{"stdout":"hello"}`),
+	}
 	if err := RunPostToolUse(input, a); err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +128,7 @@ func TestRunPostToolUse_SkipsPinnedSession(t *testing.T) {
 	// Tool output references a totally unrelated PR — exactly the
 	// scenario where the old code mis-attributed pr_urls.
 	input := &HookInput{
+		ToolInput:    json.RawMessage(`{"command":"gh pr create --draft"}`),
 		SessionID:    "s1",
 		ToolResponse: json.RawMessage(`{"stdout":"viewed https://github.com/other/repo/pull/999"}`),
 	}
@@ -120,6 +148,31 @@ func TestRunPostToolUse_SkipsPinnedSession(t *testing.T) {
 	}
 	if !sessions[0].PRPinned {
 		t.Fatal("pr_pinned must remain true")
+	}
+}
+
+func TestRunPostToolUse_NonCreateCommandDoesNotScrapePRURL(t *testing.T) {
+	dir := t.TempDir()
+	a := &agent.Agent{Name: agent.NameCodex, DataDir: dir}
+	idx := a.SessionIndexPath()
+
+	original := `{"coding_agent":"codex","session_id":"s1","cwd":"/tmp","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}` + "\n"
+	if err := os.WriteFile(idx, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	input := &HookInput{
+		SessionID:    "s1",
+		ToolInput:    json.RawMessage(`{"command":"gh pr view 999"}`),
+		ToolResponse: json.RawMessage(`{"stdout":"https://github.com/other/repo/pull/999"}`),
+	}
+	if err := RunPostToolUse(input, a); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := os.ReadFile(idx)
+	if string(got) != original {
+		t.Errorf("file modified for non-create command:\n  before: %q\n  after:  %q", original, got)
 	}
 }
 

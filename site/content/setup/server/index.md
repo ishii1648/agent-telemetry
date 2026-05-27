@@ -3,7 +3,7 @@ title: server
 weight: 20
 ---
 
-複数マシンやチームメンバーで集計値を集約したい場合、`agent-telemetry-server` を立てて `agent-telemetry push` で送信する経路を有効化できます。サーバ送信は **オプトイン** で、設定しなければローカル単独利用は従来どおり動きます。基本のローカルセットアップは [local]({{< relref "/setup/local" >}}) を参照してください。
+複数マシンやチームメンバーでメトリクスを集約したい場合、`agent-telemetry-server` を立てて `agent-telemetry flush` でイベントを送信する経路を有効化できます。送信は append-only なイベント列を OTLP/HTTP Logs（`POST /v1/logs`）で転送する方式です。サーバ送信は **オプトイン** で、設定しなければローカル単独利用は従来どおり動きます。基本のローカルセットアップは [local]({{< relref "/setup/local" >}}) を参照してください。
 
 仕様の外部契約は [docs/spec.md ## サーバ送信](https://github.com/ishii1648/agent-telemetry/blob/main/docs/spec.md#サーバ送信)、設計判断は [docs/design.md ## サーバ側集約パイプライン](https://github.com/ishii1648/agent-telemetry/blob/main/docs/design.md#サーバ側集約パイプライン) を参照。
 
@@ -302,25 +302,27 @@ token    = "xxx"                             # AGENT_TELEMETRY_SERVER_TOKEN と�
 設定を確認:
 
 ```fish
-agent-telemetry push --dry-run        # 対象セッション件数と payload サイズだけ表示
-agent-telemetry push --since-last     # 実送信。差分のみ
+agent-telemetry flush --dry-run        # 送信対象イベント件数と payload サイズだけ表示
+agent-telemetry flush --since-last     # 実送信。未送信イベントのみ
 ```
 
 `[server]` が欠落 / 値が空のときは warning を stderr に出して exit code 0 で終了するため、cron に設定したまま config を取り除いても CI / cron が壊れません。
 
-## 7. push の定期起動
+> **旧 `push` 経路について**: v0.0.10 までは集計行を `POST /v1/metrics` で送る `agent-telemetry push` がありましたが、append-only イベント + OTLP/HTTP Logs への移行（[0038]）に伴い削除されました。v0.0.10 から移行する場合は、そのバージョンのうちに `agent-telemetry migrate-to-events`（クライアント）/ `agent-telemetry-server migrate-to-events`（サーバ）を実行してから新 binary に更新してください。
 
-`agent-telemetry push --since-last` は Stop hook の hot path に乗せず、別途定期起動します（hook が遅延すると agent UX が劣化するため）。exit code は **0 = ok / 1 = error / 2 = schema_mismatch** です。
+## 7. flush の定期起動
+
+`agent-telemetry flush --since-last` は Stop hook の hot path に乗せず、別途定期起動します（hook が遅延すると agent UX が劣化するため）。exit code は **0 = ok / 1 = error** です。配送失敗時は `last_flushed_sequence` を進めないため、次回 flush で同じ範囲を冪等に再送します（サーバ側 `INSERT OR IGNORE` で重複排除）。
 
 ### cron（Linux / macOS）
 
 ```cron
-0 * * * * /usr/local/bin/agent-telemetry push --since-last >> $HOME/.claude/logs/push.log 2>&1
+0 * * * * /usr/local/bin/agent-telemetry flush --since-last >> $HOME/.claude/logs/flush.log 2>&1
 ```
 
 ### launchd plist（macOS）
 
-`~/Library/LaunchAgents/dev.agent-telemetry.push.plist`:
+`~/Library/LaunchAgents/dev.agent-telemetry.flush.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -329,61 +331,46 @@ agent-telemetry push --since-last     # 実送信。差分のみ
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>dev.agent-telemetry.push</string>
+  <string>dev.agent-telemetry.flush</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/agent-telemetry</string>
-    <string>push</string>
+    <string>flush</string>
     <string>--since-last</string>
   </array>
   <key>StartInterval</key>
   <integer>3600</integer>
   <key>StandardOutPath</key>
-  <string>/Users/REPLACE_ME/.claude/logs/push.log</string>
+  <string>/Users/REPLACE_ME/.claude/logs/flush.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/REPLACE_ME/.claude/logs/push.log</string>
+  <string>/Users/REPLACE_ME/.claude/logs/flush.log</string>
 </dict>
 </plist>
 ```
 
 ```fish
-launchctl load ~/Library/LaunchAgents/dev.agent-telemetry.push.plist
+launchctl load ~/Library/LaunchAgents/dev.agent-telemetry.flush.plist
 ```
 
 ## 8. 新メトリクス追加時の遡及反映
 
-サーバ・クライアント間で `internal/syncdb/schema.sql` のハッシュ（`schema_meta`）が一致している必要があります。新メトリクスを追加する場合は **サーバを先に新スキーマへ更新** します（クライアント先行で push されると古いスキーマで永続化されるため）。
+events モデルでは `events` テーブルの DDL を変えずに新属性 / 新イベント名を増やせるため、旧設計の「サーバ先行デプロイ → 全クライアント binary 更新 → 全件再送」運用は不要です。`schema_hash` 不一致でサーバが送信を全停止させる仕組みも廃止されました（events table の DDL は安定で、新メトリクスは新属性の追加で表現できるため）。
 
 ```fish
-# 1. サーバを新 image にロールアウト
+# 1. 新属性 / 新イベントを emit するクライアント binary を順次配布
+#    （旧クライアントは無変更でも既存 events を送り続ける）
+
+# 2. サーバ binary 側の VIEW 定義を更新（events の新属性を引いて新カラムを生やす）
 kubectl set image deployment/agent-telemetry-server \
   server=ghcr.io/ishii1648/agent-telemetry-server:v0.6.0 -n agent-telemetry
 kubectl rollout status deployment/agent-telemetry-server -n agent-telemetry
 
-# 2. 全クライアントで binary を更新（Releases から再 install）
-
-# 3. 各クライアントで過去全セッションを再集計し再送信
+# 3. 既存セッションに新属性を遡及反映したい場合は snapshot イベントを再 emit
+#    （sync-db --recheck で agent.transcript.scanned 等が新属性付きで再生成される）
 agent-telemetry sync-db --recheck
-agent-telemetry push --full
+agent-telemetry flush --since-last
 ```
 
-### `schema_mismatch` エラーが出たとき
+**新メトリクスの大半は schema 変更を伴いません**。属性は events の JSON に入るため、新属性を増やすだけならクライアント binary を差し替えるだけで済み、サーバ DB は無変更で受け続けます。
 
-クライアントが古いまま push するとサーバが `schema_mismatch: true` を返し、クライアントは **exit code 2** で終了します。
-
-```
-$ agent-telemetry push --since-last
-schema mismatch: client=abc123… server=def456… — upgrade client binary
-$ echo $status
-2
-```
-
-対処は単純に **クライアント binary を新 version へ更新する** だけです:
-
-```fish
-agent-telemetry version    # 現在の binary version を確認
-# Releases から最新を再 install
-agent-telemetry sync-db --recheck && agent-telemetry push --full
-```
-
-サーバを過去 version にロールバックする場合も同じ手順で **クライアント側を先に旧 version に戻し**、その後サーバ image を差し替えます。
+> **VIEW / DDL を変更するときの注意**: `schema.sql`（VIEW 定義・index 等）を変更すると埋め込み `schema_hash` が変わり、サーバ起動時の `schema_meta` 比較で不一致になります。現状の `EnsureSchema` は不一致時に `schema.sql` を再適用し、その先頭で `DROP TABLE events` してから作り直すため、**サーバ集約 DB の events は一度全消去されます**。クライアントはローカル `events` を保持しているので、復旧は全クライアントで `agent-telemetry flush --full` を実行して再投入します（`INSERT OR IGNORE` で冪等）。本番では VIEW 変更をまとめて行い、変更デプロイ前に events を退避（DB バックアップ）するか、全クライアントの `flush --full` を段取りしてください。`events` テーブル本体の DDL に互換破壊変更を入れる場合は、新 endpoint（例: `/v2/logs`）を切る運用とします。

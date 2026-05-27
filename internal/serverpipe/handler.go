@@ -16,97 +16,32 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/ishii1648/agent-telemetry/internal/syncdb/schema"
 )
 
-// MaxPayloadBytes caps a single /v1/metrics request. Aggregated rows
-// are tiny in practice (<1 MB / month for individuals); 50 MB is
+// MaxPayloadBytes caps a single /v1/logs request. An OTLP batch is
+// tiny in practice (<1 MB / month for individuals); 50 MB is
 // insurance against runaway clients, matching docs/spec.md.
 const MaxPayloadBytes = 50 * 1024 * 1024
 
-// Session mirrors the sessions table columns. JSON tags match
-// docs/spec.md ## SQLite データモデル so payloads can be decoded
-// directly without an intermediate shape.
-type Session struct {
-	SessionID        string `json:"session_id"`
-	CodingAgent      string `json:"coding_agent"`
-	AgentVersion     string `json:"agent_version"`
-	UserID           string `json:"user_id"`
-	Timestamp        string `json:"timestamp"`
-	CWD              string `json:"cwd"`
-	Repo             string `json:"repo"`
-	Branch           string `json:"branch"`
-	PRURL            string `json:"pr_url"`
-	PRTitle          string `json:"pr_title"`
-	Transcript       string `json:"transcript"`
-	ParentSessionID  string `json:"parent_session_id"`
-	EndedAt          string `json:"ended_at"`
-	EndReason        string `json:"end_reason"`
-	IsSubagent       int    `json:"is_subagent"`
-	BackfillChecked  int    `json:"backfill_checked"`
-	IsMerged         int    `json:"is_merged"`
-	TaskType         string `json:"task_type"`
-	ReviewComments   int    `json:"review_comments"`
-	ChangesRequested int    `json:"changes_requested"`
-}
-
-// TranscriptStat mirrors the transcript_stats table columns.
-type TranscriptStat struct {
-	SessionID        string `json:"session_id"`
-	CodingAgent      string `json:"coding_agent"`
-	ToolUseTotal     int64  `json:"tool_use_total"`
-	MidSessionMsgs   int64  `json:"mid_session_msgs"`
-	AskUserQuestion  int64  `json:"ask_user_question"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	ReasoningTokens  int64  `json:"reasoning_tokens"`
-	Model            string `json:"model"`
-	IsGhost          int    `json:"is_ghost"`
-}
-
-// Payload is the request body for POST /v1/metrics.
-type Payload struct {
-	ClientVersion   string           `json:"client_version"`
-	SchemaHash      string           `json:"schema_hash"`
-	Sessions        []Session        `json:"sessions"`
-	TranscriptStats []TranscriptStat `json:"transcript_stats"`
-}
-
-// Response is the body returned from POST /v1/metrics. Even when
-// schema_mismatch is true the server returns 200 so clients can
-// inspect the body — the client treats schema_mismatch as a hard
-// stop and surfaces a binary-update prompt.
-type Response struct {
-	ReceivedSessions int  `json:"received_sessions"`
-	SkippedSessions  int  `json:"skipped_sessions"`
-	SchemaMismatch   bool `json:"schema_mismatch"`
-}
-
-// Handler holds the deps a /v1/metrics request needs. CollisionsLog
-// is opened lazily so a missing data dir at startup doesn't kill the
+// Handler holds the deps a /v1/logs request needs. RejectedLog is
+// opened lazily so a missing data dir at startup doesn't kill the
 // server before its first write.
 type Handler struct {
-	DB             *sql.DB
-	Token          string
-	CollisionsPath string
-	RejectedPath   string
+	DB           *sql.DB
+	Token        string
+	RejectedPath string
 
-	mu          sync.Mutex
-	collisionsW io.WriteCloser
-	rejectedW   io.WriteCloser
+	mu        sync.Mutex
+	rejectedW io.WriteCloser
 }
 
 // NewHandler wires up the http.Handler. Token must be non-empty —
 // the cmd entrypoint validates the env var before reaching here.
 func NewHandler(db *sql.DB, token, dataDir string) *Handler {
 	return &Handler{
-		DB:             db,
-		Token:          token,
-		CollisionsPath: filepath.Join(dataDir, "collisions.log"),
-		RejectedPath:   filepath.Join(dataDir, "rejected.log"),
+		DB:           db,
+		Token:        token,
+		RejectedPath: filepath.Join(dataDir, "rejected.log"),
 	}
 }
 
@@ -114,69 +49,19 @@ func NewHandler(db *sql.DB, token, dataDir string) *Handler {
 // separate from NewHandler so callers can compose middleware (e.g.
 // access logging) before mounting.
 func (h *Handler) Routes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/metrics", h.ServeIngest)
 	mux.HandleFunc("/v1/logs", h.ServeLogs)
 }
 
-// Close releases the collisions / rejected log files if they were opened.
+// Close releases the rejected log file if it was opened.
 func (h *Handler) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var err error
-	if h.collisionsW != nil {
-		err = h.collisionsW.Close()
-		h.collisionsW = nil
-	}
 	if h.rejectedW != nil {
-		if cerr := h.rejectedW.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
+		err = h.rejectedW.Close()
 		h.rejectedW = nil
 	}
 	return err
-}
-
-func (h *Handler) ServeIngest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !h.checkAuth(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	body, err := readBody(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var payload Payload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Schema mismatch is a hard stop. We respond 200 with the body so
-	// the client can read schema_mismatch and surface the upgrade
-	// prompt — using a non-2xx would conflate transport errors with
-	// version drift.
-	if payload.SchemaHash != schema.Hash {
-		writeJSON(w, http.StatusOK, Response{
-			SchemaMismatch: true,
-		})
-		return
-	}
-
-	resp, err := h.upsert(&payload)
-	if err != nil {
-		http.Error(w, "ingest: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 type logsPayload struct {
@@ -376,120 +261,6 @@ func readBody(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("payload exceeds %d bytes", MaxPayloadBytes)
 	}
 	return body, nil
-}
-
-// upsert applies sessions + transcript_stats rows in a single
-// transaction. Pre-existing rows for the same composite PK are logged
-// to collisions.log (last-write-wins semantics, per docs/design.md).
-func (h *Handler) upsert(p *Payload) (Response, error) {
-	tx, err := h.DB.Begin()
-	if err != nil {
-		return Response{}, fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback()
-
-	collidedSessions, err := h.findCollidingSessions(tx, p.Sessions)
-	if err != nil {
-		return Response{}, err
-	}
-
-	sessionStmt, err := tx.Prepare(`INSERT OR REPLACE INTO sessions
-		(session_id, coding_agent, agent_version, user_id, timestamp, cwd, repo, branch, pr_url, pr_title, transcript, parent_session_id, ended_at, end_reason, is_subagent, backfill_checked, is_merged, task_type, review_comments, changes_requested)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		return Response{}, err
-	}
-	defer sessionStmt.Close()
-
-	statsStmt, err := tx.Prepare(`INSERT OR REPLACE INTO transcript_stats
-		(session_id, coding_agent, tool_use_total, mid_session_msgs, ask_user_question, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, reasoning_tokens, model, is_ghost)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		return Response{}, err
-	}
-	defer statsStmt.Close()
-
-	for _, s := range p.Sessions {
-		if _, err := sessionStmt.Exec(
-			s.SessionID, s.CodingAgent, s.AgentVersion, s.UserID, s.Timestamp, s.CWD, s.Repo, s.Branch,
-			s.PRURL, s.PRTitle, s.Transcript, s.ParentSessionID, s.EndedAt, s.EndReason,
-			s.IsSubagent, s.BackfillChecked, s.IsMerged, s.TaskType, s.ReviewComments, s.ChangesRequested,
-		); err != nil {
-			return Response{}, fmt.Errorf("insert session %s/%s: %w", s.CodingAgent, s.SessionID, err)
-		}
-	}
-
-	for _, t := range p.TranscriptStats {
-		if _, err := statsStmt.Exec(
-			t.SessionID, t.CodingAgent, t.ToolUseTotal, t.MidSessionMsgs, t.AskUserQuestion,
-			t.InputTokens, t.OutputTokens, t.CacheWriteTokens, t.CacheReadTokens,
-			t.ReasoningTokens, t.Model, t.IsGhost,
-		); err != nil {
-			return Response{}, fmt.Errorf("insert stats %s/%s: %w", t.CodingAgent, t.SessionID, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return Response{}, fmt.Errorf("commit: %w", err)
-	}
-
-	if len(collidedSessions) > 0 {
-		h.recordCollisions(collidedSessions)
-	}
-	return Response{
-		ReceivedSessions: len(p.Sessions),
-		SkippedSessions:  0,
-	}, nil
-}
-
-// findCollidingSessions returns the (coding_agent, session_id) pairs
-// in the payload that already exist in the DB. We log them but still
-// upsert (last-write-wins).
-func (h *Handler) findCollidingSessions(tx *sql.Tx, sessions []Session) ([][2]string, error) {
-	if len(sessions) == 0 {
-		return nil, nil
-	}
-	stmt, err := tx.Prepare(`SELECT 1 FROM sessions WHERE session_id = ? AND coding_agent = ?`)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	var collisions [][2]string
-	for _, s := range sessions {
-		var dummy int
-		err := stmt.QueryRow(s.SessionID, s.CodingAgent).Scan(&dummy)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("collision check %s/%s: %w", s.CodingAgent, s.SessionID, err)
-		}
-		collisions = append(collisions, [2]string{s.CodingAgent, s.SessionID})
-	}
-	return collisions, nil
-}
-
-func (h *Handler) recordCollisions(pairs [][2]string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.collisionsW == nil {
-		if err := os.MkdirAll(filepath.Dir(h.CollisionsPath), 0o755); err != nil {
-			log.Printf("collisions.log mkdir: %v", err)
-			return
-		}
-		f, err := os.OpenFile(h.CollisionsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			log.Printf("collisions.log open: %v", err)
-			return
-		}
-		h.collisionsW = f
-	}
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	for _, p := range pairs {
-		fmt.Fprintf(h.collisionsW, "%s coding_agent=%s session_id=%s\n", now, p[0], p[1])
-	}
 }
 
 // recordRejected appends permanently-rejected OTLP log records to rejected.log

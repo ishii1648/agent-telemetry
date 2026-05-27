@@ -21,6 +21,19 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/syncdb"
 )
 
+// MaxBatchBytes is the per-request hard cap from docs/spec.md. Kept as a var
+// so tests can shrink it without producing massive fixtures.
+var MaxBatchBytes = 50 * 1024 * 1024
+
+// gzipThreshold is the payload size above which we compress. Below this,
+// gzip overhead (~30 bytes minimum) is comparable to the savings on small
+// JSON, so we send raw.
+const gzipThreshold = 4 * 1024
+
+// requestTimeout caps each HTTP attempt. Server work is a dumb INSERT OR
+// IGNORE into SQLite, so anything beyond this points at network trouble.
+const requestTimeout = 60 * time.Second
+
 type FlushOptions struct {
 	ClientVersion string
 	SinceLast     bool

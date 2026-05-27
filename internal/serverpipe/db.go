@@ -1,8 +1,10 @@
 // Package serverpipe implements the dumb ingest layer for
-// agent-telemetry-server: receive aggregated rows from clients and
-// upsert them into a shared SQLite DB. The aggregation logic
-// (transcript parsing, PR rollup) lives entirely on the client side —
-// the server only shares the schema DDL via internal/syncdb/schema.
+// agent-telemetry-server: receive append-only events from clients as
+// OTLP/HTTP Logs (POST /v1/logs) and append them (INSERT OR IGNORE)
+// into a shared SQLite DB. sessions / transcript_stats / pr_metrics are
+// derived VIEWs over events; the transcript parsing / PR rollup that
+// feeds those events runs on the client side. The server only shares
+// the schema DDL via internal/syncdb/schema.
 package serverpipe
 
 import (

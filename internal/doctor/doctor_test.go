@@ -349,6 +349,33 @@ func TestRun_BacklogHintAboveThreshold(t *testing.T) {
 	}
 }
 
+// TestCountBacklog_ExcludesDefaultBranch verifies the backlog count mirrors the
+// backfill candidate filter: default-branch sessions are structurally never PR
+// candidates (excluded by runURLBackfill and never markChecked / retired by
+// --gc), so counting them would produce an unresolvable --gc hint.
+func TestCountBacklog_ExcludesDefaultBranch(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "session-index.jsonl")
+	lines := []string{
+		// counts: PR-less, unchecked, unpinned, not default branch
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"feat1","cwd":"/tmp","repo":"u/r","branch":"feat","pr_urls":[],"backfill_checked":false}`,
+		// excluded: default branch (structurally never a candidate)
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"def1","cwd":"/tmp","repo":"u/r","branch":"main","is_default_branch":true,"pr_urls":[],"backfill_checked":false}`,
+		// excluded: already has a URL
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"url1","cwd":"/tmp","repo":"u/r","branch":"feat2","pr_urls":["https://github.com/u/r/pull/1"],"backfill_checked":false}`,
+		// excluded: already checked
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"chk1","cwd":"/tmp","repo":"u/r","branch":"feat3","pr_urls":[],"backfill_checked":true}`,
+	}
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	if got := countBacklog(a); got != 1 {
+		t.Errorf("countBacklog = %d, want 1 (default-branch / url'd / checked excluded)", got)
+	}
+}
+
 func TestRun_NoBacklogHintBelowThreshold(t *testing.T) {
 	dir := t.TempDir()
 	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
