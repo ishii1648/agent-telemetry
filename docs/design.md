@@ -223,7 +223,7 @@ GitHub の secondary rate limit は総量でなく **バースト / 同時実行
 
 ### 移行 drain `backfill --gc`
 
-deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。
+deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。
 
 ### PR タイトルの取得
 
@@ -235,7 +235,7 @@ backfill は `gh pr list` / `gh pr view` の `--json` 引数に `title` を含�
 
 ### `(repo, branch)` グルーピングと候補の絞り込み（第1層 admission control + 第2層 horizon）
 
-backfill は `pr_urls` が空のセッションを `(repo, branch)` でグループ化し、`gh pr list` を 1 回だけ実行する。同一ブランチで複数セッションがあっても API 呼び出しは 1 回。「PR が未作成のまま放置されたブランチ」を毎 Stop で無限に再 probe しないため、候補は 2 段で絞る（[issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/0035-bug-backfill-no-pr-infinite-retry.md)）。
+backfill は `pr_urls` が空のセッションを `(repo, branch)` でグループ化し、`gh pr list` を 1 回だけ実行する。同一ブランチで複数セッションがあっても API 呼び出しは 1 回。「PR が未作成のまま放置されたブランチ」を毎 Stop で無限に再 probe しないため、候補は 2 段で絞る（[issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。
 
 **第1層 — 実デフォルトブランチの admission control**: repo の**実際のデフォルトブランチ上のセッションは構造的に PR を持たない**（デフォルトブランチから PR は作らない）ので、そもそも候補に入れず `gh pr list` を一度も呼ばない。判定は SessionStart の `extractGitInfo`（既に git を叩いている）で `git symbolic-ref refs/remotes/origin/HEAD` を使って repo ごとの実デフォルトブランチを動的に求め、現セッションの branch と一致するかを `is_default_branch` フラグとして session entry に焼き付ける（gh API は呼ばない）。origin/HEAD 未設定の repo に限り慣習的な `main` / `master` へフォールバックする。**branch 名 `main` / `master` のハードコード除外は採用しない**——`trunk` / `dev` / `develop` 等の命名多様性に対応するため、名前一致ではなく実デフォルトブランチの動的判定にする。`is_default_branch` を持つセッションは Phase 1 の候補収集でも pin（現セッションの `gh pr list`）でも除外され、`backfill_checked` ではなくこのフラグが永続スキップを担うので `--recheck` でも候補に入らない。
 

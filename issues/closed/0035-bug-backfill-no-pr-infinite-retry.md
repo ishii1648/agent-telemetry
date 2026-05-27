@@ -31,9 +31,9 @@ Created: 2026-05-11
 
 - 原 Python (`batch/session-index-backfill-batch.py`, e1196eb 以前) は **cron 実行前提**で「`cwd` 存在 + PR 未発見 → 次 cron で再試行」をコメント明記の上で意図的に実装していた。cron tick 数（1 日数回）×グループ数のコストは許容範囲だった
 - 2026-03 の Go rewrite (e1196eb) はこの挙動を素直に移植
-- 2026-04-29 [issues/closed/0020-design-backfill-evolution-to-stop-hook.md](closed/0020-design-backfill-evolution-to-stop-hook.md) で backfill を Stop hook から呼ぶよう移行 → retry 頻度が **cron tick 数 → Stop 回数** に急増
+- 2026-04-29 [issues/closed/0020-design-backfill-evolution-to-stop-hook.md](0020-design-backfill-evolution-to-stop-hook.md) で backfill を Stop hook から呼ぶよう移行 → retry 頻度が **cron tick 数 → Stop 回数** に急増
 - 同じ流れで `docs/design.md:204-206` に「main/master は永続スキップ」が書かれたが、code 側の `fetchPR` は touch されず Python 起源の挙動が残った
-- 2026-05-08 [issues/closed/0022-design-pr-resolve-early-binding.md](closed/0022-design-pr-resolve-early-binding.md) で Stop hook pin が導入され、PR 作成済セッションは pin で即解決するようになった。しかし「PR 未作成ブランチの probe」は backfill フォールバック側に残ったため、本 issue の cost が浮き彫りになった
+- 2026-05-08 [issues/closed/0022-design-pr-resolve-early-binding.md](0022-design-pr-resolve-early-binding.md) で Stop hook pin が導入され、PR 作成済セッションは pin で即解決するようになった。しかし「PR 未作成ブランチの probe」は backfill フォールバック側に残ったため、本 issue の cost が浮き彫りになった
 
 ### 影響
 
@@ -43,7 +43,7 @@ Created: 2026-05-11
 
 ### `ended_at` の信頼性（2026-05 実測、E の前提に直結）
 
-E の horizon は `ended_at` を基準にするが、`ended_at` の計測は agent で非対称（[0039](closed/0039-bug-stop-hook-backfill-rate-limit.md) の調査）:
+E の horizon は `ended_at` を基準にするが、`ended_at` の計測は agent で非対称（[0039](0039-bug-stop-hook-backfill-rate-limit.md) の調査）:
 
 - **Claude**: SessionEnd hook (`sessionend.go:22`) が発火時に 1 回だけ書く。kill / 端末強制クローズ / クラッシュでは発火せず空のまま。**補完経路なし**。
 - **Codex**: SessionEnd が無いので Stop hook が毎回上書き (`stop.go:62`) → 最終アクティビティ時刻。さらに `backfillCodexEndedAt` が rollout JSONL から復元。
@@ -68,7 +68,7 @@ E の horizon は `ended_at` を基準にするが、`ended_at` の計測は age
 
 ## 対応方針
 
-採用: **第1層（実デフォルトブランチの admission control）+ E（horizon）+ G（pin 結果を同 tick 内で再利用）の組み合わせ**。第1層 = 入口で candidate に入れない、E = 入った candidate を時間で諦める、という 2 段の GC（[0039](closed/0039-bug-stop-hook-backfill-rate-limit.md) の GC 設計と対応。第1層/第2層の用語は 0039 と共通）。
+採用: **第1層（実デフォルトブランチの admission control）+ E（horizon）+ G（pin 結果を同 tick 内で再利用）の組み合わせ**。第1層 = 入口で candidate に入れない、E = 入った candidate を時間で諦める、という 2 段の GC（[0039](0039-bug-stop-hook-backfill-rate-limit.md) の GC 設計と対応。第1層/第2層の用語は 0039 と共通）。
 
 ### 第1層 — 実デフォルトブランチの admission control（新規採用）
 
@@ -128,7 +128,7 @@ Stop hook の `pinPRForSession` が「PR なし」を確定した `(repo, branch
 
 ## 参照
 
-- 過去の意思決定: [0020](closed/0020-design-backfill-evolution-to-stop-hook.md) (cron→Stop hook 移行) / [0022](closed/0022-design-pr-resolve-early-binding.md) (Stop hook pin 導入) / [0001](closed/0001-bug-pr-session-misattribution.md) (関連バグ)
+- 過去の意思決定: [0020](0020-design-backfill-evolution-to-stop-hook.md) (cron→Stop hook 移行) / [0022](0022-design-pr-resolve-early-binding.md) (Stop hook pin 導入) / [0001](0001-bug-pr-session-misattribution.md) (関連バグ)
 - 該当コード: `internal/backfill/backfill.go:358-403` (`fetchPR`), `internal/sessionindex/update.go:131-176` (`MarkChecked`)
 - doc/code drift 箇所: `docs/design.md:204-206`, `docs/spec.md:136`
 - 詳細な調査メモ: `.outputs/claude/backfill-markchecked-investigation.md`（local 出力、commit しない）
@@ -139,7 +139,7 @@ Completed: 2026-05-28
 
 ## 解決方法
 
-本 issue は **第1層（実デフォルトブランチの admission control）** と **第2層（24h horizon）+ G（pin 重複）** に分かれ、後者は先行 merge した [0039](closed/0039-bug-stop-hook-backfill-rate-limit.md) が既に巻き取っていた。本 PR では残りの第1層のみを実装した。
+本 issue は **第1層（実デフォルトブランチの admission control）** と **第2層（24h horizon）+ G（pin 重複）** に分かれ、後者は先行 merge した [0039](0039-bug-stop-hook-backfill-rate-limit.md) が既に巻き取っていた。本 PR では残りの第1層のみを実装した。
 
 ### 第1層 — 実デフォルトブランチの admission control（本 PR）
 
