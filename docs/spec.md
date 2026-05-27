@@ -38,7 +38,7 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 |---|---|---|
 | `SessionStart` | `agent-telemetry hook session-start --agent claude` | セッション開始メタデータを `~/.claude/session-index.jsonl` に追記 |
 | `SessionEnd` | `agent-telemetry hook session-end --agent claude` | 終了時刻と終了理由を `~/.claude/session-index.jsonl` に追記し、SQLite を同期 |
-| `Stop` | `agent-telemetry hook stop --agent claude` | 応答完了時に branch から PR を解決して `pr_pinned` で確定 → `backfill` → `sync-db` を実行（ブロッキング） |
+| `Stop` | `agent-telemetry hook stop --agent claude` | 応答完了時に `backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側で実行 |
 
 ### Codex CLI
 
@@ -47,10 +47,10 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 | hook イベント | サブコマンド | 役割 |
 |---|---|---|
 | `SessionStart` (`startup\|resume`) | `agent-telemetry hook session-start --agent codex` | セッション開始メタデータを `~/.codex/session-index.jsonl` に追記 |
-| `Stop` | `agent-telemetry hook stop --agent codex` | 応答完了時に branch から PR を解決して `pr_pinned` で確定し、`ended_at` を更新、`backfill` → `sync-db` を実行（ブロッキング） |
+| `Stop` | `agent-telemetry hook stop --agent codex` | 応答完了時に `ended_at` を同期更新し（Codex の de-facto SessionEnd）、`backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側 |
 | `PostToolUse` | `agent-telemetry hook post-tool-use --agent codex` | `tool_response` から PR URL を抽出し `pr_urls` に追記（`pr_pinned: true` のセッションでは無視される） |
 
-`Stop` hook はセッション終了を待機するが、cursor 方式・時間条件スキップ・goroutine 並列・8 秒タイムアウトで処理時間を抑制する。
+`Stop` hook の同期パスはローカル書き込み（Codex の `ended_at` のみ）と worker spawn だけで、`gh` を 1 回も呼ばず数 ms で return する。`gh` を伴う処理は detached worker に退避し、worker 側で global single-flight（同時実行抑制）・cooldown（頻度抑制）・gh cap（1 起動の件数上限）でレート制御する。両 agent とも worker トリガは Stop のみで、hook 登録構成は従来から変更しない。詳細は `docs/design.md ## Stop hook の非同期 worker 起動`。
 
 ---
 
@@ -59,7 +59,7 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 ```
 agent-telemetry setup [--agent <claude|codex>]            セットアップ案内を表示（hook 登録はユーザが手動で行う）
 agent-telemetry doctor                                    検出された agent ごとに binary / data dir / hook 登録を検証（自動修復はしない）
-agent-telemetry backfill [--recheck]                      検出された agent すべての pr_urls / is_merged / review_comments を補完
+agent-telemetry backfill [--recheck] [--gc]               検出された agent すべての pr_urls / is_merged / review_comments を補完
 agent-telemetry sync-db                                   検出された agent すべての JSONL/transcript → SQLite 変換（毎回フル再構築）
 agent-telemetry update <session_id> <url>...              session-index.jsonl に PR URL を追加（重複排除）
 agent-telemetry update --mark-checked <session_id>...     backfill_checked フラグをセット
@@ -73,7 +73,7 @@ agent-telemetry version                                   version を表示
 
 `setup` は何も書き込まず案内表示のみを行う。hook 登録の編集はユーザが手動で行う（既存の自動登録エントリも手動で削除する）。
 
-`backfill --recheck` は cursor を無視してフルスキャンする。
+`backfill --recheck` は cursor を無視してフルスキャンする。`backfill --gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする移行 drain（deploy 後に 1 回手動実行する。`doctor` が backlog 件数を見て案内する）。`--detach` / `--worker` は Stop hook が内部で使う detached worker 起動用フラグ。
 
 agent の検出は次の優先順位で行う:
 
@@ -133,7 +133,7 @@ agent ごとに収集元を分離し、SQLite DB は単一に集約する。
 - `agent_version` は agent 自身が報告するバージョン文字列（取得不能なら空文字列）。バージョン跨ぎでの効率比較に使う。
 - `user_id` はセッションを記録したユーザの識別子。SessionStart hook が後述の優先順位で解決して埋める。欠落時は `unknown` として扱う（後方互換）。`sync-db` は欠落レコードに対して現在の解決値で埋め戻し、JSONL にも書き戻す。
 - `pr_urls` は PostToolUse / Stop / `update` / `backfill` から重複排除しつつ追記される。`sync-db` は配列の最後の 1 件を採用する。
-- `pr_pinned: true` は Stop hook が `gh pr list --head <branch>` で確定した PR にセッションが束縛されたことを示す。pinned レコードに対しては PostToolUse / `update` / `backfill` の URL 追記は **すべて no-op** になる（誤接続防止）。欠落時は `false` として扱う（後方互換）。
+- `pr_pinned: true` は backfill worker が `gh pr list --head <branch>` で確定した PR にセッションが束縛されたことを示す（Stop が `--pin-session` で対象を渡し、worker 内の pin が解決する）。pinned レコードに対しては PostToolUse / `update` / `backfill` の URL 追記は **すべて no-op** になる（誤接続防止）。欠落時は `false` として扱う（後方互換）。
 - `pr_title` は backfill が `gh pr view --json title` で取得する PR タイトル。欠落時 / 取得失敗時は空文字列として扱う（後方互換）。
 - `backfill_checked: true` のレコードは backfill で再 API 呼び出しされない。PR が存在しないブランチで永続スキップされる。
 - Codex の場合: `end_reason` は Stop hook の最終発火を記録するため `stop` 固定。`transcript` は `~/.codex/sessions/.../rollout-*.jsonl[.zst]` のフルパス。

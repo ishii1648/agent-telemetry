@@ -3,11 +3,15 @@ package backfill
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ishii1648/agent-telemetry/internal/agent"
@@ -46,6 +50,16 @@ type reviewJSON struct {
 
 // MetaCheckInterval is the minimum duration between Phase 2 (merge status) checks.
 const MetaCheckInterval = 1 * time.Hour
+const WorkerCooldown = 5 * time.Minute
+const DefaultGHCap = 20
+
+type Options struct {
+	Recheck      bool
+	DetachedRun  bool
+	PinSessionID string
+	GCOnly       bool
+	GHCap        int
+}
 
 // Run executes the backfill batch. It finds sessions without pr_urls,
 // groups them by (repo, branch), and fetches PR URLs via gh pr list in parallel.
@@ -66,16 +80,24 @@ func Run(indexPath string, recheck bool) error {
 // and Phase 2 (PR meta refresh) for one agent. The state cursor lives at
 // the agent's StatePath().
 func RunForAgent(a *agent.Agent, recheck bool) error {
-	return runForAgent(a, a.SessionIndexPath(), a.StatePath(), recheck)
+	return RunForAgentWithOptions(a, Options{Recheck: recheck})
+}
+
+func RunForAgentWithOptions(a *agent.Agent, opts Options) error {
+	return runForAgent(a, a.SessionIndexPath(), a.StatePath(), opts)
 }
 
 // RunForAgents iterates every supplied agent. Errors from one agent do
 // not abort the others — they are logged to stderr and the function
 // returns the last error seen.
 func RunForAgents(agents []*agent.Agent, recheck bool) error {
+	return RunForAgentsWithOptions(agents, Options{Recheck: recheck})
+}
+
+func RunForAgentsWithOptions(agents []*agent.Agent, opts Options) error {
 	var lastErr error
 	for _, a := range agents {
-		if err := RunForAgent(a, recheck); err != nil {
+		if err := RunForAgentWithOptions(a, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "backfill[%s]: %v\n", a.Name, err)
 			lastErr = err
 		}
@@ -85,12 +107,26 @@ func RunForAgents(agents []*agent.Agent, recheck bool) error {
 
 // RunWithState is like Run but accepts an explicit state file path (for testing).
 func RunWithState(indexPath, statePath string, recheck bool) error {
-	return runForAgent(agent.Claude(), indexPath, statePath, recheck)
+	return runForAgent(agent.Claude(), indexPath, statePath, Options{Recheck: recheck})
 }
 
-func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) error {
+func runForAgent(a *agent.Agent, indexPath, statePath string, opts Options) error {
 	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
 		return nil
+	}
+	if opts.GHCap <= 0 {
+		opts.GHCap = DefaultGHCap
+	}
+	if opts.DetachedRun {
+		f, ok, err := tryGlobalLock()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("backfill-worker: skip (another worker is running)")
+			return nil
+		}
+		defer unlockGlobal(f)
 	}
 
 	_, sessions, err := sessionindex.ReadAll(indexPath)
@@ -103,6 +139,20 @@ func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) erro
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
+	if opts.DetachedRun && !opts.Recheck && !opts.GCOnly && !state.LastWorkerRun.IsZero() && time.Since(state.LastWorkerRun) < WorkerCooldown {
+		fmt.Printf("backfill-worker: skip (cooldown %s)\n", WorkerCooldown)
+		return nil
+	}
+	if state.MetaURLChecks == nil {
+		state.MetaURLChecks = make(map[string]time.Time)
+	}
+
+	batch := sessionindex.Batch{
+		PinPRs:      make(map[string]string),
+		SessionURLs: make(map[string][]string),
+		PRMetas:     make(map[string]sessionindex.PRMeta),
+		EndUpdates:  make(map[string]sessionindex.EndUpdate),
+	}
 
 	// Phase 1: Fetch PR URLs for sessions without them.
 	// Cursor skips bulk-resolved entries, but cursor-below entries that are
@@ -110,7 +160,7 @@ func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) erro
 	// run — otherwise sessions whose PR was created after the previous Stop
 	// hook would never get their URL filled in.
 	offset := state.LastBackfillOffset
-	if offset > len(sessions) || recheck {
+	if offset > len(sessions) || opts.Recheck || opts.GCOnly {
 		offset = 0
 	}
 	target := append([]sessionindex.Session(nil), sessions[offset:]...)
@@ -120,14 +170,25 @@ func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) erro
 		}
 	}
 
-	if err := runURLBackfill(indexPath, target, recheck); err != nil {
+	capBudget := opts.GHCap
+	if opts.PinSessionID != "" && !opts.GCOnly {
+		used, err := runPinBackfill(sessions, opts.PinSessionID, &batch)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "backfill-pin: %v\n", err)
+		}
+		capBudget -= used
+		if capBudget < 0 {
+			capBudget = 0
+		}
+	}
+	if err := runURLBackfill(indexPath, target, opts.Recheck, opts.GCOnly, capBudget, &batch); err != nil {
 		return err
 	}
 
 	// Codex-only: backfill ended_at from rollout JSONL when the Stop hook
 	// missed the final tick (process killed, hook crashed, ...).
 	if a != nil && a.Name == agent.NameCodex {
-		if err := backfillCodexEndedAt(indexPath); err != nil {
+		if err := backfillCodexEndedAt(indexPath, &batch); err != nil {
 			fmt.Fprintf(os.Stderr, "backfill: ended_at補完: %v\n", err)
 		}
 	}
@@ -138,13 +199,8 @@ func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) erro
 	// Phase 2: Update merge status and review comments for sessions with pr_urls
 	// Only run if enough time has elapsed since last check
 	now := time.Now()
-	if now.Sub(state.LastMetaCheck) >= MetaCheckInterval || recheck {
-		// Re-read sessions since Phase 1 may have updated them
-		_, sessions, err = sessionindex.ReadAll(indexPath)
-		if err != nil {
-			return err
-		}
-		if err := runMetaBackfill(indexPath, sessions); err != nil {
+	if !opts.GCOnly && (now.Sub(state.LastMetaCheck) >= MetaCheckInterval || opts.Recheck) {
+		if err := runMetaBackfill(indexPath, sessions, opts.GHCap, state.MetaURLChecks, &batch); err != nil {
 			return err
 		}
 		state.LastMetaCheck = now
@@ -153,6 +209,18 @@ func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) erro
 			MetaCheckInterval)
 	}
 
+	if len(batch.PinPRs) > 0 || len(batch.SessionURLs) > 0 || len(batch.MarkChecked) > 0 || len(batch.PRMetas) > 0 || len(batch.EndUpdates) > 0 {
+		if _, err := sessionindex.ApplyBatch(indexPath, batch); err != nil {
+			if errors.Is(err, sessionindex.ErrLockBusy) {
+				fmt.Println("backfill: skip write (session index busy)")
+				return nil
+			}
+			return err
+		}
+	}
+	if opts.DetachedRun {
+		state.LastWorkerRun = now
+	}
 	// Save cursor state
 	if statePath != "" {
 		if err := SaveState(statePath, state); err != nil {
@@ -163,7 +231,8 @@ func runForAgent(a *agent.Agent, indexPath, statePath string, recheck bool) erro
 	return nil
 }
 
-func runURLBackfill(indexPath string, sessions []sessionindex.Session, recheck bool) error {
+func runURLBackfill(indexPath string, sessions []sessionindex.Session, recheck bool, gcOnly bool, capBudget int, batch *sessionindex.Batch) error {
+	_ = indexPath
 	// Collect entries with empty pr_urls. Pinned sessions are excluded
 	// unconditionally — their pr_urls is authoritative (Stop hook bound
 	// it via gh pr view) and we must not re-resolve via (repo, branch).
@@ -197,8 +266,25 @@ func runURLBackfill(indexPath string, sessions []sessionindex.Session, recheck b
 	for k, es := range groupMap {
 		groups = append(groups, group{repo: k.repo, branch: k.branch, entries: es})
 	}
+	sort.Slice(groups, func(i, j int) bool {
+		return newestGroupTime(groups[i]).After(newestGroupTime(groups[j]))
+	})
+	if !recheck && !gcOnly && capBudget >= 0 && len(groups) > capBudget {
+		groups = groups[:capBudget]
+	}
 
 	fmt.Printf("backfill: %d エントリ / %d グループを処理中...\n", len(entries), len(groups))
+	if gcOnly {
+		for _, g := range groups {
+			for _, e := range g.entries {
+				if e.SessionID != "" && shouldMarkChecked(e, time.Now()) {
+					batch.MarkChecked = append(batch.MarkChecked, e.SessionID)
+				}
+			}
+		}
+		fmt.Printf("backfill-gc: %d セッションを markChecked 予定\n", len(batch.MarkChecked))
+		return nil
+	}
 
 	// Parallel fetch with max 8 workers
 	results := make(chan result, len(groups))
@@ -227,26 +313,16 @@ func runURLBackfill(indexPath string, sessions []sessionindex.Session, recheck b
 			found++
 			for _, e := range r.group.entries {
 				if e.SessionID != "" {
-					if _, err := sessionindex.Update(indexPath, e.SessionID, []string{r.url}); err != nil {
-						fmt.Fprintf(os.Stderr, "backfill: update %s: %v\n", e.SessionID, err)
-					}
+					batch.SessionURLs[e.SessionID] = []string{r.url}
 				}
 			}
 			// Also set merge info right away
-			if _, err := sessionindex.UpdatePRMeta(indexPath, r.url, r.isMerged, r.comments, r.changesRequested, r.title); err != nil {
-				fmt.Fprintf(os.Stderr, "backfill: update-meta %s: %v\n", r.url, err)
-			}
+			batch.PRMetas[r.url] = sessionindex.PRMeta{IsMerged: r.isMerged, ReviewComments: r.comments, ChangesRequested: r.changesRequested, Title: r.title}
 		} else if r.markChecked {
 			skipped++
-			var ids []string
 			for _, e := range r.group.entries {
 				if e.SessionID != "" {
-					ids = append(ids, e.SessionID)
-				}
-			}
-			if len(ids) > 0 {
-				if _, err := sessionindex.MarkChecked(indexPath, ids); err != nil {
-					fmt.Fprintf(os.Stderr, "backfill: mark-checked: %v\n", err)
+					batch.MarkChecked = append(batch.MarkChecked, e.SessionID)
 				}
 			}
 		} else {
@@ -259,12 +335,45 @@ func runURLBackfill(indexPath string, sessions []sessionindex.Session, recheck b
 	return nil
 }
 
+func newestGroupTime(g group) time.Time {
+	var newest time.Time
+	for _, e := range g.entries {
+		t := sessionTime(e)
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
+}
+
+func sessionTime(s sessionindex.Session) time.Time {
+	for _, v := range []string{s.EndedAt, s.Timestamp} {
+		if v == "" {
+			continue
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func shouldMarkChecked(s sessionindex.Session, now time.Time) bool {
+	t := sessionTime(s)
+	if t.IsZero() {
+		return false
+	}
+	return now.Sub(t) >= 24*time.Hour
+}
+
 // runMetaBackfill updates PR metadata for sessions that have pr_urls.
-func runMetaBackfill(indexPath string, sessions []sessionindex.Session) error {
+func runMetaBackfill(indexPath string, sessions []sessionindex.Session, capBudget int, metaURLChecks map[string]time.Time, batch *sessionindex.Batch) error {
+	_ = indexPath
 	// Collect unique pr_urls that need meta update.
 	type prInfo struct {
-		url string
-		cwd string // any cwd from sessions with this URL, for running gh commands
+		url         string
+		cwd         string // any cwd from sessions with this URL, for running gh commands
+		lastChecked time.Time
 	}
 	seen := make(map[string]bool)
 	var targets []prInfo
@@ -272,16 +381,26 @@ func runMetaBackfill(indexPath string, sessions []sessionindex.Session) error {
 		if len(s.PRURLs) == 0 {
 			continue
 		}
+		if s.IsMerged {
+			continue
+		}
 		url := s.PRURLs[len(s.PRURLs)-1]
 		if url == "" || seen[url] {
 			continue
 		}
 		seen[url] = true
-		targets = append(targets, prInfo{url: url, cwd: s.CWD})
+		targets = append(targets, prInfo{url: url, cwd: s.CWD, lastChecked: metaURLChecks[url]})
 	}
 
 	if len(targets) == 0 {
 		return nil
+	}
+
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].lastChecked.Before(targets[j].lastChecked)
+	})
+	if capBudget > 0 && len(targets) > capBudget {
+		targets = targets[:capBudget]
 	}
 
 	fmt.Printf("backfill-meta: %d PR のメタデータを更新中...\n", len(targets))
@@ -343,9 +462,8 @@ func runMetaBackfill(indexPath string, sessions []sessionindex.Session) error {
 	updated := 0
 	for r := range results {
 		if r.ok {
-			if _, err := sessionindex.UpdatePRMeta(indexPath, r.url, r.isMerged, r.comments, r.changesRequested, r.title); err != nil {
-				fmt.Fprintf(os.Stderr, "backfill-meta: update %s: %v\n", r.url, err)
-			}
+			batch.PRMetas[r.url] = sessionindex.PRMeta{IsMerged: r.isMerged, ReviewComments: r.comments, ChangesRequested: r.changesRequested, Title: r.title}
+			metaURLChecks[r.url] = time.Now()
 			updated++
 		}
 	}
@@ -400,6 +518,65 @@ func fetchPR(g group) result {
 		_ = cmd.Process.Kill()
 		return result{group: g}
 	}
+}
+
+func runPinBackfill(sessions []sessionindex.Session, sessionID string, batch *sessionindex.Batch) (int, error) {
+	for _, s := range sessions {
+		if s.SessionID != sessionID {
+			continue
+		}
+		if s.PRPinned || s.Branch == "" {
+			return 0, nil
+		}
+		r := fetchPR(group{repo: s.Repo, branch: s.Branch, entries: []sessionindex.Session{s}})
+		if r.url == "" {
+			return 1, nil
+		}
+		batch.PinPRs[sessionID] = r.url
+		batch.PRMetas[r.url] = sessionindex.PRMeta{
+			IsMerged:         r.isMerged,
+			ReviewComments:   r.comments,
+			ChangesRequested: r.changesRequested,
+			Title:            r.title,
+		}
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func globalLockPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(os.TempDir(), "agent-telemetry-backfill.lock")
+	}
+	return filepath.Join(home, ".agent-telemetry", "backfill.lock")
+}
+
+func tryGlobalLock() (*os.File, bool, error) {
+	path := globalLockPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, false, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return f, true, nil
+}
+
+func unlockGlobal(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
 }
 
 // fetchPRByURL fetches PR metadata for an existing PR URL using gh pr view.
@@ -458,7 +635,7 @@ func isDir(path string) bool {
 // backfillCodexEndedAt reads each Codex session whose ended_at is empty
 // and fills it from the rollout JSONL's last event timestamp. This catches
 // the case where the Codex process was killed before the Stop hook fired.
-func backfillCodexEndedAt(indexPath string) error {
+func backfillCodexEndedAt(indexPath string, batch *sessionindex.Batch) error {
 	_, sessions, err := sessionindex.ReadAll(indexPath)
 	if err != nil {
 		return err
@@ -473,13 +650,8 @@ func backfillCodexEndedAt(indexPath string) error {
 			continue
 		}
 		endedAt := lastTS.Format("2006-01-02 15:04:05")
-		ok2, err := sessionindex.UpdateEnd(indexPath, s.SessionID, endedAt, "stop")
-		if err != nil {
-			return err
-		}
-		if ok2 {
-			updated++
-		}
+		batch.EndUpdates[s.SessionID] = sessionindex.EndUpdate{EndedAt: endedAt, Reason: "stop"}
+		updated++
 	}
 	if updated > 0 {
 		fmt.Printf("backfill-codex: ended_at を %d 件補完\n", updated)

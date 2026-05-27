@@ -331,3 +331,37 @@ func TestIsRegistered_MatchesLooseCommand(t *testing.T) {
 		})
 	}
 }
+
+func TestRun_BacklogHintAboveThreshold(t *testing.T) {
+	dir := t.TempDir()
+	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	env := envWith(t, []*agent.Agent{a}, true, map[string]map[string][]string{
+		agent.NameClaude: {"Stop": {"agent-telemetry hook stop"}},
+	})
+	env.BacklogCounter = func(*agent.Agent) int { return backlogDrainThreshold + 1 }
+
+	var buf bytes.Buffer
+	if _, err := RunWith(&buf, env); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "backfill --gc") {
+		t.Errorf("expected --gc drain hint, got:\n%s", buf.String())
+	}
+}
+
+func TestRun_NoBacklogHintBelowThreshold(t *testing.T) {
+	dir := t.TempDir()
+	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	env := envWith(t, []*agent.Agent{a}, true, map[string]map[string][]string{
+		agent.NameClaude: {"Stop": {"agent-telemetry hook stop"}},
+	})
+	env.BacklogCounter = func(*agent.Agent) int { return 5 }
+
+	var buf bytes.Buffer
+	if _, err := RunWith(&buf, env); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "backfill --gc") {
+		t.Error("did not expect --gc hint below threshold")
+	}
+}
