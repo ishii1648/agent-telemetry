@@ -48,7 +48,7 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 |---|---|---|
 | `SessionStart` (`startup\|resume`) | `agent-telemetry hook session-start --agent codex` | セッション開始メタデータを `~/.codex/session-index.jsonl` に追記 |
 | `Stop` | `agent-telemetry hook stop --agent codex` | 応答完了時に `ended_at` を同期更新し（Codex の de-facto SessionEnd）、`backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側 |
-| `PostToolUse` | `agent-telemetry hook post-tool-use --agent codex` | `tool_response` から PR URL を抽出し `pr_urls` に追記（`pr_pinned: true` のセッションでは無視される） |
+| `PostToolUse` | `agent-telemetry hook post-tool-use --agent codex` | `tool_input.command` が `gh pr create` のときだけ `tool_response` から PR URL を抽出し `pr_urls` に追記（`pr_pinned: true` のセッションでは無視される） |
 
 `Stop` hook の同期パスはローカル書き込み（Codex の `ended_at` のみ）と worker spawn だけで、`gh` を 1 回も呼ばず数 ms で return する。`gh` を伴う処理は detached worker に退避し、worker 側で global single-flight（同時実行抑制）・cooldown（頻度抑制）・gh cap（1 起動の件数上限）でレート制御する。両 agent とも worker トリガは Stop のみで、hook 登録構成は従来から変更しない。詳細は `docs/design.md ## Stop hook の非同期 worker 起動`。
 
@@ -132,7 +132,7 @@ agent ごとに収集元を分離し、SQLite DB は単一に集約する。
 - `coding_agent` は `claude` または `codex`。欠落時は `claude` として扱う（後方互換）。
 - `agent_version` は agent 自身が報告するバージョン文字列（取得不能なら空文字列）。バージョン跨ぎでの効率比較に使う。
 - `user_id` はセッションを記録したユーザの識別子。SessionStart hook が後述の優先順位で解決して埋める。欠落時は `unknown` として扱う（後方互換）。`sync-db` は欠落レコードに対して現在の解決値で埋め戻し、JSONL にも書き戻す。
-- `pr_urls` は PostToolUse / Stop / `update` / `backfill` から重複排除しつつ追記される。`sync-db` は配列の最後の 1 件を採用する。
+- `pr_urls` は PostToolUse / Stop / `update` / `backfill` から重複排除しつつ追記される。PostToolUse は `gh pr create` の出力だけを抽出対象にする。`sync-db` は配列の最後の 1 件を採用する。
 - `pr_pinned: true` は backfill worker が `gh pr list --head <branch>` で確定した PR にセッションが束縛されたことを示す（Stop が `--pin-session` で対象を渡し、worker 内の pin が解決する）。pinned レコードに対しては PostToolUse / `update` / `backfill` の URL 追記は **すべて no-op** になる（誤接続防止）。欠落時は `false` として扱う（後方互換）。
 - `pr_title` は backfill が `gh pr view --json title` で取得する PR タイトル。欠落時 / 取得失敗時は空文字列として扱う（後方互換）。
 - `is_default_branch: true` は SessionStart 時点でこのセッションの branch が repo の**実デフォルトブランチ**（`git symbolic-ref refs/remotes/origin/HEAD` で動的判定。未設定時のみ `main` / `master` フォールバック）だったことを示す。デフォルトブランチは構造的に PR を持たないので、backfill は候補に入れず `gh pr list` を一度も呼ばない（第1層 admission control）。欠落 / `false` 時は通常のセッションとして扱う（後方互換）。branch 名のハードコードではなく動的判定なので `trunk` / `dev` 等にも対応する。
