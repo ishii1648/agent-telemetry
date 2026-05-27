@@ -115,6 +115,7 @@ agent ごとに収集元を分離し、SQLite DB は単一に集約する。
   "cwd": "/path/to/project",
   "repo": "org/repo",
   "branch": "feature-xxx",
+  "is_default_branch": false,
   "pr_urls": ["https://github.com/org/repo/pull/123"],
   "pr_pinned": true,
   "pr_title": "feat: add metrics dashboard",
@@ -135,7 +136,8 @@ agent ごとに収集元を分離し、SQLite DB は単一に集約する。
 - `pr_urls` は PostToolUse / Stop / `update` / `backfill` から重複排除しつつ追記される。`sync-db` は配列の最後の 1 件を採用する。
 - `pr_pinned: true` は backfill worker が `gh pr list --head <branch>` で確定した PR にセッションが束縛されたことを示す（Stop が `--pin-session` で対象を渡し、worker 内の pin が解決する）。pinned レコードに対しては PostToolUse / `update` / `backfill` の URL 追記は **すべて no-op** になる（誤接続防止）。欠落時は `false` として扱う（後方互換）。
 - `pr_title` は backfill が `gh pr view --json title` で取得する PR タイトル。欠落時 / 取得失敗時は空文字列として扱う（後方互換）。
-- `backfill_checked: true` のレコードは backfill で再 API 呼び出しされない。PR が存在しないブランチで永続スキップされる。
+- `is_default_branch: true` は SessionStart 時点でこのセッションの branch が repo の**実デフォルトブランチ**（`git symbolic-ref refs/remotes/origin/HEAD` で動的判定。未設定時のみ `main` / `master` フォールバック）だったことを示す。デフォルトブランチは構造的に PR を持たないので、backfill は候補に入れず `gh pr list` を一度も呼ばない（第1層 admission control）。欠落 / `false` 時は通常のセッションとして扱う（後方互換）。branch 名のハードコードではなく動的判定なので `trunk` / `dev` 等にも対応する。
+- `backfill_checked: true` のレコードは backfill で再 API 呼び出しされない。`gh pr list` が空を返したグループのうち `COALESCE(ended_at, timestamp)` から 24h 以上経過したセッション（第2層 horizon）にセットされ、abandoned ブランチを時間で retire する。`is_default_branch` を持たない過去のデフォルトブランチセッションもこの horizon + `backfill --gc` で収束する。
 - Codex の場合: `end_reason` は Stop hook の最終発火を記録するため `stop` 固定。`transcript` は `~/.codex/sessions/.../rollout-*.jsonl[.zst]` のフルパス。
 - 後方互換: 古いレコードに新フィールドが欠けていても扱える（欠落値は 0 / false / 空文字列、`user_id` のみ `unknown`）。
 

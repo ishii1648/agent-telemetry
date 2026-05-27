@@ -233,11 +233,15 @@ backfill は `gh pr list` / `gh pr view` の `--json` 引数に `title` を含�
 
 空文字列での上書きはしない。`gh` が title を返さなかった（タイトルが空 / API エラーで取得失敗）場合に既存の `pr_title` を消さないため、`UpdatePRMeta` は `prTitle == ""` のとき `pr_title` フィールドを書き換えずスキップする。
 
-### `(repo, branch)` グルーピングと `backfill_checked`
+### `(repo, branch)` グルーピングと候補の絞り込み（第1層 admission control + 第2層 horizon）
 
-backfill は `pr_urls` が空のセッションを `(repo, branch)` でグループ化し、`gh pr list` を 1 回だけ実行する。同一ブランチで複数セッションがあっても API 呼び出しは 1 回。
+backfill は `pr_urls` が空のセッションを `(repo, branch)` でグループ化し、`gh pr list` を 1 回だけ実行する。同一ブランチで複数セッションがあっても API 呼び出しは 1 回。「PR が未作成のまま放置されたブランチ」を毎 Stop で無限に再 probe しないため、候補は 2 段で絞る（[issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/0035-bug-backfill-no-pr-infinite-retry.md)）。
 
-PR が存在しないブランチ（`main` / `master` 等）は初回チェック後に `backfill_checked: true` をセットして永続スキップする。これがないと PR を作らないリポジトリの `master` のような大量エントリが毎回 8 秒の空振りを起こす。
+**第1層 — 実デフォルトブランチの admission control**: repo の**実際のデフォルトブランチ上のセッションは構造的に PR を持たない**（デフォルトブランチから PR は作らない）ので、そもそも候補に入れず `gh pr list` を一度も呼ばない。判定は SessionStart の `extractGitInfo`（既に git を叩いている）で `git symbolic-ref refs/remotes/origin/HEAD` を使って repo ごとの実デフォルトブランチを動的に求め、現セッションの branch と一致するかを `is_default_branch` フラグとして session entry に焼き付ける（gh API は呼ばない）。origin/HEAD 未設定の repo に限り慣習的な `main` / `master` へフォールバックする。**branch 名 `main` / `master` のハードコード除外は採用しない**——`trunk` / `dev` / `develop` 等の命名多様性に対応するため、名前一致ではなく実デフォルトブランチの動的判定にする。`is_default_branch` を持つセッションは Phase 1 の候補収集でも pin（現セッションの `gh pr list`）でも除外され、`backfill_checked` ではなくこのフラグが永続スキップを担うので `--recheck` でも候補に入らない。
+
+**第2層 — `COALESCE(ended_at, timestamp)` の 24h horizon**: 第1層を通過した候補（abandoned な feature ブランチ等）は、基準時刻から 24h 以上経過していれば `backfill_checked: true` をセットして以降スキップする（`shouldMarkChecked`）。基準時刻は `ended_at` 単独ではなく `COALESCE(ended_at, timestamp)`——Claude の ~15% は SessionEnd 不発で `ended_at` が恒久的に空になるため、空なら SessionStart で必ず入る `timestamp` にフォールバックして全セッションが必ず age out するようにする。24h 以内は markChecked せず次 run で再 probe する（完了直後の遅延 PR 作成を救済する窓）。
+
+両者は排他でなく補完: 第1層が構造的 never-PR を 0 秒で弾き、第2層が時間経過した abandoned ブランチを retire する。第1層は新規セッション向けの入口フィルタなので、`is_default_branch` フラグを持たない過去のデフォルトブランチセッションは引き続き第2層 + `backfill --gc` で収束する（過去分を遡ってフラグ付けはしない）。`is_default_branch` は backfill が読む `session-index.jsonl` にのみ持たせ、ダッシュボード用途が無いため `sessions` テーブル（DB）へは伝播しない。
 
 ### 並列化
 

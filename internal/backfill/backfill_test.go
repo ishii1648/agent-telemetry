@@ -334,6 +334,101 @@ func TestGCOnly_MarksStaleUncheckedOnly(t *testing.T) {
 	}
 }
 
+// TestRunURLBackfill_SkipsDefaultBranch verifies the first-layer admission
+// control: a session flagged is_default_branch is never collected as a
+// candidate, so no (repo, branch) group is formed and no gh pr list fires for
+// it — even with a bogus cwd that would otherwise make fetchPR return
+// markChecked=true. A non-default feature branch in the same index is still
+// processed (markChecked via the bogus-cwd path), proving the filter is
+// branch-flag driven and not a name match.
+func TestRunURLBackfill_SkipsDefaultBranch(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := writeTestIndex(t, dir, []string{
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"def1","cwd":"/nonexistent/path/abc","repo":"user/repo","branch":"main","is_default_branch":true,"pr_urls":[],"transcript":"","parent_session_id":"","backfill_checked":false}`,
+		`{"timestamp":"2026-03-01 11:00:00","session_id":"feat1","cwd":"/nonexistent/path/def","repo":"user/repo","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":"","backfill_checked":false}`,
+	})
+
+	_, sessions, err := sessionindex.ReadAll(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	batch := sessionindex.Batch{
+		PinPRs:      make(map[string]string),
+		SessionURLs: make(map[string][]string),
+		PRMetas:     make(map[string]sessionindex.PRMeta),
+		EndUpdates:  make(map[string]sessionindex.EndUpdate),
+	}
+	if err := runURLBackfill(indexPath, sessions, false, false, DefaultGHCap, &batch); err != nil {
+		t.Fatal(err)
+	}
+
+	marked := map[string]bool{}
+	for _, id := range batch.MarkChecked {
+		marked[id] = true
+	}
+	if marked["def1"] {
+		t.Error("default-branch session must not be a candidate (no gh call, no markChecked)")
+	}
+	if !marked["feat1"] {
+		t.Error("feature-branch session should be processed (markChecked via bogus cwd)")
+	}
+}
+
+// TestRunURLBackfill_DefaultBranchExcludedUnderRecheck confirms the structural
+// exclusion holds even with recheck=true: --recheck ignores backfill_checked
+// but a default-branch session can never have a PR, so it stays out of the
+// candidate set.
+func TestRunURLBackfill_DefaultBranchExcludedUnderRecheck(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := writeTestIndex(t, dir, []string{
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"def1","cwd":"/nonexistent/path/abc","repo":"user/repo","branch":"trunk","is_default_branch":true,"pr_urls":[],"transcript":"","parent_session_id":"","backfill_checked":false}`,
+	})
+
+	_, sessions, err := sessionindex.ReadAll(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	batch := sessionindex.Batch{
+		PinPRs:      make(map[string]string),
+		SessionURLs: make(map[string][]string),
+		PRMetas:     make(map[string]sessionindex.PRMeta),
+		EndUpdates:  make(map[string]sessionindex.EndUpdate),
+	}
+	if err := runURLBackfill(indexPath, sessions, true, false, DefaultGHCap, &batch); err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.MarkChecked) != 0 || len(batch.SessionURLs) != 0 {
+		t.Fatalf("default-branch session leaked into recheck candidates: marked=%v urls=%v", batch.MarkChecked, batch.SessionURLs)
+	}
+}
+
+// TestRunPinBackfill_SkipsDefaultBranch verifies the pin path (current
+// session's gh pr list) short-circuits for a default-branch session so the
+// Stop hook hot path issues zero gh calls for it.
+func TestRunPinBackfill_SkipsDefaultBranch(t *testing.T) {
+	sessions := []sessionindex.Session{
+		{SessionID: "def1", Repo: "user/repo", Branch: "master", IsDefaultBranch: true, CWD: "/nonexistent/path/abc"},
+	}
+	batch := sessionindex.Batch{
+		PinPRs:      make(map[string]string),
+		SessionURLs: make(map[string][]string),
+		PRMetas:     make(map[string]sessionindex.PRMeta),
+		EndUpdates:  make(map[string]sessionindex.EndUpdate),
+	}
+	used, err := runPinBackfill(sessions, "def1", &batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != 0 {
+		t.Errorf("default-branch pin should consume 0 gh budget, got %d", used)
+	}
+	if len(batch.PinPRs) != 0 {
+		t.Errorf("default-branch session must not be pinned: %v", batch.PinPRs)
+	}
+}
+
 func TestParsePRList_ChangesRequested(t *testing.T) {
 	prs := parsePRList([]byte(`[
 		{

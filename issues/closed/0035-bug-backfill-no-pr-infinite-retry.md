@@ -7,6 +7,7 @@ affected_paths:
   - docs/design.md
   - docs/spec.md
 tags: [backfill, hooks, stop-hook-cost, doc-code-drift]
+closed_at: 2026-05-28
 ---
 
 # backfill が PR 未作成ブランチを毎 Stop で無限再試行する
@@ -112,18 +113,18 @@ Stop hook の `pinPRForSession` が「PR なし」を確定した `(repo, branch
 
 修正された後の振る舞いを以下で検証する:
 
-- [ ] repo の実デフォルトブランチ上のセッションは candidate に入らず `gh pr list` が一度も呼ばれない（第1層。branch 名のハードコードではなく動的判定）
-- [ ] `ended_at` が空のセッション（SessionEnd 不発の Claude 等）でも `timestamp` フォールバックで 24h 経過後に markChecked される（pure-`ended_at` だと永久 retry する穴を塞ぐ）
-- [ ] PR 未作成 main セッションは、`COALESCE(ended_at, timestamp)` から 24h 経過後の Stop hook 1 回で当該 session が `backfill_checked = true` になる
-- [ ] 24h 以内のセッションは markChecked されず、次 tick で再 probe される（遅延 PR 作成の救済窓を維持）
-- [ ] PR 未作成の `feature/foo` セッションでも同様に 24h horizon が効く（branch 名に依存しない）
-- [ ] `(repo, branch)` グループ内に新旧 session が混在する場合、24h 経過した session のみが markChecked され、新規 session は markChecked されない（group 全体一括ではなく per-session 判定）
-- [ ] Stop hook の pin lookup が「PR なし」を確定した直後の同 tick の backfill では、当該 `(repo, branch)` の `gh pr list` が **追加で呼ばれない**（G 採用時。別 PR に分けるなら別 issue）
-- [ ] `agent-telemetry backfill --recheck` は引き続き markChecked を無視してフルスキャンする（既存挙動の回帰なし）
-- [ ] `docs/design.md:204-206` の「`(repo, branch)` グルーピングと `backfill_checked`」節を、`ended_at` ベース horizon を反映した記述に更新する
-- [ ] `docs/spec.md:136` の `backfill_checked` 説明を、horizon 条件を含む形に更新する
-- [ ] 既存の `internal/sessionindex/update_test.go` の `TestMarkChecked_*` を回帰させない
-- [ ] `internal/backfill/backfill.go` に horizon 判定の unit test を追加（`ended_at` 空＋`timestamp` 36h 前→markChecked / `ended_at` 12h 前→skip / `ended_at` 36h 前→markChecked / 混在 group のケース）
+- [x] repo の実デフォルトブランチ上のセッションは candidate に入らず `gh pr list` が一度も呼ばれない（第1層。branch 名のハードコードではなく動的判定）
+- [x] `ended_at` が空のセッション（SessionEnd 不発の Claude 等）でも `timestamp` フォールバックで 24h 経過後に markChecked される（pure-`ended_at` だと永久 retry する穴を塞ぐ）— **0039 で解決済**（`sessionTime` = `COALESCE(ended_at, timestamp)`）
+- [x] PR 未作成 main セッションは、`COALESCE(ended_at, timestamp)` から 24h 経過後の Stop hook 1 回で当該 session が `backfill_checked = true` になる — **0039 で解決済**（`shouldMarkChecked`）
+- [x] 24h 以内のセッションは markChecked されず、次 tick で再 probe される（遅延 PR 作成の救済窓を維持）— **0039 で解決済**
+- [x] PR 未作成の `feature/foo` セッションでも同様に 24h horizon が効く（branch 名に依存しない）— **0039 で解決済**
+- [x] `(repo, branch)` グループ内に新旧 session が混在する場合、24h 経過した session のみが markChecked され、新規 session は markChecked されない（group 全体一括ではなく per-session 判定）— **0039 で解決済**
+- [x] Stop hook の pin lookup が「PR なし」を確定した直後の同 tick の backfill では、当該 `(repo, branch)` の `gh pr list` が **追加で呼ばれない**（G 採用時）— **moot（0039 で収束アーキへ移行し pin の同期 gh パスを全廃。pin は worker の `runPinBackfill` に吸収済みで、`pinPRForSession` / `ghPRLookup` は削除済み）**
+- [x] `agent-telemetry backfill --recheck` は引き続き markChecked を無視してフルスキャンする（既存挙動の回帰なし）— 第1層の構造除外は recheck でも効くが backfill_checked 無視のフルスキャン挙動は維持（`TestRunWithState_RecheckResetsCursor` / `TestRunURLBackfill_DefaultBranchExcludedUnderRecheck`）
+- [x] `docs/design.md` の「`(repo, branch)` グルーピングと候補の絞り込み」節を、第1層 admission control + 第2層 horizon を反映した記述に更新する（horizon 部分は 0039 が既に更新済、本 PR で第1層を追記）
+- [x] `docs/spec.md` の `backfill_checked` / `is_default_branch` 説明を、第1層 + horizon 条件を含む形に更新する
+- [x] 既存の `internal/sessionindex/update_test.go` の `TestMarkChecked_*` を回帰させない
+- [x] `internal/backfill/backfill.go` の horizon 判定 unit test（`TestGCOnly_MarksStaleUncheckedOnly`）は 0039 で追加済。本 PR は第1層の unit test（`TestRunURLBackfill_SkipsDefaultBranch` / `TestRunURLBackfill_DefaultBranchExcludedUnderRecheck` / `TestRunPinBackfill_SkipsDefaultBranch`）と動的判定 test（`internal/hook` の `TestIsRepoDefaultBranch_*`）を追加
 
 ## 参照
 
@@ -131,3 +132,35 @@ Stop hook の `pinPRForSession` が「PR なし」を確定した `(repo, branch
 - 該当コード: `internal/backfill/backfill.go:358-403` (`fetchPR`), `internal/sessionindex/update.go:131-176` (`MarkChecked`)
 - doc/code drift 箇所: `docs/design.md:204-206`, `docs/spec.md:136`
 - 詳細な調査メモ: `.outputs/claude/backfill-markchecked-investigation.md`（local 出力、commit しない）
+
+---
+
+Completed: 2026-05-28
+
+## 解決方法
+
+本 issue は **第1層（実デフォルトブランチの admission control）** と **第2層（24h horizon）+ G（pin 重複）** に分かれ、後者は先行 merge した [0039](closed/0039-bug-stop-hook-backfill-rate-limit.md) が既に巻き取っていた。本 PR では残りの第1層のみを実装した。
+
+### 第1層 — 実デフォルトブランチの admission control（本 PR）
+
+repo の実デフォルトブランチ上のセッションは構造的に PR を持たない（デフォルトブランチから PR は作らない）ので、入口で candidate に入れず `gh pr list` を一度も呼ばない。
+
+- **判定の場所と手段**: `internal/hook/sessionstart.go` の `extractGitInfo`（既に git を叩いている）で `isRepoDefaultBranch` を呼び、`git symbolic-ref --short refs/remotes/origin/HEAD` で repo ごとの実デフォルトブランチを動的に解決して現セッションの branch と比較する。gh API は呼ばない（コスト増を避ける）。origin/HEAD 未設定の repo に限り慣習的な `main` / `master` へフォールバックする。
+- **フラグの永続化**: `sessionindex.Session` に `IsDefaultBranch bool json:"is_default_branch,omitempty"` を追加し、SessionStart で `true` のときだけ entry に焼き付ける（`false` は omitempty に合わせキー省略で既存レコードと同形を保つ）。backfill が読む `session-index.jsonl` にのみ持たせ、ダッシュボード用途が無いため `serverpipe` / `sessions` テーブル（DB）へは伝播させない。
+- **candidate からの除外**: `internal/backfill/backfill.go` の `runURLBackfill`（Phase 1 候補収集）と `runPinBackfill`（現セッションの pin）の両方で `IsDefaultBranch` を除外。`backfill_checked` ではなくこのフラグが永続スキップを担うので `--recheck` でも候補に入らない。
+- **却下/決定**: 案 D（branch 名 `main`/`master` の **ハードコード**除外）は却下し、実デフォルトブランチの**動的判定**を採用（`trunk`/`dev`/`develop` 等の命名多様性に対応）。G（pin の同 tick 重複呼び出し回避）は 0039 が収束アーキで pin の同期 gh パスを全廃したため **moot**。
+
+### 0039 が解決済みの分（本 PR では触らない）
+
+- 第2層 horizon: `backfill.go` の `shouldMarkChecked` + `sessionTime` が `COALESCE(ended_at, timestamp)` の 24h horizon を実装済み（`ended_at` 空の Claude も `timestamp` フォールバックで age out）。`backfill --gc` が一括 drain を担う。
+- `docs/design.md` / `docs/spec.md` の horizon 記述。本 PR は同節へ第1層を追記して整合させた。
+
+### 過去 entry の扱い
+
+第1層は新規セッション向けの入口フィルタ。`is_default_branch` フラグを持たない過去のデフォルトブランチセッションは遡ってフラグ付けせず、従来どおり第2層 horizon + `backfill --gc` で収束させる（両者は補完関係）。
+
+### テスト
+
+- `internal/backfill/backfill_test.go`: `TestRunURLBackfill_SkipsDefaultBranch` / `TestRunURLBackfill_DefaultBranchExcludedUnderRecheck` / `TestRunPinBackfill_SkipsDefaultBranch`
+- `internal/hook/sessionstart_test.go`: `TestIsRepoDefaultBranch_FallbackByName`（origin/HEAD 未設定 → 名前フォールバック）/ `TestIsRepoDefaultBranch_DynamicFromOriginHEAD`（origin/HEAD→trunk で動的判定が名前ハードコードでないことを確認）
+- 既存 `TestMarkChecked_*` / `TestGCOnly_*` は回帰なし。`go build ./... && go vet ./... && go test ./...` 緑。
