@@ -39,7 +39,7 @@ Codex は `SessionEnd` を持たないため、`Stop` hook で `ended_at` を毎
 | hook | サブコマンド | 用途 |
 |---|---|---|
 | `SessionStart` (`startup` / `resume`) | `hook session-start --agent codex` | セッション開始メタデータを `~/.codex/session-index.jsonl` に追記 |
-| `PostToolUse` | `hook post-tool-use --agent codex` | `tool_response` 文字列から PR URL を抽出して `pr_urls` に追記（`pr_pinned: true` のセッションでは no-op） |
+| `PostToolUse` | `hook post-tool-use --agent codex` | `tool_input.command` が `gh pr create` のときだけ `tool_response` 文字列から PR URL を抽出して `pr_urls` に追記（`pr_pinned: true` のセッションでは no-op） |
 | `Stop` | `hook stop --agent codex` | branch から PR を解決して `pr_pinned: true` で確定し `ended_at` を更新 → `backfill` → `sync-db`（ブロッキング） |
 
 ## `Stop` hook の処理時間
@@ -88,7 +88,7 @@ PR URL は複数の経路から到達するため、衝突を避けるために�
 ```mermaid
 flowchart TB
     A["Stop hook<br/>(gh pr list --head branch)"]
-    B["PostToolUse hook<br/>(tool_response から抽出)"]
+    B["PostToolUse hook<br/>(gh pr create の<br/>tool_response から抽出)"]
     C["agent-telemetry update CLI<br/>(手動指定)"]
     D["agent-telemetry backfill<br/>(後追い補完)"]
 
@@ -104,8 +104,8 @@ flowchart TB
     P -- "no" --> JSONL
 ```
 
-`Stop` hook が `pr_pinned: true` を立てた後は、他経路からの URL 追記は **すべて no-op** になります。これにより以下のような事故を排除できます。
+`Stop` hook が `pr_pinned: true` を立てた後は、他経路からの URL 追記は **すべて no-op** になります。さらに PostToolUse は `gh pr create` の出力だけを抽出対象にするため、pin 前または pin 失敗時でも通常の Bash 出力に含まれる任意の PR URL は拾いません。これにより以下のような事故を排除できます。
 
-- **branch とは無関係に PR URL が混入する** — PR コメントに別 PR のリンクを貼った瞬間に `PostToolUse` が誤検出する等
+- **branch とは無関係に PR URL が混入する** — PR コメントに別 PR のリンクを貼った、`gh pr view` / `gh pr list` の結果に別 PR の URL が含まれた、などの出力は `PostToolUse` の抽出対象外
 - **同一ブランチで別 PR を使い回す運用** — 新 PR の URL が古いセッションに付与される
-- **Bash 出力に含まれた他人の PR URL** を `pr_urls` 末尾に拾うケース — `sync-db` は末尾を採用するため誤接続が起きる
+- **Bash 出力に含まれた他人の PR URL** を `pr_urls` 末尾に拾うケース — `sync-db` は末尾を採用するため誤接続が起きるが、PostToolUse は `gh pr create` 以外の出力を抽出しない
