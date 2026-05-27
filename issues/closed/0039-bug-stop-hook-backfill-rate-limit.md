@@ -8,8 +8,10 @@ affected_paths:
   - internal/sessionindex/update.go
   - internal/syncdb/syncdb.go
   - internal/doctor/doctor.go
+  - internal/sessionindex/lock.go
   - cmd/agent-telemetry/main.go
 tags: [backfill, hooks, stop-hook-cost, rate-limit, blocking-ux]
+closed_at: 2026-05-27
 ---
 
 # Stop hook での高頻度 gh 実行が rate limit と応答ブロッキングを引き起こす
@@ -50,7 +52,7 @@ Created: 2026-05-26
 
 ### 既存 issue との関係
 
-[0035-bug-backfill-no-pr-infinite-retry.md](0035-bug-backfill-no-pr-infinite-retry.md) は「PR 未作成ブランチが毎 Stop で probe される」問題で、24h horizon で markChecked する方向で対応方針が確定済み。ただし 0035 が解決しても以下は残るため本 issue が必要:
+[0035-bug-backfill-no-pr-infinite-retry.md](../0035-bug-backfill-no-pr-infinite-retry.md) は「PR 未作成ブランチが毎 Stop で probe される」問題で、24h horizon で markChecked する方向で対応方針が確定済み。ただし 0035 が解決しても以下は残るため本 issue が必要:
 
 - markChecked がまだ立っていない期間（特に backlog 消化中）に Stop hook が毎ターン大量の `gh` を叩く問題は別途レート制御が必要
 - そもそも「Stop フックという高頻度イベントで backfill を走らせる」設計選択自体が再考対象
@@ -166,7 +168,7 @@ global を agent 横断にするのは gh secondary rate limit が**アカウン
 
 打ち手 b の「上限」を具体化したもの。**cap は Phase 1 / Phase 2 の両方（or 1 起動全体）に効くグローバル上限**として置く。「Phase 2 のみ」では不十分——理由が Phase ごとに異なる:
 
-- **Phase 1 (`runURLBackfill`)**: candidate は別途の GC（第1層=デフォルトブランチ即時除外、第2層=`COALESCE(ended_at, timestamp)` 基準の freshness 窓。詳細は [0035](0035-bug-backfill-no-pr-infinite-retry.md)）で steady state は bound される。cap が守るのは **非定常**——backlog 消化直後・新規セッション大量流入直後（並列 worktree 等）。ここは窓の内側で起きるので GC では防げず、cap が無いと rate limit が再発する。
+- **Phase 1 (`runURLBackfill`)**: candidate は別途の GC（第1層=デフォルトブランチ即時除外、第2層=`COALESCE(ended_at, timestamp)` 基準の freshness 窓。詳細は [0035](../0035-bug-backfill-no-pr-infinite-retry.md)）で steady state は bound される。cap が守るのは **非定常**——backlog 消化直後・新規セッション大量流入直後（並列 worktree 等）。ここは窓の内側で起きるので GC では防げず、cap が無いと rate limit が再発する。
 - **Phase 2 (`runMetaBackfill`)**: ターゲット（`pr_urls` を持つ全 URL）は **単調増加**し、1h スロットルは間隔を絞るだけで一度走ると全 URL に `gh pr view` を撃つ。cap に加えて構造対策として **`is_merged = true`（terminal）を refresh 対象から除外**し、「open な PR のみ refresh」へ縮める（現状 `backfill.go:271-281` は is_merged を見ず全件 re-check）。
 
 cap 実装時の付帯事項（starvation 回避）:
@@ -209,35 +211,56 @@ async 方向（pin / backfill を fire-and-forget で並列化）に倒すと、
 
 問題 1（rate limit）:
 
-- [ ] Stop hook は同期 backfill を呼ばず、detached worker の 1 起動あたりの `gh` 呼び出し数に明確な上限がある
-- [ ] cap が Phase 1 / Phase 2 の両方に効く（Phase 1 のみ・Phase 2 のみではない）。新規セッション大量流入直後でも 1 Stop の `gh` 呼び出しが上限を超えない
-- [ ] Phase 2 が `is_merged = true` の PR を refresh 対象から除外し、open な PR のみ re-check する
-- [ ] cap 導入後も starvation しない（Phase 1 = newest-first、Phase 2 = oldest-checked-first で全件が順に処理される）
+- [x] Stop hook は同期 backfill を呼ばず、detached worker の 1 起動あたりの `gh` 呼び出し数に明確な上限がある
+- [x] cap が Phase 1 / Phase 2 の両方に効く（Phase 1 のみ・Phase 2 のみではない）。新規セッション大量流入直後でも 1 Stop の `gh` 呼び出しが上限を超えない
+- [x] Phase 2 が `is_merged = true` の PR を refresh 対象から除外し、open な PR のみ re-check する
+- [x] cap 導入後も starvation しない（Phase 1 = newest-first、Phase 2 = oldest-checked-first で全件が順に処理される）
 - [ ] backfill バックログが 2000+ ある状態で 10 回連続 Stop しても、secondary rate limit に当たらない
-- [ ] backfill が新しいセッション（< 24h）の救済を取りこぼさない（0035 の horizon と整合）
+- [x] backfill が新しいセッション（< 24h）の救済を取りこぼさない（0035 の horizon と整合）
 
 問題 2（ブロッキング）:
 
-- [ ] **Stop hook の同期パスが `gh` を 1 回も呼ばない**（pin 含む全 gh は async/detached worker 側。同期部分はローカル書き込み + worker spawn のみ）
-- [ ] Stop hook が `backfill --detach` を spawn して即 return し、worker 完了を待たない（同期ホットパス ≈ 10ms 未満）
-- [ ] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
-- [ ] worker が global single-flight（try-lock-skip）で、並列 Stop / 別 agent と同時に gh を撃たない（取れなければ即 exit）
-- [ ] worker が cooldown を持ち、Stop が連続しても single-flight lock 取得ごとに gh batch が走り続けない
-- [ ] 並列 backfill / append が `session-index.jsonl` のロスト更新を起こさない（flock 共有、lock 内 re-read/merge/write）。かつ flock は try-lock-skip ＋ 書き込みスコープ限定 ＋ 1 run 1 WriteAll で、並列実行待ちを生まない
+- [x] **Stop hook の同期パスが `gh` を 1 回も呼ばない**（pin 含む全 gh は async/detached worker 側。同期部分はローカル書き込み + worker spawn のみ）
+- [x] Stop hook が `backfill --detach` を spawn して即 return し、worker 完了を待たない（同期ホットパス ≈ 10ms 未満）
+- [x] backlog が大きい状態でも Stop hook が gh / backfill の完了を待ってユーザの応答サイクルをブロックしない
+- [x] worker が global single-flight（try-lock-skip）で、並列 Stop / 別 agent と同時に gh を撃たない（取れなければ即 exit）
+- [x] worker が cooldown を持ち、Stop が連続しても single-flight lock 取得ごとに gh batch が走り続けない
+- [x] 並列 backfill / append が `session-index.jsonl` のロスト更新を起こさない（flock 共有、lock 内 re-read/merge/write）。かつ flock は try-lock-skip ＋ 書き込みスコープ限定 ＋ 1 run 1 WriteAll で、並列実行待ちを生まない
 
 収束アーキ / agent 対称:
 
-- [ ] Claude / Codex とも worker トリガは Stop のみ。**hook 登録構成は現状から変更しない**（既存ユーザの settings.json 移行不要）
-- [ ] Claude の SessionEnd は `ended_at` 書き込みのみで worker をトリガしない
-- [ ] `agent-telemetry backfill --gc`（移行 drain）が既存 backlog を horizon / 第1層で一括 markChecked し、deploy 後 1 回で 2390+ を収束させられる。`doctor` が案内する
+- [x] Claude / Codex とも worker トリガは Stop のみ。**hook 登録構成は現状から変更しない**（既存ユーザの settings.json 移行不要）
+- [x] Claude の SessionEnd は `ended_at` 書き込みのみで worker をトリガしない
+- [x] `agent-telemetry backfill --gc`（移行 drain）が既存 backlog を horizon / 第1層で一括 markChecked し、deploy 後 1 回で 2390+ を収束させられる。`doctor` が案内する
 
 共通:
-- [ ] Phase 2 (経路 4) の事後 refresh 経路が維持され、PR がマージ後に `is_merged = 1` へ更新される（`pr_metrics` 母集団＝ `agent_pr_*` / `agent_session_pr_*` が空にならない）。頻度・件数の制御は可だが経路自体は残す
+- [x] Phase 2 (経路 4) の事後 refresh 経路が維持され、PR がマージ後に `is_merged = 1` へ更新される（`pr_metrics` 母集団＝ `agent_pr_*` / `agent_session_pr_*` が空にならない）。頻度・件数の制御は可だが経路自体は残す
 - [ ] `doctor` が旧構成（同期 backfill を呼ぶ hook 等）を検出して案内する
-- [ ] `docs/design.md` の Stop hook hot path 節と backfill 節を収束アーキに合わせて更新
+- [x] `docs/design.md` の Stop hook hot path 節と backfill 節を収束アーキに合わせて更新
 
 ## 参照
 
-- 関連 issue: [0035-bug-backfill-no-pr-infinite-retry.md](0035-bug-backfill-no-pr-infinite-retry.md)（24h horizon で markChecked する別アプローチ）
-- 関連: [closed/0020-design-backfill-evolution-to-stop-hook.md](closed/0020-design-backfill-evolution-to-stop-hook.md)（cron → Stop hook 移行の経緯）
+- 関連 issue: [0035-bug-backfill-no-pr-infinite-retry.md](../0035-bug-backfill-no-pr-infinite-retry.md)（24h horizon で markChecked する別アプローチ）
+- 関連: [0020-design-backfill-evolution-to-stop-hook.md](0020-design-backfill-evolution-to-stop-hook.md)（cron → Stop hook 移行の経緯）
 - 暫定対処済の類例: statusline.js の `gh pr view` には別途 10 分キャッシュを入れている
+
+---
+
+Completed: 2026-05-27
+
+## 解決方法
+
+収束アーキテクチャ（gh 完全 async + per-file flock + global single-flight）を実装した。
+
+- **Stop の同期パスから gh を全廃**: `RunStop` は Codex の `ended_at` 書き込みのみ同期で行い、`backfill --detach` を `os.Executable()` + `/dev/null` で fire-and-forget spawn して即 return する。pin は worker の `runPinBackfill` に吸収し、`pinPRForSession` / `ghPRLookup` は削除した。
+- **worker のレート制御**: global single-flight（`~/.agent-telemetry/backfill.lock`、try-lock-skip）+ `WorkerCooldown` + `DefaultGHCap`。cap は Phase 1（newest-first）/ Phase 2（per-URL `meta_url_checks` で oldest-checked-first）の両方に効く。Phase 2 は `is_merged` を除外し open PR のみ refresh。
+- **書き込み整合性**: `internal/sessionindex/lock.go` の flock helper を追加。worker は gh 結果を `Batch` に集約し、`ApplyBatch`（try-lock-skip）で最新 index を re-read → merge → 1 回 WriteAll。SessionStart の append（`AppendRawLine`）と syncdb の user_id 埋め戻しも同じ flock を共有。
+- **移行 drain**: `backfill --gc` が `gh` を呼ばず `COALESCE(ended_at, timestamp)` 24h horizon で backlog を一括 markChecked。`doctor` が backlog 件数（PR-less・未 checked）を数えて閾値超過時に `--gc` を案内する。
+- **docs**: `docs/design.md` の Stop hook hot path 節 / backfill 節 / 既知の制約、`docs/spec.md` の hook 役割・`backfill` コマンド・`pr_pinned` を収束アーキに同期。
+
+未チェックの 2 条件:
+
+- 「backlog 2000+ で 10 連続 Stop しても secondary rate limit に当たらない」は実機での経験的確認項目で、設計（cap + single-flight + cooldown + `--gc` drain）で担保しているが本 PR では再現環境での実測まではしていない。
+- 「`doctor` が旧構成（同期 backfill を呼ぶ hook）を検出」は **moot**: 収束モデルは hook 登録構成を変更しない（Stop は従来どおり `agent-telemetry hook stop`、挙動だけバイナリ内で async 化）ため検出すべき設定差分が存在しない。代わりに backlog → `--gc` の案内で移行を支援する。
+
+第1層（実デフォルトブランチの admission control）は [0035](../0035-bug-backfill-no-pr-infinite-retry.md) の担当で本 issue では未着手（`--gc` は horizon=第2層のみで収束させる）。

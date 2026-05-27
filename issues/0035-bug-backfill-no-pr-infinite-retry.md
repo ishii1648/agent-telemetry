@@ -42,7 +42,7 @@ Created: 2026-05-11
 
 ### `ended_at` の信頼性（2026-05 実測、E の前提に直結）
 
-E の horizon は `ended_at` を基準にするが、`ended_at` の計測は agent で非対称（[0038](0038-bug-stop-hook-backfill-rate-limit.md) の調査）:
+E の horizon は `ended_at` を基準にするが、`ended_at` の計測は agent で非対称（[0039](closed/0039-bug-stop-hook-backfill-rate-limit.md) の調査）:
 
 - **Claude**: SessionEnd hook (`sessionend.go:22`) が発火時に 1 回だけ書く。kill / 端末強制クローズ / クラッシュでは発火せず空のまま。**補完経路なし**。
 - **Codex**: SessionEnd が無いので Stop hook が毎回上書き (`stop.go:62`) → 最終アクティビティ時刻。さらに `backfillCodexEndedAt` が rollout JSONL から復元。
@@ -67,7 +67,7 @@ E の horizon は `ended_at` を基準にするが、`ended_at` の計測は age
 
 ## 対応方針
 
-採用: **第1層（実デフォルトブランチの admission control）+ E（horizon）+ G（pin 結果を同 tick 内で再利用）の組み合わせ**。第1層 = 入口で candidate に入れない、E = 入った candidate を時間で諦める、という 2 段の GC（[0038](0038-bug-stop-hook-backfill-rate-limit.md) の GC 設計と対応。第1層/第2層の用語は 0038 と共通）。
+採用: **第1層（実デフォルトブランチの admission control）+ E（horizon）+ G（pin 結果を同 tick 内で再利用）の組み合わせ**。第1層 = 入口で candidate に入れない、E = 入った candidate を時間で諦める、という 2 段の GC（[0039](closed/0039-bug-stop-hook-backfill-rate-limit.md) の GC 設計と対応。第1層/第2層の用語は 0039 と共通）。
 
 ### 第1層 — 実デフォルトブランチの admission control（新規採用）
 
