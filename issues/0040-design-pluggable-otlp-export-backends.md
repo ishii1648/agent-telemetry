@@ -18,8 +18,12 @@ Created: 2026-05-26
 
 本 issue の deliverable は **backend 非依存の 2 本**:
 
-- **A. 設定可能な OTLP export**: client が OTLP/HTTP を **設定可能な宛先（複数 endpoint + 任意の auth header）** に投げられる 1 能力を確立する。これ自体が「OTLP 標準に乗っているので任意 backend に向けられる」を内包し、その上で **direct（client → backend Intake 直送）** と **collector（client → OTel Collector → fanout）** の 2 つを **デプロイレシピ**として docs に同梱する。direct/collector は実装分岐ではなく宛先設定の違い
-- **B. attribute の意味分類**: 独自 event の attribute を「低 cardinality の次元 / 高 cardinality の識別子 / 数値の measure」に分類し、各 backend のタグ・索引・メトリクスへ落とせる形に仕様化する
+- **A. 設定可能な OTLP export（2 representation）**: client が OTLP/HTTP を、**endpoint + auth header + representation を持つ export target の配列**に投げられる能力を確立する。送る representation は 2 種:
+  - **raw events**（OTLP **Logs**）: event-level 分析（token 推移・流量・カウント）と、任意で SQLite ingest（Grafana）向け
+  - **pre-aggregated `pr_metrics`**（OTLP **Metrics** gauge, PR 単位）: 効率指標向け。**log-metric backend は record 間 join をしない**ため、cross-event join に依存する `pr_metrics` 相当は client のローカル VIEW で集約してから gauge で送る（理由は「問題」節）
+
+  その上で **direct（client → backend Intake 直送）** と **collector（client → OTel Collector → fanout）** の 2 つを **デプロイレシピ**として docs に同梱する。direct/collector は宛先設定の違いで実装分岐ではない
+- **B. attribute の意味分類**: 独自 event / gauge の attribute を「低 cardinality の次元タグ / 高 cardinality の識別子 / 数値の measure」に分類し、各 backend のタグ・索引・メトリクスへ落とせる形に仕様化する
 
 **Datadog はこの方針の最初のリファレンス実装** として 1 本通す。A + B が「ユーザが実 backend 上で自前の dashboard / monitor を組める状態」を担保できることを、Datadog という具体例で検証・例示する。Datadog 固有の用語（tag / facet / measure）は B の generic な意味分類の concretization として扱い、New Relic / Honeycomb / Grafana Cloud 等も同じ A + B の仕組みで後続 issue として足せる前提とする。
 
@@ -31,9 +35,9 @@ Created: 2026-05-26
 
 [0038] で OTLP/HTTP に乗り換えると、wire format が OTel 標準になるため「送信先を差し替えるだけで別 backend に流せる」というのが理屈の上では成立する。ユーザの関心も「OTel 対応によってエクスポート先をプラガブルにできるか」にある。
 
-ただし「流せる」と「ユーザがその backend で意味のある dashboard を組める」の間には backend 非依存の gap が 2 つあり、これを埋めて初めてプラガブルが実用になる:
+ただし「流せる」と「ユーザがその backend で意味のある dashboard を組める」の間には backend 非依存の gap があり、これを埋めて初めてプラガブルが実用になる:
 
-- **送信経路（A）**: events をどの OTLP signal で送るか（OTLP **Logs**＝[0038] の決定のまま backend 側で Logs to Metrics するか、OTLP **Metrics** に変換するか）と、どの経路で外部 backend に届けるか
+- **送信経路と representation（A）**: events をどの OTLP signal で送るか、どの経路で外部 backend に届けるか。さらに **log-metric backend は record 間 join をしない**ため、`pr_metrics` 相当（token は `transcript.scanned`、`pr_url`/`is_merged` は `pr.observed`、`user_id`/`repo` は `session.started` に分散し、SQLite VIEW が session_id で join + latest-wins + sum している）は **raw events を流すだけでは backend 側で組み立てられない**。効率指標は client 側で集約して送る必要がある
 - **attribute の意味分類（B）**: attribute をそのまま log attribute として流すと、cardinality 爆発（`session_id` を次元タグにしてしまう等）や、数値属性が集計対象にならず埋もれる事態を招く。どの属性が低 cardinality の次元で、どれが高 cardinality の識別子で、どれが数値 measure かを backend 非依存に分類しておく必要がある
 
 「backend で metrics を表示できる」と言うときのユーザの実用上の要求は通常「コーディングエージェント運用状況を monitor / dashboard 経由で日常運用に組み込みたい」である。本 issue はその dashboard 自体を提供するのではなく、**ユーザが選んだ backend で自前で組めるだけの素材（A の届け先 + B の意味分類）を渡す**ことでこの要求に応える。
@@ -46,16 +50,16 @@ Created: 2026-05-26
 
 [0038] が完了した時点で残る、外部 backend への export 固有の障害を 2 つに整理する。いずれも backend 非依存で、Datadog はその具体的な検証対象。
 
-### A. OTLP export 能力と signal / 宛先
+### A. export の representation・signal・宛先
 
-events をどの OTLP signal で、どの宛先に届けるか。
+events をどの representation / signal で、どの宛先に届けるか。**representation は 2 種に分かれる**:
 
-- [0038] は OTLP **Logs** で emit する決定。Logs のままなら backend 側で Logs to Metrics 相当（Datadog なら [Logs to Metrics](https://docs.datadoghq.com/logs/log_configuration/logs_to_metrics/)）で metric 化する
-- あるいは events を **OTLP Metrics に変換して送る**。多くの backend は素直に metric として受けるが、OTLP Logs で emit する [0038] の決定との整合性をどう取るかが論点になる
+- **raw events（OTLP Logs）**: [0038] の決定どおり events をそのまま流す。event-level 分析（素の token 推移・流量・カウント）と、任意の SQLite ingest（Grafana）向け
+- **pre-aggregated `pr_metrics`（OTLP Metrics gauge）**: 効率指標向け。後述の join 制約のため client 側で集約してから送る
 
-宛先は「設定可能な OTLP export」1 能力の上で **direct（backend Intake 直送）/ collector（Collector 経由 fanout）** をデプロイレシピとして両対応する。どちらを使うかの指針（個人 / team での使い分けと secret モデル）は「対応方針 > export 能力と 2 つのデプロイレシピ」で扱う。
+宛先は「設定可能な OTLP export」能力の上で **direct（backend Intake 直送）/ collector（Collector 経由 fanout）** をデプロイレシピとして両対応する。どちらを使うかの指針（個人 / team での使い分けと secret モデル）は「対応方針 > export 能力と 2 つのデプロイレシピ」で扱う。
 
-> **集約（`pr_metrics` 相当）はユーザ側で組む。** `total_tokens` / `fresh_tokens` / `per_million_tokens` 等は現状 agent-telemetry-server の **SQLite VIEW** で集約している。外部 backend 側では、ユーザが measure 上の式（Datadog なら formula、`total_tokens = input + output + cache_write + cache_read + reasoning`）と次元タグのフィルタ（merged 限定 / subagent 除外 / ghost 除外 / ノイズ repo 除外）で**自前再現する**前提とする。本 issue は再現に必要な次元を B の意味分類で漏れなく露出するところまでを担保し、集約定義そのものを backend 側に同梱・保守はしない。pre-aggregated metric を我々が別経路で送る案は、dashboard 非提供方針と矛盾する scope creep のため採らない。
+> **集約（`pr_metrics` 相当）は client 側で行い gauge として送る（join 不可ゆえ）。** `total_tokens` / `fresh_tokens` / `per_million_tokens` 等は現状 agent-telemetry-server の **SQLite VIEW** が cross-event join（`session_id`）+ latest-wins + sum で算出している。log-metric backend（Datadog Logs to Metrics 等）は **record 間 join をしない**ため、normalized な events（token は `transcript.scanned`、`pr_url`/`is_merged` は `pr.observed`、`user_id`/`repo` は `session.started` に分散）を流すだけでは backend 側で `pr_metrics` を組み立てられない。よって **client がローカル VIEW を評価し、PR 単位（`pr_url` / `coding_agent` / `user_id`）の pre-aggregated 値を OTLP Metrics gauge（last-value）として送る**。これは当初「scope creep」として却下した pre-aggregated 案の採用にあたるが、却下の前提（「集約はユーザ側で組める」）が join 不可で崩れたための翻意。gauge は last-value で再送が上書き（冪等）になり、`session_id` を tag に出さずに済むので cardinality も PR 数止まり。**denormalized な session-rollup を log で送り backend で集約する案（session-grain）は不採用**: latest-wins のため `session_id` を高 cardinality tag にせざるを得ず Datadog custom metric を膨張させ、log の sum が二重カウントしやすい。backend での自由 slice 柔軟性は Grafana/SQLite が既に担うため低価値。
 
 > **却下: event 名を OTel `gen_ai.*` semantic conventions に寄せる案。** `gen_ai.*` は個々の LLM 呼び出しを記述する規約であり、agent-telemetry の中核概念（PR 単位のトークン効率・transcript scan の latest-wins snapshot）は構造的にマップできない。部分的に寄せても二重命名が増えるだけで OOTB 認識の利得が出ないため採らない。独自命名は維持し、次元 / metric は自前定義する前提で進める。
 
@@ -63,7 +67,7 @@ events をどの OTLP signal で、どの宛先に届けるか。
 
 OTLP Logs を外部 backend に送ると、各 attribute は backend の log attribute にマップされる。これを **次元タグ / 索引（facet）/ measure** に昇格しないと、検索・集計・monitor 対象として一級にならない。一方で `session_id` のような高 cardinality 属性を次元タグにすると、backend の課金 / index 設計を破壊する。
 
-ここを backend 非依存の意味分類として spec で固定しないと、利用者ごと・backend ごとに mapping がブレて、組織や backend を跨いだ dashboard 再利用ができない。**「ユーザが dashboard を組める」を実際に担保するのはこの意味分類** であり、本 issue の core deliverable。
+ここを backend 非依存の意味分類として spec で固定しないと、利用者ごと・backend ごとに mapping がブレて、組織や backend を跨いだ dashboard 再利用ができない。意味分類（B）は **event-level 分析（raw events 側）を一級にする** 担保で、**効率指標（`pr_metrics`）は A の client 集約 gauge が担う** という二本立て（join 不可ゆえの役割分担）。両者が揃って初めて「ユーザがその backend で dashboard を組める」状態になる。
 
 仕様化が必要な観点（対応表と Datadog へのリファレンスマッピングは「対応方針 > attribute の意味分類（B）」に置く）:
 
@@ -95,14 +99,16 @@ OTLP Logs を外部 backend に送ると、各 attribute は backend の log att
 
 > **なぜ team では collector か（credential モデルの帰結）**: Datadog の ingestion API key (`DD-API-KEY`) は **org-wide でスコープ不可**（scopes は read/管理用の Application key にのみ適用、[API and Application Keys](https://docs.datadoghq.com/account_management/api-app-keys/)）。「ログ送信のみ」の key は作れない。submit 専用ではあるが、漏洩時は org 全体 rotate・濫用（コスト増幅）の blast-radius が残り、RUM client token のような app スコープ / 公開耐性 / 個別失効は無い。RUM が安全なのは token そのものではなく「**信頼できない多数クライアントは強い秘密を持たず、信頼できる intake だけが特権 submit する**」アーキテクチャ由来であり、それを OTLP で再現するのが collector レシピ（client は秘密なし＝RUM 等価）。個人は公開環境ではないので direct + submit-only key で十分。
 
-これにより、agent-telemetry 本体には backend 固有のコードを入れず（宛先と auth は設定）、Grafana 経路（SQLite）も両レシピで並列に保てる。少なくとも意味分類（B）は spec / docs に書き残す（その作業は本 issue で行う）。
+これにより backend 固有のもの（endpoint / auth header 名 / representation）は設定に追い出せ、Grafana 経路（SQLite）も両レシピで並列に保てる。少なくとも意味分類（B）は spec / docs に書き残す（その作業は本 issue で行う）。
+
+**送信経路の形（2 representation の帰結）**: 効率指標は client のローカル VIEW で集約するので、**集約は client 側に固定**される（collector は stateless で cross-event join できないため **router であって aggregator ではない**。server 側集約は SQLite ingest を必須化し Datadog-only 個人と矛盾するので採らない）。結果、同じローカル SoR から **raw events（Logs）と `pr_metrics` gauge（Metrics）の 2 projection** を作って別宛先に送る。差分検出は 1 スキャン共有・**宛先ごとに独立カーソル**（raw=append で重複防止に必須 / gauge=upsert 冪等なので最適化）。現行 `[server].endpoint + Bearer 固定` を **export target 配列（endpoint + 可変 auth header + representation）** に拡張する。
 
 ### attribute の意味分類（B）
 
 attribute → 意味分類の対応（**spec 本体は 1 つ**）を `docs/spec.md` に backend 非依存で固定する。各分類は backend のタグ・索引・メトリクスへ落ちる。**Datadog をリファレンス実装としたときの concrete マッピング**を併記する:
 
-- **低 cardinality の次元タグ**（フィルタ・group-by 用、Datadog では tag）: `service` / `env` / `version` / `coding_agent` / `model` / `agent_version` / `repo` / `task_type` / `end_reason` / `pr_state`
-- **高 cardinality の識別子**（索引のみ、次元タグに昇格しない、Datadog では facet only）: `branch` / `pr_url` / `pr_title` / `user_id` / `session_id` / `parent_session_id`
+- **低 cardinality の次元タグ**（フィルタ・group-by 用、Datadog では tag）: `service` / `env` / `version` / `coding_agent` / `model` / `agent_version` / `repo` / `task_type` / `end_reason` / `pr_state` / **`user_id`**（`pr_metrics` の GROUP BY 軸（`pr_url`/`coding_agent`/`user_id`、`spec.md:270`）。cardinality はユーザ数で低く、group-by に必須なので次元タグ）/ **`pr_url`**（PR 単位 gauge の主キー。PR 数ぶん増えるが `session_id` より穏当で集計軸として必須）
+- **高 cardinality の識別子**（索引のみ、次元タグに昇格しない、Datadog では facet only）: `branch` / `pr_title` / `session_id` / `parent_session_id`
 - **数値 measure**（Datadog では measure）: `input_tokens` / `output_tokens` / `cache_write_tokens` / `cache_read_tokens` / `reasoning_tokens` / `tool_use_total` / `mid_session_msgs` / `ask_user_question` / `review_comments` / `changes_requested`
 - **OTel resource 規約**: `service.name=agent-telemetry`, `env=<deploy environment>`, `version=<agent_version>`（Datadog の `service` / `env` / `version` に対応）
 
@@ -110,7 +116,9 @@ attribute → 意味分類の対応（**spec 本体は 1 つ**）を `docs/spec.
 
 > **配布形式は 2 つ（spec 本体は 1 つ）**: この意味分類が実際に昇格を起こす場所はレシピで変わる。**direct** では mapping は backend 側で行うため、Datadog をリファレンスとした **Logs Pipeline remapper の import 可能な設定**として配る。**collector** では **Collector processor のサンプル設定**として配る。「両対応」の追加コストはこの **2 形式へのレンダリング**だけで、どれが次元タグ / 識別子 / measure かという spec 本体は共通。
 
-> **担保のガードレール**: どの backend を選んでも、ユーザが SQLite VIEW の集約（`total_tokens = input + output + cache_* + reasoning`、merged 限定 / subagent・ghost 除外 / ノイズ repo 除外）を再現できることが、本 issue の合否条件。そのためには **全フィルタ次元（`is_merged` / `is_subagent` / `is_ghost` / `repo`）が次元タグ、全数値が measure** として漏れなく上記に含まれている必要がある。意味分類を確定する際はこの完全性を必ず検証する。
+> **担保のガードレール（join 不可を踏まえた改訂）**: `pr_metrics` は cross-event join + latest-wins + sum に依存し、log-metric backend は join しないので **「measure + 次元タグの分類だけで backend が pr_metrics を再現できる」という当初の合否条件は成立しない（撤回）**。合否は representation ごとに 2 段で定義する:
+> - **効率指標（`pr_metrics` 相当）**: client がローカル VIEW で集約し、**PR 単位の OTLP Metrics gauge（last-value、tags = `pr_url`/`coding_agent`/`user_id` + `repo`/`model`/`is_merged` 等）** として送れること。`session_count` / `tokens_per_session` / `tokens_per_tool_use` もこの行に含めるので backend 側 formula で出る
+> - **event-level 分析**: raw events の attribute が B の意味分類どおり次元タグ / measure に落ち、backend で素の token 推移・流量・カウントを出せること（フィルタ次元 `is_merged` / `is_subagent` / `is_ghost` / `repo` が次元タグ、全数値が measure）
 
 ### dashboard / monitor はユーザが構築する
 
@@ -122,10 +130,11 @@ Grafana 版（`grafana/dashboards/agent-telemetry.json`、SQLite datasource 前�
 
 本 issue 自体は spec/docs の更新と方針確定までを想定し、実装は次の child issue に分解する。順序は依存関係に従う:
 
-1. **設定可能な OTLP export 能力 + 2 デプロイレシピの確立（A、backend 非依存）**: client の OTLP exporter を **設定可能な宛先（複数 endpoint + auth header）** に向けられるようにする。docs に **direct レシピ**（client → backend Intake 直送、submit-only credential を client 設定に）と **collector レシピ**（`deploy/otel-collector/` or how-to で、選んだ宛先への fanout。SQLite ingest exporter は Grafana 併用時の任意の 1 宛先で必須ではない。client は Collector に向けるだけ）を同梱。**最初の backend として Datadog を例示**する
-2. **attribute の意味分類を `docs/spec.md` に追記（B、backend 非依存 + Datadog リファレンス）**: 対応表を仕様本体として固定し、**2 配布形式**（direct 用の Datadog Logs Pipeline 設定 / collector 用の Collector processor サンプル）を同梱する
-3. **`docs/metrics.md` にユーザ向け再構築ガイドを追記（任意）**: 各メトリクスについて「Logs to Metrics 相当で生成 / OTLP measure をそのまま使う / backend 側の式で再定義」のどれでユーザが組めるかを参考として明示
-4. **`docs/design.md` に client / server / (Collector) / 外部 backend の責務分担を追記**: 「client は設定可能な OTLP export を担う。server は OTLP receiver + SQLite ingest だけ。外部 backend 側集約はユーザが担う。collector レシピを採る場合のみ Collector が fanout と意味分類の昇格を担う（direct レシピでは backend 側 Pipeline が担う）」という分担を明文化
+1. **flush を export target 配列に拡張（A）**: 現行 `[server].endpoint + Bearer 固定` を、**endpoint + 可変 auth header（Bearer / `DD-API-KEY` 等）+ representation を持つ target の配列**にする。1 差分スキャンから raw events（Logs）と後述の gauge（Metrics）の 2 projection を、宛先ごとの独立カーソルで送る。docs に **direct レシピ**（client → backend 直送、submit-only credential を client 設定に）と **collector レシピ**（`deploy/otel-collector/` or how-to で選んだ宛先へ router fanout。SQLite ingest は Grafana 併用時の任意宛先で必須ではない）を同梱。**最初の backend として Datadog を例示**
+2. **`pr_metrics` の client 側集約 + gauge 送信（A、効率指標）**: client がローカル `pr_metrics` VIEW を評価し、PR 単位の値を OTLP Metrics gauge（last-value）として送る経路を実装する。`session_count` / 各 ratio もこの行に含める
+3. **attribute の意味分類を `docs/spec.md` に追記（B、backend 非依存 + Datadog リファレンス）**: 対応表を仕様本体として固定し、**2 配布形式**（direct 用の Datadog Logs Pipeline 設定 / collector 用の Collector processor サンプル）を同梱する。これは raw events 側（event-level 分析）の tag/measure 昇格に効く
+4. **`docs/metrics.md` に backend 上の representation 対応を追記（任意）**: 各メトリクスについて「`pr_metrics` 系は client 集約の gauge をそのまま使う / event-level 系は raw events から backend formula で出す」のどちらかを明示
+5. **`docs/design.md` に client / server / (Collector) / 外部 backend の責務分担を追記**: 「client は設定可能な OTLP export と **`pr_metrics` のローカル集約（gauge 化）** を担う。server は OTLP receiver + SQLite ingest だけ。外部 backend は gauge の格納・表示と event-level 集計を担う（cross-event 集約は backend 側では行わない）。collector レシピを採る場合のみ Collector が router として fanout と raw events 側の意味分類昇格を担う（direct では backend 側 Pipeline）」という分担を明文化
 
 実装の前段で確認したい spike（Datadog をリファレンスとして実機検証する）:
 
@@ -136,7 +145,7 @@ Grafana 版（`grafana/dashboards/agent-telemetry.json`、SQLite datasource 前�
 
 - `docs/spec.md` / `docs/design.md` の本文は本 issue 単体では更新しない（本 issue を ack した後の child issue / 段階実装の中で更新する）
 - **dashboard / monitor の提供・保守**（backend を問わずユーザ構築前提。本 issue は A + B で構築可能性のみを担保する）
-- 集約定義（merged 限定等）の backend 側への同梱（ユーザが backend の式で自前再現する）
+- **backend 側での cross-event 集約の再現**（merged 限定等のフィルタ + join を backend formula で組ませる案）。log-metric backend は join しないので不可能であり、効率指標は client がローカル VIEW で集約して gauge 送信する（backend は gauge を格納・表示するだけ）
 - **Datadog 以外の backend（New Relic / Honeycomb / Grafana Cloud）のリファレンス実装**: A の設定可能な OTLP export（direct / collector）と B の意味分類は backend 非依存なので、宛先と意味分類のレンダリング先を変えれば原理的に対応可能。ただし本 issue では **リファレンス実装を Datadog 1 本に絞る**（検証対象を 1 つに固定するため）。横展開は同じ A + B 上で後続 issue として起こす
 
 ## 前提
