@@ -65,9 +65,8 @@ agent-telemetry update <session_id> <url>...              session-index.jsonl �
 agent-telemetry update --mark-checked <session_id>...     backfill_checked フラグをセット
 agent-telemetry update --by-branch <repo> <branch> <url>  同一 repo+branch の全セッションに URL を追加
 agent-telemetry hook <event> [--agent <claude|codex>]     hook サブコマンド（settings.json / config.toml から呼ばれる、既定 claude）
-agent-telemetry push [--since-last|--full] [--dry-run]    既存実装: サーバへ sessions / transcript_stats の集計行を送信（要 [server] 設定、deprecated）
 agent-telemetry flush [--since-last|--full] [--dry-run]   未送信のイベントをサーバへ OTLP/HTTP で flush（要 [server] 設定）
-agent-telemetry migrate-to-events                         既存 session-index / transcript から events DB を再生成（旧 push 経路からの移行用）
+agent-telemetry migrate-to-events                         既存 session-index / transcript から events DB を再生成
 agent-telemetry version                                   version を表示
 ```
 
@@ -441,16 +440,18 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 
 `schema_hash` mismatch によるサーバ受信拒否は廃止。events table の DDL に互換破壊変更が入る場合のみ、新 endpoint（例: `/v2/logs`）を切る運用とする。
 
-### 旧 push 経路からの移行
+### 旧 push 経路からの移行（完了）
 
-[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で deprecate。既存 binary 互換のため `agent-telemetry push` / `/v1/metrics` は 1 リリース併走し、新経路は `agent-telemetry flush` / `/v1/logs` を使う。クライアント側は `agent-telemetry migrate-to-events` で既存 session-index / transcript から events DB を再生成できる。サーバ側は `agent-telemetry-server migrate-to-events` で events schema を確定し、以降は `flush` で届く events を受ける。展開後は `sessions` / `transcript_stats` が VIEW として提供される。
+[0009] / [0028]-[0031] で実装した「`sessions` / `transcript_stats` 集計行を `POST /v1/metrics` で送る」経路は本仕様で廃止済み。`agent-telemetry push` / `agent-telemetry-server` の `/v1/metrics` ハンドラ・`schema_hash` mismatch 受信拒否・`INSERT OR REPLACE` upsert・`collisions.log` は **v0.0.10 を 1 リリース併走させたのち削除した**（[0038]）。現行はクライアント `agent-telemetry flush` → サーバ `/v1/logs`（OTLP/HTTP Logs）の一本のみ。
+
+移行が必要なユーザは旧 push 経路を含む v0.0.10 のうちに `agent-telemetry migrate-to-events`（session-index / transcript から events DB を再生成）と `agent-telemetry-server migrate-to-events`（events schema 確定）を済ませる。展開後は `sessions` / `transcript_stats` が events 由来の VIEW として提供される。
 
 ### サーバ MVP の非目標
 
 - user 別の read/write 権限分離（RLS / OIDC）— 信頼境界 = チーム内を前提
 - transcript 本体のサーバ保管 — events のみを送る方針なのでそもそも保管しない。会話ログを共有したいケースは別ツールで対応
 - write API 以外の提供（read API・専用 UI）— Grafana から直接 SQLite を読む構成
-- OTel Metrics / Traces signal の受信 — Logs（events）のみで完結する。tool 使用などを Counter 化したい場合は後追いで `/v1/metrics` を追加する
+- OTel Metrics / Traces signal の受信 — Logs（events）のみで完結する。tool 使用などを Counter 化したい場合は後追いで Metrics signal の endpoint を追加する
 
 ---
 

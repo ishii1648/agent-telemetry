@@ -437,7 +437,7 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 ### 採用しなかった代替
 
 - **旧設計（`sessions` 行 upsert + SHA-256 hash 追跡）の維持**: 後追い更新のたびに行 hash を計算 → 比較 → 再送、というロジックが本質的に「mutable state を transport で表現する」hack で、events 1 件追記で済む話を複雑化していた。新メトリクス追加時の `schema_mismatch` 全停止も運用負荷が大きい
-- **OTLP Metrics signal の採用**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため Logs（events）に統一する。後で Counter が必要になった時点で `/v1/metrics` を追加する
+- **OTLP Metrics signal の採用**: tool_used / mid_session_msgs などを Counter として送る選択肢はあるが、(1) tool 1 回 = 1 event の細粒度は最初から取らず snapshot に集約したい、(2) Counter / Log の二系統に分けると server の ingest と VIEW 構築が複雑になる、ため Logs（events）に統一する。後で Counter が必要になった時点で別途 OTLP Metrics signal の endpoint を追加する
 - **raw JSONL 転送 + サーバ側 transcript 解析**: 送信サイズ膨張・プライバシー観点・サーバ側のパーサ保守の 3 点が大きく、旧設計の議論で既に却下されている（[0009]）。append-only 化でもこの判断は変わらない
 - **イベント table を持たず、行 mutation で済ます append-only シミュレーション**: 一見「集計行に `updated_at` を持たせて INSERT OR REPLACE すれば append-only っぽくなる」が、過去の状態を保てないので replay ができず、events table に置き換えるべき以上のものは生まれない
 
@@ -570,9 +570,9 @@ events 数が大きくなって VIEW のオンザフライ集約が重くなっ�
 
 最初はオンザフライ VIEW で進め、ベンチマークで顕在化したら materialization に切り替える。
 
-### 旧 push 経路からの移行
+### 旧 push 経路からの移行（完了）
 
-[0028] / [0029] で実装した「`sessions` 行 / `transcript_stats` 行を `POST /v1/metrics` で送る」経路は本仕様で deprecate する。
+[0028] / [0029] で実装した「`sessions` 行 / `transcript_stats` 行を `POST /v1/metrics` で送る」経路は本仕様で廃止済み。移行は次の手順で完了した:
 
 1. クライアント・サーバとも一度だけ `agent-telemetry migrate-to-events` / `agent-telemetry-server migrate-to-events` を実行
    - 既存 `sessions` 行 → `agent.session.started` + `agent.session.ended` + `agent.pr.observed` の擬似イベント列に展開
@@ -580,8 +580,8 @@ events 数が大きくなって VIEW のオンザフライ集約が重くなっ�
    - `event_id` は通常 event と同じ deterministic content hash（`at_event_id`）で振る。content hash が再実行時の重複防止を兼ねるため、別途 `source_row_hash` のようなキーは持たない（前節「`event_id` の deterministic 採番」）
    - `occurred_at` は対応するカラム（`timestamp` / `ended_at` 等）から推定。不明分は migration 実行時刻
    - 実体は `sync-db` と同じ経路（`syncdb.RunForAgents`）を一度走らせるだけ。既存 `sessions` / `transcript_stats` 行ではなく session-index / transcript を読み直して events を deterministic に再生成する
-2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える
-3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを残しておき、1 リリース併走後に削除（既存ユーザに移行猶予を与える）
+2. 既存 `sessions` / `transcript_stats` テーブルを VIEW に差し替える（`INSTEAD OF INSERT` トリガで `sync-db` の行書き込みを events へリダイレクト）
+3. 旧 `agent-telemetry push` / 旧 `POST /v1/metrics` ハンドラを **v0.0.10 で 1 リリース併走させ、次リリース（[0038] 完了 PR）で削除した**。あわせて client の `serverclient.Run` / `Payload` / `SplitBatches` / `schema_hash` mismatch (`ErrSchemaMismatch`)、server の `ServeIngest` / `INSERT OR REPLACE` upsert / `findCollidingSessions` / `collisions.log`、`state.json` の `pushed_session_versions` を撤去。`sync-db` が書き込みに使う `INSTEAD OF INSERT` トリガと `schema_meta` の DDL バージョニングは現行経路で必要なため残す
 
 ### 配布形態 — Go binary + Docker image + k8s manifest
 

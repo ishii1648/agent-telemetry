@@ -1,8 +1,9 @@
 // agent-telemetry-server is the dumb ingest layer for agent-telemetry.
-// It receives aggregated sessions / transcript_stats rows from clients
-// and upserts them into a shared SQLite DB for Grafana to read.
-// Aggregation lives entirely on the client; the server only shares the
-// schema DDL.
+// It receives append-only events from clients as OTLP/HTTP Logs on
+// /v1/logs and appends them (INSERT OR IGNORE) into a shared SQLite DB.
+// sessions / transcript_stats / pr_metrics are derived VIEWs over events
+// for Grafana to read. Aggregation lives entirely in those VIEWs; the
+// server only shares the schema DDL.
 package main
 
 import (

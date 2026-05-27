@@ -1,11 +1,12 @@
-// Package serverclient implements `agent-telemetry push`: extracting the
-// aggregated rows from the local sync-db SQLite, hashing them for diff
-// detection, and POSTing them to a central server's /v1/metrics endpoint.
+// Package serverclient implements `agent-telemetry flush`: extracting unsent
+// events from the local sync-db SQLite and POSTing them as OTLP/HTTP Logs to a
+// central server's /v1/logs endpoint.
 //
-// The on-disk contract (state.json `pushed_session_versions`, payload shape,
-// schema hash check) is documented in docs/spec.md ## サーバ送信. The reasons
-// behind the design —集計値転送 over raw JSONL, dumb ingest server, opt-in via
-// [server] section — are recorded in issues/closed/0009-feat-server-side-metrics-pipeline.md.
+// The on-disk contract (state.json `last_flushed_sequence`, OTLP payload shape)
+// is documented in docs/spec.md ## サーバ送信. The reasons behind the
+// append-only event-sourced design are recorded in
+// issues/closed/0038-spec-event-sourced-metrics-otel.md (it supersedes the
+// /v1/metrics aggregated-row push from 0009).
 package serverclient
 
 import (
@@ -17,7 +18,7 @@ import (
 )
 
 // ServerConfig holds the resolved [server] section from agent-telemetry.toml.
-// Both fields must be non-empty for push to attempt a network call; that gate
+// Both fields must be non-empty for flush to attempt a network call; that gate
 // is enforced by Configured().
 type ServerConfig struct {
 	Endpoint string
@@ -26,7 +27,7 @@ type ServerConfig struct {
 
 // Configured reports whether the [server] section is populated enough to send
 // a request. A missing config is intentionally not an error — `agent-telemetry
-// push` is meant to be safe in cron without first checking whether the user
+// flush` is meant to be safe in cron without first checking whether the user
 // has opted into server upload.
 func (c ServerConfig) Configured() bool {
 	return c.Endpoint != "" && c.Token != ""

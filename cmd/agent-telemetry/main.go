@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -39,8 +38,6 @@ func main() {
 		runBackfill(os.Args[2:])
 	case "sync-db":
 		runSyncDB(os.Args[2:])
-	case "push":
-		runPush(os.Args[2:])
 	case "flush":
 		runFlush(os.Args[2:])
 	case "migrate-to-events":
@@ -73,8 +70,6 @@ Commands:
   backfill [--recheck] [--gc] [--detach] [--agent <a>]
                                          検出された agent すべての pr_urls / is_merged / review_comments を補完
   sync-db [--agent <a>]                  検出された agent すべての JSONL/transcript → SQLite 変換（毎回フル再構築）
-	  push [--since-last|--full] [--dry-run] [--agent <a>]
-	                                         sync-db の集計値（sessions / transcript_stats）を [server] へ送信（オプトイン）
 	  flush [--since-last|--full] [--dry-run] [--agent <a>]
 	                                         events を OTLP/HTTP Logs として [server] へ送信（オプトイン）
 	  migrate-to-events [--agent <a>]        session-index / transcript から events DB を再生成
@@ -255,54 +250,6 @@ func runSyncDB(args []string) {
 	}
 	if err := syncdb.RunForAgents(agents, syncdb.DBPath()); err != nil {
 		fmt.Fprintf(os.Stderr, "sync-db error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-// runPush dispatches `push` to serverclient. Missing [server] config is
-// surfaced via stderr but exits 0 — cron should not page on an opt-out.
-// schema_mismatch is the one server-side condition we exit non-zero on, so
-// users notice they need to upgrade either client or server binary.
-func runPush(args []string) {
-	migrateLegacy()
-	agentName, args := extractAgentFlag(args)
-	opts := serverclient.Options{
-		ClientVersion: version,
-	}
-	for _, a := range args {
-		switch a {
-		case "--since-last":
-			opts.SinceLast = true
-		case "--full":
-			opts.Full = true
-		case "--dry-run":
-			opts.DryRun = true
-		default:
-			fmt.Fprintf(os.Stderr, "push: unknown flag %q\n", a)
-			os.Exit(1)
-		}
-	}
-	if !opts.Full && !opts.SinceLast {
-		opts.SinceLast = true
-	}
-	opts.AgentName = agentName
-
-	res, err := serverclient.Run(context.Background(), opts)
-	if res != nil {
-		res.Summarize(os.Stderr)
-		for _, ar := range res.PerAgent {
-			if ar.NoConfig {
-				fmt.Fprintf(os.Stderr, "push: [server] セクションが %s に未設定です。docs/spec.md ## サーバ送信 を参照してください。\n", configpath.Preferred())
-				break
-			}
-		}
-	}
-	if err != nil {
-		if errors.Is(err, serverclient.ErrSchemaMismatch) {
-			fmt.Fprintln(os.Stderr, "push: server reported schema_mismatch — クライアント / サーバ binary のスキーマハッシュが一致していません。両側を同じ version に揃えてください。")
-			os.Exit(2)
-		}
-		fmt.Fprintf(os.Stderr, "push error: %v\n", err)
 		os.Exit(1)
 	}
 }

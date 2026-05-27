@@ -131,9 +131,10 @@ SELECT
     COALESCE(json_extract(attributes, '$.is_ghost'), 0) AS is_ghost
 FROM latest_stats;
 
--- These INSTEAD OF INSERT triggers let sync-db (and the legacy /v1/metrics
--- upsert) keep writing whole sessions / transcript_stats rows while the events
--- table is the actual store. event_id is derived deterministically from the
+-- These INSTEAD OF INSERT triggers let sync-db keep writing whole sessions /
+-- transcript_stats rows while the events table is the actual store. (The server
+-- no longer relies on them: it appends events directly via /v1/logs.) event_id
+-- is derived deterministically from the
 -- event content via at_event_id() (registered in funcs.go) and inserts use
 -- INSERT OR IGNORE, so re-running sync-db over unchanged data dedups instead of
 -- appending a fresh random-id row every time. A genuine content change yields a

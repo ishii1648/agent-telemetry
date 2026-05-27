@@ -130,9 +130,22 @@ agent 跨ぎでは `model` / `agent_version` の混在で平均化が壊れや�
 
 ## メトリクスカタログ
 
-メトリクス名・型・ラベルの一覧。各メトリクスは SQLite のカラム/VIEW と 1:1 で対応する（データモデルは `docs/spec.md ## SQLite データモデル` を参照）。型は時系列指標としての性格を表す（`counter` = 単調増加、`gauge` = 瞬時値）。Grafana が SQLite を直接 SQL で参照する想定で、外部配信プロトコルは備えない。
+メトリクス名・型・ラベルの一覧。SoR は append-only な `events` テーブル（`agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed` の 4 イベント）で、各メトリクスはイベントの属性を `sessions` / `transcript_stats` / `pr_metrics` などの **派生 VIEW** が latest-wins で surface した値と 1:1 で対応する（イベント schema は `docs/spec.md ## SQLite データモデル`、VIEW 定義は `internal/syncdb/schema/schema.sql` を参照）。型は時系列指標としての性格を表す（`counter` = 単調増加、`gauge` = 瞬時値）。クライアント間でのイベント転送は OTLP/HTTP Logs（`POST /v1/logs`）だが、Grafana 出力は VIEW を直接 SQL で参照する（Prometheus / OpenMetrics 形式の pull endpoint は備えない）。
 
-### セッション単位（`sessions` + `transcript_stats`）
+各メトリクス群とソースイベントの対応:
+
+| メトリクス群 | ソースイベント | surface する VIEW |
+|---|---|---|
+| `agent_session_{tool_use,*_tokens,mid_session_msgs,ask_user_question,is_ghost}` 系 + `model` | `agent.transcript.scanned`（snapshot） | `transcript_stats` |
+| `agent_session_started_timestamp_seconds` + ラベル（`repo` / `branch` / `agent_version` / `parent_session_id` 等） | `agent.session.started` | `sessions` |
+| `agent_session_ended_timestamp_seconds` / `end_reason` | `agent.session.ended` | `sessions` |
+| `agent_session_pr_{merged,review_comments,changes_requested}` + `pr_url` | `agent.pr.observed`（snapshot） | `sessions` |
+| `agent_pr_*` 系 | 上記の集約 | `pr_metrics` |
+| `agent_concurrent_sessions_*` | `started` / `ended` の区間重なり | `session_concurrency_*` |
+
+snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セッションで複数行が events に残り、VIEW が `MAX(local_sequence)` で最新を採る。
+
+### セッション単位（`sessions` + `transcript_stats` VIEW）
 
 すべてのセッション単位メトリクスは次の共通ラベル集合を持つ:
 
@@ -249,7 +262,7 @@ A と C はどちらも session-index.jsonl に書き込むが、A は hook が�
 1. SessionStart hook が `internal/hook/sessionstart.go: RunSessionStart` で発火
 2. `time.Now().Format("2006-01-02 15:04:05")` を `timestamp` フィールドに書き込む
 3. 同じ JSON エントリに `session_id` / `cwd` / `parent_session_id` / transcript path / `resolved user_id` / `extractGitInfo` で取得した `repo`・`branch` を詰めて session-index.jsonl に append
-4. sync-db が `sessions.timestamp` カラムに転写、Grafana 出力時に Unix epoch に変換
+4. sync-db が `agent.session.started` イベントの `started_at` 属性として events に追記。`sessions` VIEW が `timestamp` カラムとして surface し、Grafana 出力時に Unix epoch に変換
 
 git 情報の取得は `git rev-parse --is-inside-work-tree` で git 配下を確認 → `git remote get-url origin` → `git branch --show-current` の順で best-effort。git 外で起動した場合は両方空文字列で続行する（hook を失敗させない）。
 
@@ -260,13 +273,13 @@ git 情報の取得は `git rev-parse --is-inside-work-tree` で git 配下を�
 
 ### B. Transcript パース
 
-agent ごとに異なる会話ログ（Claude: `~/.claude/projects/**/<session_id>.jsonl` / Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]`）を sync-db が後追いで読み、トークン・ツール・メッセージ系の集計値を `transcript_stats` テーブルに UPSERT する。
+agent ごとに異なる会話ログ（Claude: `~/.claude/projects/**/<session_id>.jsonl` / Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]`）を sync-db が後追いで読み、トークン・ツール・メッセージ系の集計値を `agent.transcript.scanned` イベントとして `events` テーブルに `INSERT OR IGNORE` 追記する（`transcript_stats` VIEW がそれを latest-wins で surface する）。
 
 | 項目 | 内容 |
 |---|---|
 | 収集主体 | `internal/transcript/{claude,codex}.go` の `ParseClaude` / `ParseCodex` |
 | トリガ | `agent-telemetry sync-db` 実行時（Stop hook → backfill → sync-db のチェーンで発火 / 手動 / cron） |
-| 書き込み先 | SQLite `transcript_stats` テーブル |
+| 書き込み先 | SQLite `events` テーブル（`agent.transcript.scanned`）。`transcript_stats` は events 由来の VIEW |
 | 該当メトリクスのソース | token 系全部（input / output / cache_write / cache_read / reasoning）, `tool_use_total`, `mid_session_msgs`, `ask_user_question`, `is_ghost`, `model` |
 
 #### 代表例: `agent_session_input_tokens_total`（Claude / Codex で集計方式が異なる）

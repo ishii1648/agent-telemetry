@@ -9,19 +9,20 @@ import (
 
 // State holds the cursor for incremental backfill processing.
 //
-// PushedSessionVersions is owned by the serverclient push pipeline (issue 0028)
+// LastFlushedSequence is owned by the serverclient flush pipeline (issue 0038)
 // but lives in the same on-disk file. Keeping it on this struct lets either
-// package round-trip the file without a custom merge: backfill leaves the map
-// untouched and push leaves the cursor fields untouched. Keys are
-// `<coding_agent>:<session_id>` (composite to survive UUID collisions across
-// agents), values are SHA-256 hashes of the canonicalized payload.
+// package round-trip the file without a custom merge: backfill leaves the
+// cursor untouched and flush leaves the backfill fields untouched.
+//
+// The legacy push pipeline's `pushed_session_versions` map (issue 0028) was
+// removed with the /v1/metrics path in 0038; any leftover key in an old
+// state.json is silently ignored on load and dropped on the next save.
 type State struct {
-	LastBackfillOffset    int                  `json:"last_backfill_offset"`
-	LastMetaCheck         time.Time            `json:"last_meta_check"`
-	LastWorkerRun         time.Time            `json:"last_worker_run,omitempty"`
-	MetaURLChecks         map[string]time.Time `json:"meta_url_checks,omitempty"`
-	PushedSessionVersions map[string]string    `json:"pushed_session_versions,omitempty"`
-	LastFlushedSequence   int64                `json:"last_flushed_sequence,omitempty"`
+	LastBackfillOffset  int                  `json:"last_backfill_offset"`
+	LastMetaCheck       time.Time            `json:"last_meta_check"`
+	LastWorkerRun       time.Time            `json:"last_worker_run,omitempty"`
+	MetaURLChecks       map[string]time.Time `json:"meta_url_checks,omitempty"`
+	LastFlushedSequence int64                `json:"last_flushed_sequence,omitempty"`
 }
 
 // StatePath returns ~/.claude/agent-telemetry-state.json (Claude default).

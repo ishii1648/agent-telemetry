@@ -20,11 +20,13 @@ import (
 // a new snapshot row is appended, and the views resolve latest-wins via
 // MAX(local_sequence). See docs/design.md ## event_id の採番.
 //
-// We register it here, alongside the embedded DDL that depends on it, so both
-// the client (sync-db) and server (legacy /v1/metrics → sessions view) binaries
-// — which both import this package — have it available before any connection
-// opens. Read-only consumers (Grafana, raw sqlite3) never fire the triggers,
-// so they don't need the function.
+// We register it here, alongside the embedded DDL that depends on it, so the
+// client (sync-db writes whole sessions / transcript_stats rows through the
+// INSTEAD OF INSERT triggers) has it available before any connection opens.
+// The server no longer fires these triggers — it appends events directly via
+// /v1/logs — but it imports this package for the shared schema DDL. Read-only
+// consumers (Grafana, raw sqlite3) never fire the triggers, so they don't need
+// the function.
 func init() {
 	sqlite.MustRegisterDeterministicScalarFunction("at_event_id", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 		var content string

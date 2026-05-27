@@ -9,6 +9,7 @@ affected_paths:
   - internal/sessionindex/
 supersedes: [0009]
 tags: [server, transport, event-sourcing, otel, append-only]
+closed_at: 2026-05-28
 ---
 
 # metrics 転送を append-only イベント列 + OTel に移行する
@@ -84,3 +85,30 @@ append-only に移すと:
 3. ローカル / サーバ data migration コマンド（`migrate-to-events`）
 4. 旧 `push` 経路の deprecate（1 リリース併走 → 削除）
 5. `docs/metrics.md` の OpenMetrics カタログを events 由来の表現に合わせる
+
+Completed: 2026-05-28
+
+## 解決方法
+
+中核実装（item1-3: events table / OTLP Logs receiver / `/v1/logs` flush / migrate-to-events / 派生 VIEW）は landing 済みだった。本 PR で残りの item4 / item5 を完了し close した。
+
+### item4: 旧 `/v1/metrics` + `INSERT OR REPLACE` upsert 経路の削除
+
+**併走完了の確認** — 旧 push（`/v1/metrics`）と新 flush（`/v1/logs`）+ `migrate-to-events` は **v0.0.10**（2026-05-27 tag）に同梱され、これが両経路を併走させた唯一のリリース（直前の v0.0.9 は flush 未搭載）。「1 リリース併走 → 削除」の併走フェーズは満了しており、本ブランチ（次リリース）での削除は計画通りで安全と判断した。
+
+**削除したもの**:
+- client: `internal/serverclient/push.go` / `payload.go`（+ それぞれの test）、`agent-telemetry push` サブコマンド（`cmd/agent-telemetry/main.go`）、`serverclient.Run` / `Options` / `Result` / `Payload` / `Session` / `TranscriptStat` / `LoadPairs` / `SelectChanged` / `SplitBatches`、`ErrSchemaMismatch`（schema_hash mismatch → exit 2）
+- server: `ServeIngest`（`/v1/metrics` route）、`Payload` / `Response` / `Session` / `TranscriptStat`、`INSERT OR REPLACE INTO sessions/transcript_stats` upsert、`findCollidingSessions` / `recordCollisions` / `collisions.log`
+- state: `backfill.State.PushedSessionVersions`（旧 push の SHA-256 hash 追跡。古い state.json の `pushed_session_versions` は load 時に無視され次回 save で落ちる）
+
+**残したもの**: `sync-db` がローカル DB へ書き込む際に使う `INSTEAD OF INSERT` トリガ（`sessions_insert_events` / `transcript_stats_insert_events`）と `at_event_id()`、`schema_meta` の DDL バージョニング。これらは現行の events 書き込み経路で必要。
+
+### item5: `docs/metrics.md` の events 由来表現への更新
+
+OpenMetrics カタログ導入文を「SoR は append-only な `events`、各メトリクスはイベント属性を派生 VIEW が latest-wins で surface した値と 1:1 対応」に書き換え、メトリクス群 ↔ ソースイベント（`agent.session.started` / `agent.session.ended` / `agent.transcript.scanned` / `agent.pr.observed`）↔ VIEW の対応表を追加。収集パイプライン B 節の「`transcript_stats` テーブルに UPSERT」を「`events` に `INSERT OR IGNORE`、VIEW が surface」へ修正。
+
+### docs 同期 / テスト
+
+`docs/spec.md`・`docs/design.md` の「旧 push 経路からの移行」を「（完了）」に更新し削除内容を明記。`site/content/setup/server/index.md` の cron / launchd を `push` → `flush` に置換、`schema_mismatch` リカバリ手順を events モデルの遡及反映手順へ差し替え。schema.sql のトリガコメント修正に伴い schema hash を再生成。`go test ./...` 全パス（gofmt / go vet clean）。
+
+関連: 0040（pluggable OTLP export）は 0038 に depends_on しており、本 close で実装フェーズの前提が整う。
