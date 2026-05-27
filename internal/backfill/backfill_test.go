@@ -298,6 +298,42 @@ func TestRunURLBackfill_SkipsPinnedSession(t *testing.T) {
 	}
 }
 
+// TestGCOnly_MarksStaleUncheckedOnly verifies the migration-drain path
+// (`backfill --gc`): PR-less, unchecked sessions older than the 24h horizon
+// are markChecked in one pass, while sessions inside the horizon are left for
+// the next worker tick (delayed-PR-creation rescue window). The horizon uses
+// COALESCE(ended_at, timestamp), so an empty ended_at still ages out via
+// timestamp. No gh call fires.
+func TestGCOnly_MarksStaleUncheckedOnly(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-36 * time.Hour).Format("2006-01-02 15:04:05")
+	recent := time.Now().Add(-2 * time.Hour).Format("2006-01-02 15:04:05")
+	indexPath := writeTestIndex(t, dir, []string{
+		`{"timestamp":"` + old + `","session_id":"old1","cwd":"/nonexistent/x","repo":"u/r","branch":"feat-old","pr_urls":[],"transcript":"","parent_session_id":""}`,
+		`{"timestamp":"` + recent + `","session_id":"new1","cwd":"/nonexistent/y","repo":"u/r","branch":"feat-new","pr_urls":[],"transcript":"","parent_session_id":""}`,
+	})
+	statePath := filepath.Join(dir, "state.json")
+
+	if err := runForAgent(nil, indexPath, statePath, Options{GCOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, sessions, err := readBackForTest(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := map[string]bool{}
+	for _, s := range sessions {
+		checked[s.SessionID] = s.BackfillChecked
+	}
+	if !checked["old1"] {
+		t.Error("stale session (36h) should be markChecked by --gc")
+	}
+	if checked["new1"] {
+		t.Error("recent session (2h) must NOT be markChecked (still inside horizon)")
+	}
+}
+
 func TestParsePRList_ChangesRequested(t *testing.T) {
 	prs := parsePRList([]byte(`[
 		{

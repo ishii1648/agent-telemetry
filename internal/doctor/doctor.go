@@ -13,9 +13,16 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 	"github.com/ishii1648/agent-telemetry/internal/configpath"
 	"github.com/ishii1648/agent-telemetry/internal/legacy"
+	"github.com/ishii1648/agent-telemetry/internal/sessionindex"
 	"github.com/ishii1648/agent-telemetry/internal/setup"
 	"github.com/ishii1648/agent-telemetry/internal/userid"
 )
+
+// backlogDrainThreshold is the number of PR-less, unchecked sessions above
+// which doctor nudges the user to run the one-shot `backfill --gc` migration
+// drain. Below it, the worker's per-run gh cap retires the backlog gradually
+// without help.
+const backlogDrainThreshold = 200
 
 // Run executes all checks against the real filesystem and writes a report
 // to stdout. Returns nil even when warnings/failures are found — the exit
@@ -44,6 +51,9 @@ func RunWith(w io.Writer, env Env) (Result, error) {
 
 		ar.Hooks = checkHooks(env, a)
 		writeHooks(w, a, env, ar.Hooks)
+
+		ar.Backlog = checkBacklog(env, a)
+		writeBacklog(w, a, ar.Backlog)
 
 		r.AgentReports = append(r.AgentReports, ar)
 	}
@@ -76,6 +86,11 @@ type Env struct {
 	// UserResolver returns the resolved user_id and the source tier that
 	// produced it. When nil, defaults to userid.Resolve.
 	UserResolver func() (string, userid.Source)
+
+	// BacklogCounter returns the number of PR-less, unchecked sessions in an
+	// agent's session-index (backfill candidates). When nil, defaults to
+	// countBacklog, which reads the index from disk.
+	BacklogCounter func(*agent.Agent) int
 
 	// ConfigPathStatus returns the migration state of the TOML config
 	// path. When nil, defaults to configpath.Status.
@@ -150,6 +165,7 @@ type AgentReport struct {
 	Agent   *agent.Agent
 	DataDir CheckResult
 	Hooks   []HookCheck
+	Backlog int
 }
 
 // CheckResult is the result of a single binary/dir check.
@@ -207,6 +223,32 @@ func checkBinary(env Env) CheckResult {
 		return CheckResult{OK: false, Detail: fmt.Sprintf("not found in PATH (%v)", err)}
 	}
 	return CheckResult{OK: true, Detail: path}
+}
+
+// checkBacklog counts an agent's backfill candidates (PR-less, unchecked,
+// unpinned sessions). A large count means the worker's per-run gh cap will
+// take many ticks to retire the backlog, so doctor suggests the one-shot
+// `backfill --gc` drain.
+func checkBacklog(env Env, a *agent.Agent) int {
+	counter := env.BacklogCounter
+	if counter == nil {
+		counter = countBacklog
+	}
+	return counter(a)
+}
+
+func countBacklog(a *agent.Agent) int {
+	_, sessions, err := sessionindex.ReadAll(a.SessionIndexPath())
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, s := range sessions {
+		if !s.PRPinned && len(s.PRURLs) == 0 && !s.BackfillChecked {
+			n++
+		}
+	}
+	return n
 }
 
 func checkDataDir(a *agent.Agent) CheckResult {
@@ -402,6 +444,14 @@ func writeHooks(w io.Writer, a *agent.Agent, env Env, checks []HookCheck) {
 	if !allOK {
 		fmt.Fprintln(w, "  → register manually or via dotfiles (see https://ishii1648.github.io/agent-telemetry/setup/install/)")
 	}
+}
+
+func writeBacklog(w io.Writer, a *agent.Agent, n int) {
+	if n < backlogDrainThreshold {
+		return
+	}
+	fmt.Fprintf(w, "%s [%s] backfill backlog: %d PR-less unchecked sessions\n", markWarn, a.Name, n)
+	fmt.Fprintln(w, "  → run `agent-telemetry backfill --gc` once to retire stale (>24h) entries in a single pass and cut gh rate-limit pressure")
 }
 
 func agentSettingsPath(a *agent.Agent) string {
