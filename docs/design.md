@@ -223,7 +223,7 @@ GitHub の secondary rate limit は総量でなく **バースト / 同時実行
 
 ### 移行 drain `backfill --gc`
 
-deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。
+deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。backlog のカウント（`countBacklog`）は backfill candidate と同じフィルタを使い、`is_default_branch` のセッションを除外する——第1層で構造除外されるデフォルトブランチは `--gc` でも markChecked されないため、数えると解消不能な `--gc` 案内になってしまう。
 
 ### PR タイトルの取得
 
