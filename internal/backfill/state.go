@@ -16,10 +16,12 @@ import (
 // `<coding_agent>:<session_id>` (composite to survive UUID collisions across
 // agents), values are SHA-256 hashes of the canonicalized payload.
 type State struct {
-	LastBackfillOffset    int               `json:"last_backfill_offset"`
-	LastMetaCheck         time.Time         `json:"last_meta_check"`
-	PushedSessionVersions map[string]string `json:"pushed_session_versions,omitempty"`
-	LastFlushedSequence   int64             `json:"last_flushed_sequence,omitempty"`
+	LastBackfillOffset    int                  `json:"last_backfill_offset"`
+	LastMetaCheck         time.Time            `json:"last_meta_check"`
+	LastWorkerRun         time.Time            `json:"last_worker_run,omitempty"`
+	MetaURLChecks         map[string]time.Time `json:"meta_url_checks,omitempty"`
+	PushedSessionVersions map[string]string    `json:"pushed_session_versions,omitempty"`
+	LastFlushedSequence   int64                `json:"last_flushed_sequence,omitempty"`
 }
 
 // StatePath returns ~/.claude/agent-telemetry-state.json (Claude default).

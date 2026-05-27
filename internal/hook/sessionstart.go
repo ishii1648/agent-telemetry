@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ishii1648/agent-telemetry/internal/agent"
+	"github.com/ishii1648/agent-telemetry/internal/sessionindex"
 	"github.com/ishii1648/agent-telemetry/internal/userid"
 )
 
@@ -55,7 +56,7 @@ func RunSessionStart(input *HookInput, a *agent.Agent) error {
 	if err := os.MkdirAll(a.DataDir, 0755); err != nil {
 		return err
 	}
-	return appendFile(a.SessionIndexPath(), string(data)+"\n")
+	return sessionindex.AppendRawLine(a.SessionIndexPath(), data)
 }
 
 // extractGitInfo gets repo and branch from a directory's git context.

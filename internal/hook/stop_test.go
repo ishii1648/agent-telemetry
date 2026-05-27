@@ -9,211 +9,93 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/sessionindex"
 )
 
-// withPRLookup swaps the package-level prLookup with a fake for the
-// duration of a test. Restores the original on cleanup so tests stay
-// isolated.
-func withPRLookup(t *testing.T, fake prLookupFn) {
+// withSpawnStub swaps the package-level spawnBackfillWorker with a fake for
+// the duration of a test so RunStop never exec-s the real binary.
+func withSpawnStub(t *testing.T, fn func(agentName, sessionID string) error) {
 	t.Helper()
-	orig := prLookup
-	prLookup = fake
-	t.Cleanup(func() { prLookup = orig })
+	orig := spawnBackfillWorker
+	spawnBackfillWorker = fn
+	t.Cleanup(func() { spawnBackfillWorker = orig })
 }
 
-func TestPinPRForSession_BindsResolvedPR(t *testing.T) {
+func TestRunStop_SpawnsWorkerWithSession(t *testing.T) {
+	var gotAgent, gotSession string
+	called := 0
+	withSpawnStub(t, func(a, s string) error {
+		called++
+		gotAgent, gotSession = a, s
+		return nil
+	})
+
+	a := agent.Claude()
+	if err := RunStop(&HookInput{SessionID: "s1"}, a); err != nil {
+		t.Fatalf("RunStop: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("spawn called %d times, want 1", called)
+	}
+	if gotAgent != a.Name {
+		t.Errorf("agent forwarded = %q, want %q", gotAgent, a.Name)
+	}
+	if gotSession != "s1" {
+		t.Errorf("session forwarded = %q, want s1", gotSession)
+	}
+}
+
+func TestRunStop_SpawnErrorPropagates(t *testing.T) {
+	withSpawnStub(t, func(_, _ string) error { return errors.New("exec failed") })
+	if err := RunStop(&HookInput{SessionID: "s1"}, agent.Claude()); err == nil {
+		t.Fatal("expected spawn error to propagate")
+	}
+}
+
+func TestRunStop_CodexOverwritesEndedAt(t *testing.T) {
+	// Codex has no SessionEnd, so the Stop hook records ended_at/end_reason
+	// synchronously (the only synchronous write left in the hot path).
 	dir := t.TempDir()
-	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	a := &agent.Agent{Name: agent.NameCodex, DataDir: dir}
 	idx := a.SessionIndexPath()
-
-	cwd := t.TempDir() // exists, satisfies isExistingDir
-
 	if err := os.WriteFile(idx, []byte(
-		`{"coding_agent":"claude","session_id":"s1","cwd":"`+cwd+`","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
+		`{"coding_agent":"codex","session_id":"s1","cwd":"/tmp","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
 	), 0644); err != nil {
 		t.Fatal(err)
 	}
+	withSpawnStub(t, func(_, _ string) error { return nil })
 
-	withPRLookup(t, func(gotCwd, gotBranch string) (*prViewJSON, error) {
-		if gotCwd != cwd {
-			t.Errorf("cwd passed to lookup = %q, want %q", gotCwd, cwd)
-		}
-		if gotBranch != "feat" {
-			t.Errorf("branch passed to lookup = %q, want feat", gotBranch)
-		}
-		return &prViewJSON{
-			URL:      "https://github.com/u/r/pull/42",
-			Title:    "feat: pin PR",
-			State:    "OPEN",
-			Comments: []any{struct{}{}, struct{}{}},
-		}, nil
-	})
-
-	if err := pinPRForSession(a, &HookInput{SessionID: "s1"}); err != nil {
-		t.Fatalf("pinPRForSession: %v", err)
+	if err := RunStop(&HookInput{SessionID: "s1"}, a); err != nil {
+		t.Fatalf("RunStop: %v", err)
 	}
 
 	_, sessions, err := sessionindex.ReadAll(idx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sessions[0].PRPinned {
-		t.Fatal("pr_pinned should be true after pin")
+	if sessions[0].EndedAt == "" {
+		t.Fatal("ended_at should be set for Codex Stop")
 	}
-	if len(sessions[0].PRURLs) != 1 || sessions[0].PRURLs[0] != "https://github.com/u/r/pull/42" {
-		t.Fatalf("pr_urls = %v, want [pull/42]", sessions[0].PRURLs)
-	}
-	if sessions[0].PRTitle != "feat: pin PR" {
-		t.Errorf("pr_title = %q, want %q", sessions[0].PRTitle, "feat: pin PR")
-	}
-	if sessions[0].ReviewComments != 2 {
-		t.Errorf("review_comments = %d, want 2", sessions[0].ReviewComments)
+	if sessions[0].EndReason != "stop" {
+		t.Errorf("end_reason = %q, want stop", sessions[0].EndReason)
 	}
 }
 
-func TestPinPRForSession_NoPRFound(t *testing.T) {
-	// PR not yet created — pinPRForSession must leave the session alone
-	// (pr_pinned stays false, pr_urls untouched) so backfill can pick it
-	// up later.
+func TestRunStop_ClaudeDoesNotWriteEndedAt(t *testing.T) {
+	// Claude has a dedicated SessionEnd hook; Stop must not touch ended_at.
 	dir := t.TempDir()
 	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
 	idx := a.SessionIndexPath()
-
-	cwd := t.TempDir()
 	if err := os.WriteFile(idx, []byte(
-		`{"coding_agent":"claude","session_id":"s1","cwd":"`+cwd+`","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
+		`{"coding_agent":"claude","session_id":"s1","cwd":"/tmp","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
 	), 0644); err != nil {
 		t.Fatal(err)
 	}
+	withSpawnStub(t, func(_, _ string) error { return nil })
 
-	withPRLookup(t, func(_, _ string) (*prViewJSON, error) { return nil, nil })
-
-	if err := pinPRForSession(a, &HookInput{SessionID: "s1"}); err != nil {
-		t.Fatalf("pinPRForSession: %v", err)
-	}
-
-	_, sessions, err := sessionindex.ReadAll(idx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sessions[0].PRPinned {
-		t.Fatal("pr_pinned must remain false when no PR is found")
-	}
-	if len(sessions[0].PRURLs) != 0 {
-		t.Fatalf("pr_urls altered: %v", sessions[0].PRURLs)
-	}
-}
-
-func TestPinPRForSession_LookupErrorPropagates(t *testing.T) {
-	dir := t.TempDir()
-	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
-	idx := a.SessionIndexPath()
-
-	cwd := t.TempDir()
-	if err := os.WriteFile(idx, []byte(
-		`{"coding_agent":"claude","session_id":"s1","cwd":"`+cwd+`","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
-	), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	withPRLookup(t, func(_, _ string) (*prViewJSON, error) {
-		return nil, errors.New("gh: not authenticated")
-	})
-
-	err := pinPRForSession(a, &HookInput{SessionID: "s1"})
-	if err == nil {
-		t.Fatal("expected error from lookup to propagate")
-	}
-}
-
-func TestPinPRForSession_MissingCWDIsNoOp(t *testing.T) {
-	// cwd has been deleted (worktree removed) — we cannot safely run gh
-	// against the wrong directory, so skip without erroring.
-	dir := t.TempDir()
-	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
-	idx := a.SessionIndexPath()
-
-	if err := os.WriteFile(idx, []byte(
-		`{"coding_agent":"claude","session_id":"s1","cwd":"/this/path/should/not/exist/abc123","repo":"u/r","branch":"feat","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
-	), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	called := false
-	withPRLookup(t, func(_, _ string) (*prViewJSON, error) {
-		called = true
-		return nil, nil
-	})
-
-	if err := pinPRForSession(a, &HookInput{SessionID: "s1"}); err != nil {
-		t.Fatalf("pinPRForSession: %v", err)
-	}
-	if called {
-		t.Fatal("prLookup must not be called when cwd is missing")
+	if err := RunStop(&HookInput{SessionID: "s1"}, a); err != nil {
+		t.Fatalf("RunStop: %v", err)
 	}
 
 	_, sessions, _ := sessionindex.ReadAll(idx)
-	if sessions[0].PRPinned {
-		t.Fatal("pr_pinned must remain false")
-	}
-}
-
-func TestPinPRForSession_AlreadyPinnedIsNoOp(t *testing.T) {
-	dir := t.TempDir()
-	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
-	idx := a.SessionIndexPath()
-
-	cwd := t.TempDir()
-	if err := os.WriteFile(idx, []byte(
-		`{"coding_agent":"claude","session_id":"s1","cwd":"`+cwd+`","repo":"u/r","branch":"feat","pr_urls":["https://github.com/u/r/pull/42"],"pr_pinned":true,"transcript":"","parent_session_id":""}`+"\n",
-	), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	called := false
-	withPRLookup(t, func(_, _ string) (*prViewJSON, error) {
-		called = true
-		return nil, nil
-	})
-	if err := pinPRForSession(a, &HookInput{SessionID: "s1"}); err != nil {
-		t.Fatal(err)
-	}
-	if called {
-		t.Fatal("prLookup must not run for already-pinned sessions")
-	}
-}
-
-func TestPinPRForSession_EmptyBranchIsNoOp(t *testing.T) {
-	// Sessions started outside a git repo have empty branch — pinning
-	// would be meaningless and `gh pr list --head ''` is undefined.
-	dir := t.TempDir()
-	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
-	idx := a.SessionIndexPath()
-
-	cwd := t.TempDir()
-	if err := os.WriteFile(idx, []byte(
-		`{"coding_agent":"claude","session_id":"s1","cwd":"`+cwd+`","repo":"","branch":"","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
-	), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	called := false
-	withPRLookup(t, func(_, _ string) (*prViewJSON, error) {
-		called = true
-		return nil, nil
-	})
-	if err := pinPRForSession(a, &HookInput{SessionID: "s1"}); err != nil {
-		t.Fatal(err)
-	}
-	if called {
-		t.Fatal("prLookup must not run when branch is empty")
-	}
-}
-
-func TestPinPRForSession_NoIndexFileIsNoOp(t *testing.T) {
-	// Fresh install with no session-index yet must not error.
-	dir := t.TempDir()
-	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
-
-	if err := pinPRForSession(a, &HookInput{SessionID: "s1"}); err != nil {
-		t.Fatalf("expected no error for missing index, got: %v", err)
+	if sessions[0].EndedAt != "" {
+		t.Fatal("Claude Stop must not write ended_at (SessionEnd owns that)")
 	}
 }

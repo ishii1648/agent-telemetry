@@ -119,22 +119,27 @@ hook はすべて `agent-telemetry hook <event> [--agent <claude|codex>]` の Go
 - awk による複雑なパース（旧 `todo-cleanup-check.sh` の 80 行、現在は `todo-cleanup` 系統ごと廃止済み）を Go テストでカバーできる
 - Go バイナリの起動コスト（〜10 ms）は hook の発火間隔に対して無視できる
 
-### Stop hook のブロッキング実行
+### Stop hook の非同期 worker 起動
 
-`Stop` hook は `agent-telemetry backfill && agent-telemetry sync-db` を同期実行する。fire-and-forget や非同期化はしない。
+`Stop` hook の同期パスは **ローカル書き込みのみ**（数 ms で return）で、`gh` を 1 回も呼ばない。GitHub に触れる処理（PR の pin / URL 補完 / マージ判定）と `sync-db` の SQLite 再構築はすべて detached worker に退避する。Stop は `agent-telemetry backfill --detach --agent <a> [--pin-session=<id>]` を fire-and-forget で spawn して即座に return し、worker の完了を待たない。
 
-ブロッキングを許容する根拠:
+同期パスに残すのはローカル書き込みだけ:
 
-- 発火タイミングがセッション応答完了直後であり、ユーザーの次操作までの体感影響が小さい
-- backfill は cursor 方式で増分処理する（後述）
-- マージ判定の Phase 2 は `last_meta_check` から一定時間（1 時間）経過した場合のみ走る
-- 各グループの `gh pr` 呼び出しは goroutine で 8 並列、1 件あたり 8 秒タイムアウト
+- Codex は `SessionEnd` が無く Stop が de-facto SessionEnd なので、`ended_at` / `end_reason` を毎 Stop で上書きする（`internal/sessionindex.UpdateEnd`）
+- それ以外（pin / backfill / sync-db）はすべて worker 側
 
-過去には fire-and-forget や launchd cron も試みたが、launchd は Claude Code 外の唯一の手作業になり UX が悪化していた。詳細は [issues/closed/0020-design-backfill-evolution-to-stop-hook.md](../issues/closed/0020-design-backfill-evolution-to-stop-hook.md) を参照。
+spawn の要点:
 
-### PR の確定は Stop hook で early binding
+- worker バイナリは `os.Executable()` で解決する（PATH 上の `agent-telemetry` に依存しない。絶対パスで hook 登録されていても動く）。stdio は `/dev/null` に向けて hook 自身の出力を汚さない
+- `backfill --detach` 入口が `setsid` で実 worker (`backfill --worker`) を再 spawn するため、hook プロセスが終了しても worker は生き残る
 
-PR と session の紐づけは `Stop` hook 時点で `gh pr list --head <branch>` を 1 回叩いて確定する。1 件取れた場合は `pr_urls` を `[<url>]` で置き換え、`pr_pinned: true` を立てる。pinned 状態に入ったセッションは以降 PostToolUse / `update` / `backfill` の URL 追記をすべて拒否する。late binding（backfill 経由）は **PR 未作成のままセッションが終わったケースのフォールバック** として残す。
+このモデルにより Claude / Codex のランタイムが収束する（Codex に `SessionEnd` が無い制約が worker トリガを Stop に一本化することで設計上消える）。詳細は [issues/closed/0039-bug-stop-hook-backfill-rate-limit.md](../issues/closed/0039-bug-stop-hook-backfill-rate-limit.md)。過去の fire-and-forget / launchd cron の経緯は [issues/closed/0020-design-backfill-evolution-to-stop-hook.md](../issues/closed/0020-design-backfill-evolution-to-stop-hook.md) を参照。
+
+### PR の確定は worker で early binding
+
+PR と session の紐づけは worker 内の `runPinBackfill` が `gh pr list --head <branch>` を 1 回叩いて確定する（Stop が `--pin-session=<id>` で対象セッションを渡す）。1 件取れた場合は `pr_urls` を `[<url>]` で置き換え、`pr_pinned: true` を立てる。pinned 状態に入ったセッションは以降 PostToolUse / `update` / `backfill` の URL 追記をすべて拒否する。late binding（後続 tick の Phase 1 経由）は **PR 未作成のままセッションが終わったケースのフォールバック** として残す。
+
+worker 起動が Stop に対して非同期になったため early binding はターン直後ではなく数 ms〜次の worker run のタイミングで効くが、ダッシュボードはターン中に見るものではないので即時性は不要（pin の同期実行は正当化されない）。
 
 このルールが解決する誤接続:
 
@@ -143,16 +148,25 @@ PR と session の紐づけは `Stop` hook 時点で `gh pr list --head <branch>
 
 実装の要点:
 
-- pin 経路は `internal/sessionindex.PinPR` に集約。`pr_urls` の追加 (`Update` / `UpdateByBranch`) は内部で `PRPinned == true` をスキップする。
-- Stop hook の lookup は `gh pr list --head <branch> --author @me --state all --limit 1` を `cwd` で実行する。これは backfill の URL 解決経路と同じ呼び出しなので、pin した URL と backfill が同 tick で解決した場合の URL は一致する。
-- `cwd` 不在 / git リポジトリでない / branch 空 / `gh` がエラーの場合は best-effort で skip し、Stop の hot path を落とさない。fallback として backfill が次 tick で再試行する。
+- pin 経路は `internal/sessionindex.PinPR`（worker のバッチ集約経由で `applyPinPR`）に集約。`pr_urls` の追加 (`Update` / `UpdateByBranch`) は内部で `PRPinned == true` をスキップする。
+- pin の lookup は Phase 1 と同じ `gh pr list --head <branch> --author @me --state all --limit 1` を `cwd` で実行する。よって pin した URL と Phase 1 が同 run で解決する URL は一致する。
+- `cwd` 不在 / git リポジトリでない / branch 空 / `gh` がエラーの場合は best-effort で skip し、worker を落とさない。fallback として Phase 1 が次 run で再試行する。
 - `Phase 2` の meta 取得は pinned セッションも対象に含める（`is_merged` / `review_comments` の更新は継続したい）。pin で抑止するのは **URL の追記だけ**。
 
 ### `session-index.jsonl` の追記モデル
 
 `session-index.jsonl` は append-only に近い扱いで、SessionStart で新規 1 行を追加し、SessionEnd / backfill / `update` ではマッチする `session_id` の行を読み直して書き戻す。
 
-書き戻しは現状 in-place で行っている。書き込み中断時の truncate 耐性を上げる atomic 化（一時ファイル + rename）は今後の課題として残しており、「既知の制約」節に再掲する。
+#### 並行書き込みと flock
+
+backfill を非同期 worker に出すと、複数プロセス（並列 worktree の Stop spawn / SessionStart の append / `update`）が同時に index を書き換えうる。`WriteAll` は tmp + `os.Rename` でアトミックだが、それだけでは **ロスト更新**（プロセス 1 が ReadAll → 2 が ReadAll → 1 が WriteAll → 2 が WriteAll で 1 の変更が消える）を防げない。そこで `<index>.lock` を使った per-file flock を導入し、待ちを最小化する方式を採る（`internal/sessionindex/lock.go`）:
+
+- **ロックは「書き込み」だけ。`gh` は絶対にロック外**: worker は `gh` の結果をメモリ（`sessionindex.Batch`）に集約し、最後に flock を取って **最新 index を re-read → 差分を merge/apply → 1 回だけ WriteAll** する。ロック保持は数 ms（秒オーダーの `gh` とは無関係）。
+- **worker の重い書き換えは try-lock-skip**（`ApplyBatch` = `TryWithLockedIndex`）。取れなければ待たず譲り、候補は state に残って次の保持者が処理する。「lock して待つ」ではなく「lock して譲る」ので並列実行待ちが出ない。
+- **1 run = 1 WriteAll**: item ごとの ReadAll+WriteAll を廃し、Phase 1 / Phase 2 / pin / ended_at の全変更を Batch に集約してから一括適用する。
+- **SessionStart の append も同じ flock を共有**（`AppendRawLine`）。`O_APPEND` は原子的だが rewrite の ReadAll→WriteAll 中に挟まると消えるため、同一 flock で整合させる。待ちは「進行中 rewrite 1 回（数 ms）」が最大。
+
+global single-flight ロック（`~/.agent-telemetry/backfill.lock`）は別物で、全 agent 共有の `gh` バースト制御（後述「backfill のレート制御」）。per-file flock は書き込み整合性、global lock は `gh` 同時実行抑制と、スコープが異なる。
 
 ---
 
@@ -191,11 +205,25 @@ PR と session の紐づけは `Stop` hook 時点で `gh pr list --head <branch>
 | フェーズ | 対象 | 実行条件 |
 |---|---|---|
 | Phase 1: URL 補完 | cursor 以降の新規エントリ + cursor 以下で `pr_urls` 空かつ `backfill_checked=0` のリトライ待ちエントリ | 毎回 |
-| Phase 2: マージ判定 | 既存 PR の `is_merged` と `review_comments` の再チェック | `last_meta_check` から一定時間経過時のみ |
+| Phase 2: マージ判定 | `pr_urls` を持ち **未マージ**（`is_merged != true`）の PR の `is_merged` / `review_comments` / `changes_requested` の再チェック | `last_meta_check` から一定時間経過時のみ |
 
 `--recheck` 指定時は cursor を無視してフルスキャンする。
 
 cursor が古くても結果に影響はない。`backfill_checked` フラグが API 呼び出しの永続スキップを担うため、cursor は単なる効率化のヒントとして扱う。Stop hook 起動時にまだ PR が作られていなかったセッション（リトライ待ち）は cursor の進行とは独立して毎回再評価する — そうしないと PR が後から作られたときに永久に取りこぼす。
+
+### backfill のレート制御（single-flight / cooldown / cap）
+
+GitHub の secondary rate limit は総量でなく **バースト / 同時実行** で発火する。Stop が高頻度イベントなので、worker 1 起動あたりの `gh` 発行を小さく保ち、かつ起動自体を間引く:
+
+- **global single-flight**（`~/.agent-telemetry/backfill.lock`、try-lock-skip）: 全 agent 共有の 1 個。取れなければ worker は即 exit。並列 worktree / Claude と Codex の worker が同時に `gh` を撃つのを防ぐ（secondary rate limit はアカウント共有なので agent 横断にする）。flock はプロセス死で自動解放されるので stale にならない。
+- **worker cooldown**（`last_worker_run` から `WorkerCooldown`）: single-flight は同時実行制御であって頻度制御ではない。Stop が連続しても worker run 自体を cooldown で間引く。cooldown skip でも Stop 同期パスは spawn 後に待たない。
+- **gh cap**（`DefaultGHCap`）: Phase 1 / Phase 2 双方に効く 1 起動あたりの上限。非定常（backlog 消化直後・並列 worktree 大量流入直後）でも 1 Stop の `gh` 呼び出しが上限を超えない。
+  - **Phase 1**: PR が付いた可能性の高い順＝ **newest-first** で cap 件。あふれた分は次 run に回る。
+  - **Phase 2**: per-URL の `last_meta_check`（state の `meta_url_checks`）で **oldest-checked-first** に cap 件。単純 cap で先頭 N 件だけ更新され続ける starvation を避ける。
+
+### 移行 drain `backfill --gc`
+
+deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。
 
 ### PR タイトルの取得
 
@@ -213,10 +241,10 @@ PR が存在しないブランチ（`main` / `master` 等）は初回チェッ�
 
 ### 並列化
 
-`(repo, branch)` グループの `gh pr list` 呼び出しは goroutine で 8 並列実行する。
+1 起動内では `(repo, branch)` グループの `gh pr list` 呼び出しを goroutine で 8 並列実行する。プロセス内の並列度であって、プロセス間のバースト制御は前述の global single-flight + cooldown + cap が担う。
 
-- GitHub API の認証済みレート制限（5,000 req/h）に対し、毎時 1 回実行 × 並列 8 でも余裕がある
-- 書き込み（`session-index.jsonl` への反映）は逐次にして競合を回避する
+- primary な認証済みレート制限（5,000 req/h）に対し総量は誤差。問題は secondary rate limit（バースト）であり、cap で 1 起動の件数を、single-flight で同時起動を抑える
+- 書き込みは `gh` 完了後にメモリ集約した Batch を 1 回の WriteAll で反映する（前述「並行書き込みと flock」）
 
 ### `pr_urls` の採用ルール
 
@@ -224,7 +252,7 @@ PR が存在しないブランチ（`main` / `master` 等）は初回チェッ�
 
 `update` / `backfill` が PR URL を追記する順序が結果に影響するため、辞書順ソートはしない。
 
-通常の運用では Stop hook の pin により `pr_urls` は要素 1 件で確定する（前述「PR の確定は Stop hook で early binding」）。late binding（pin 失敗 → backfill 経由）でも要素 1 件になる。複数要素になるのは、pin 前に PostToolUse の正規表現で複数 URL がスクレイプされた極端なケースに限られ、pin 後は `[<確定 URL>]` で置き換えられるため一過性で残らない。
+通常の運用では worker の pin により `pr_urls` は要素 1 件で確定する（前述「PR の確定は worker で early binding」）。late binding（pin 失敗 → Phase 1 経由）でも要素 1 件になる。複数要素になるのは、pin 前に PostToolUse の正規表現で複数 URL がスクレイプされた極端なケースに限られ、pin 後は `[<確定 URL>]` で置き換えられるため一過性で残らない。
 
 ### transcript パース
 
@@ -469,7 +497,7 @@ Content-Encoding: gzip   (optional)
 
 Stop hook 経路には載せない方針は維持する。理由は旧設計と同じ:
 
-- Stop hook は既に `backfill` + `sync-db` を同期実行しており、ネット I/O を追加すると latency 影響が拡大する
+- Stop hook は backfill / sync-db を detached worker に退避して同期パスを数 ms に保っている。送信を hook 経路に戻すと、worker 化で得た非ブロッキング性を再び失う
 - 送信失敗が Stop hook の挙動に直接影響すると、デバッグ困難な fail mode を生む
 
 ユーザは以下のいずれかで起動する:
@@ -569,9 +597,9 @@ events 単位なので旧設計（集計値のみ）より体積は数倍だが�
 
 ## 既知の制約
 
-- `Stop` hook はブロッキング実行のため、極端に遅い `gh pr list` を含む場合は応答完了の直後に最大数秒の待機が発生する
+- `Stop` hook 同期パスは detached worker を spawn して即 return する（`gh` ゼロ）。pin / backfill / sync-db の遅延は worker 側に隠れ、ユーザの応答サイクルをブロックしない
 - `pr_urls` の順序保持と「最後の 1 件」採用の整合性は早期 pin（`pr_pinned`）で根本対処済みだが、未 pin セッションへの追記順序は検証ケースが限定的なため、引き続きデータの偏りがあれば再評価する
-- `session-index.jsonl` の書き戻しは atomic 化未対応。書き込み中の停電やプロセスキルで truncate される可能性が残る
+- `session-index.jsonl` の書き戻しは tmp + `os.Rename` でアトミックかつ per-file flock で並行書き込みのロスト更新を防ぐ（前述「並行書き込みと flock」）。global single-flight は `gh` バーストのみを抑え、書き込み整合性とはスコープが別
 - transcript のパス取得失敗時は当該セッションの `transcript_stats` が空になるが、`sessions` 行は残る
 - Codex の SessionEnd 不在を Stop hook で代替するため、Stop hook を経由せずプロセスが kill された場合は最後の Stop 発火時刻が `ended_at` になる（rollout JSONL 最終 event での補正は backfill 経由）
 - Codex の `ask_user_question` 相当指標が無いため、agent を跨いだ「仕様不明瞭さ」比較はできない

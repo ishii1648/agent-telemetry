@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"syscall"
 
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 	"github.com/ishii1648/agent-telemetry/internal/backfill"
@@ -68,7 +70,8 @@ func printUsage(w io.Writer) {
 Commands:
   setup [--agent <claude|codex>]         セットアップ案内を表示（hook 登録は dotfiles または手動）
   doctor                                 検出された agent ごとに binary / data dir / hook 登録を検証（自動修復はしない）
-  backfill [--recheck] [--agent <a>]     検出された agent すべての pr_urls / is_merged / review_comments を補完
+  backfill [--recheck] [--gc] [--detach] [--agent <a>]
+                                         検出された agent すべての pr_urls / is_merged / review_comments を補完
   sync-db [--agent <a>]                  検出された agent すべての JSONL/transcript → SQLite 変換（毎回フル再構築）
 	  push [--since-last|--full] [--dry-run] [--agent <a>]
 	                                         sync-db の集計値（sessions / transcript_stats）を [server] へ送信（オプトイン）
@@ -81,7 +84,7 @@ Commands:
   hook <event> [--agent <a>]             hook サブコマンド（settings.json / config.toml / hooks.json から呼ばれる）
     session-start                        セッションメタデータを記録
     session-end                          セッション終了時刻を記録（Claude のみ）
-    stop                                 backfill + sync-db を実行
+    stop                                 ended_at を記録し backfill worker を非同期起動
     post-tool-use                        tool_response から PR URL を抽出（Codex 用）
     pre-tool-use                         per-session tool 注釈を記録（Claude のみ）
   upgrade [--check]                      GitHub Releases から最新版を取得して自身を置き換える（--check は確認のみ）
@@ -170,21 +173,76 @@ func runUpdate(args []string) {
 func runBackfill(args []string) {
 	migrateLegacy()
 	agentName, args := extractAgentFlag(args)
-	recheck := false
+	opts := backfill.Options{}
 	for _, a := range args {
-		if a == "--recheck" {
-			recheck = true
+		switch {
+		case a == "--recheck":
+			opts.Recheck = true
+		case a == "--detach":
+			opts.DetachedRun = true
+		case a == "--gc":
+			opts.GCOnly = true
+		case len(a) > len("--pin-session=") && a[:len("--pin-session=")] == "--pin-session=":
+			opts.PinSessionID = a[len("--pin-session="):]
 		}
 	}
+	if opts.DetachedRun {
+		if err := spawnDetachedBackfill(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "backfill detach: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	opts.DetachedRun = hasArg(args, "--worker")
 	agents, err := agent.ResolveOrDetect(agentName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "backfill: %v\n", err)
 		os.Exit(1)
 	}
-	if err := backfill.RunForAgents(agents, recheck); err != nil {
+	if err := backfill.RunForAgentsWithOptions(agents, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "backfill error: %v\n", err)
 		os.Exit(1)
 	}
+	if opts.DetachedRun {
+		if err := syncdb.RunForAgents(agents, syncdb.DBPath()); err != nil {
+			fmt.Fprintf(os.Stderr, "sync-db error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func spawnDetachedBackfill(args []string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	childArgs := []string{"backfill", "--worker"}
+	for _, a := range args {
+		if a == "--detach" {
+			continue
+		}
+		childArgs = append(childArgs, a)
+	}
+	cmd := exec.Command(exe, childArgs...)
+	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer devnull.Close()
+	cmd.Stdin = devnull
+	cmd.Stdout = devnull
+	cmd.Stderr = devnull
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd.Start()
 }
 
 func runSyncDB(args []string) {

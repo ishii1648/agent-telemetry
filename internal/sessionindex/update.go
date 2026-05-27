@@ -2,7 +2,6 @@ package sessionindex
 
 import (
 	"encoding/json"
-	"os"
 	"sort"
 )
 
@@ -40,41 +39,28 @@ func Update(indexPath string, sessionID string, newURLs []string) (bool, error) 
 	if sessionID == "" || len(newURLs) == 0 {
 		return false, nil
 	}
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return false, nil
-	}
-
-	raws, sessions, err := ReadAll(indexPath)
-	if err != nil {
-		return false, err
-	}
-
-	updated := false
-	for i, s := range sessions {
-		if s.SessionID != sessionID {
-			continue
+	return WithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		updated := false
+		for i, s := range sessions {
+			if s.SessionID != sessionID {
+				continue
+			}
+			if s.PRPinned {
+				continue
+			}
+			merged, added := appendUniqueURLs(s.PRURLs, newURLs)
+			if !added {
+				continue
+			}
+			raw, err := remarshalWithUpdate(raws[i], "pr_urls", merged)
+			if err != nil {
+				return nil, false, err
+			}
+			raws[i] = raw
+			updated = true
 		}
-		if s.PRPinned {
-			continue
-		}
-		merged, added := appendUniqueURLs(s.PRURLs, newURLs)
-		if !added {
-			continue
-		}
-		s.PRURLs = merged
-		sessions[i] = s
-		raw, err := remarshalWithUpdate(raws[i], "pr_urls", merged)
-		if err != nil {
-			return false, err
-		}
-		raws[i] = raw
-		updated = true
-	}
-
-	if updated {
-		return true, WriteAll(indexPath, raws)
-	}
-	return false, nil
+		return raws, updated, nil
+	})
 }
 
 // PinPR authoritatively binds the given session to a single PR URL and
@@ -89,43 +75,9 @@ func PinPR(indexPath string, sessionID string, prURL string) (bool, error) {
 	if sessionID == "" || prURL == "" {
 		return false, nil
 	}
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return false, nil
-	}
-
-	raws, sessions, err := ReadAll(indexPath)
-	if err != nil {
-		return false, err
-	}
-
-	updated := false
-	for i, s := range sessions {
-		if s.SessionID != sessionID {
-			continue
-		}
-		alreadyPinned := s.PRPinned &&
-			len(s.PRURLs) == 1 &&
-			s.PRURLs[0] == prURL
-		if alreadyPinned {
-			continue
-		}
-		raw := raws[i]
-		raw, err = remarshalWithUpdate(raw, "pr_urls", []string{prURL})
-		if err != nil {
-			return false, err
-		}
-		raw, err = remarshalWithUpdate(raw, "pr_pinned", true)
-		if err != nil {
-			return false, err
-		}
-		raws[i] = raw
-		updated = true
-	}
-
-	if updated {
-		return true, WriteAll(indexPath, raws)
-	}
-	return false, nil
+	return WithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		return applyPinPR(raws, sessions, sessionID, prURL)
+	})
 }
 
 // MarkChecked sets backfill_checked=true for the given session IDs.
@@ -134,40 +86,13 @@ func MarkChecked(indexPath string, sessionIDs []string) (bool, error) {
 	if len(sessionIDs) == 0 {
 		return false, nil
 	}
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return false, nil
-	}
-
 	targetSet := make(map[string]struct{})
 	for _, id := range sessionIDs {
 		targetSet[id] = struct{}{}
 	}
-
-	raws, sessions, err := ReadAll(indexPath)
-	if err != nil {
-		return false, err
-	}
-
-	updated := false
-	for i, s := range sessions {
-		if _, ok := targetSet[s.SessionID]; !ok {
-			continue
-		}
-		if s.BackfillChecked {
-			continue
-		}
-		raw, err := remarshalWithUpdate(raws[i], "backfill_checked", true)
-		if err != nil {
-			return false, err
-		}
-		raws[i] = raw
-		updated = true
-	}
-
-	if updated {
-		return true, WriteAll(indexPath, raws)
-	}
-	return false, nil
+	return WithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		return applyMarkChecked(raws, sessions, targetSet)
+	})
 }
 
 // UpdateByBranch adds a PR URL to all sessions matching repo+branch that don't already have it.
@@ -176,45 +101,26 @@ func UpdateByBranch(indexPath string, targetRepo, targetBranch, newURL string) (
 	if targetRepo == "" || targetBranch == "" || newURL == "" {
 		return false, nil
 	}
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return false, nil
-	}
-
-	raws, sessions, err := ReadAll(indexPath)
-	if err != nil {
-		return false, err
-	}
-
 	normalizedTarget := NormalizeRepo(targetRepo)
-	updated := false
-
-	for i, s := range sessions {
-		if NormalizeRepo(s.Repo) != normalizedTarget {
-			continue
+	return WithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		updated := false
+		for i, s := range sessions {
+			if NormalizeRepo(s.Repo) != normalizedTarget || s.Branch != targetBranch || s.PRPinned {
+				continue
+			}
+			merged, added := appendUniqueURLs(s.PRURLs, []string{newURL})
+			if !added {
+				continue
+			}
+			raw, err := remarshalWithUpdate(raws[i], "pr_urls", merged)
+			if err != nil {
+				return nil, false, err
+			}
+			raws[i] = raw
+			updated = true
 		}
-		if s.Branch != targetBranch {
-			continue
-		}
-		if s.PRPinned {
-			continue
-		}
-		merged, added := appendUniqueURLs(s.PRURLs, []string{newURL})
-		if !added {
-			continue
-		}
-
-		raw, err := remarshalWithUpdate(raws[i], "pr_urls", merged)
-		if err != nil {
-			return false, err
-		}
-		raws[i] = raw
-		updated = true
-	}
-
-	if updated {
-		return true, WriteAll(indexPath, raws)
-	}
-	return false, nil
+		return raws, updated, nil
+	})
 }
 
 // UpdateEnd records the end timestamp and reason for the given session.
@@ -223,41 +129,9 @@ func UpdateEnd(indexPath string, sessionID string, endedAt string, reason string
 	if sessionID == "" || endedAt == "" {
 		return false, nil
 	}
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return false, nil
-	}
-
-	raws, sessions, err := ReadAll(indexPath)
-	if err != nil {
-		return false, err
-	}
-
-	updated := false
-	for i, s := range sessions {
-		if s.SessionID != sessionID {
-			continue
-		}
-		if s.EndedAt == endedAt && s.EndReason == reason {
-			continue
-		}
-
-		raw := raws[i]
-		raw, err = remarshalWithUpdate(raw, "ended_at", endedAt)
-		if err != nil {
-			return false, err
-		}
-		raw, err = remarshalWithUpdate(raw, "end_reason", reason)
-		if err != nil {
-			return false, err
-		}
-		raws[i] = raw
-		updated = true
-	}
-
-	if updated {
-		return true, WriteAll(indexPath, raws)
-	}
-	return false, nil
+	return WithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		return applyUpdateEnd(raws, sessions, sessionID, endedAt, reason)
+	})
 }
 
 // UpdatePRMeta updates PR metadata for all sessions that have the given pr_url.
@@ -266,18 +140,183 @@ func UpdatePRMeta(indexPath string, prURL string, isMerged bool, reviewComments,
 	if prURL == "" {
 		return false, nil
 	}
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return false, nil
-	}
+	return WithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		return applyPRMeta(raws, sessions, prURL, isMerged, reviewComments, changesRequested, prTitle)
+	})
+}
 
-	raws, sessions, err := ReadAll(indexPath)
-	if err != nil {
-		return false, err
-	}
+func ApplyBatch(indexPath string, batch Batch) (bool, error) {
+	return TryWithLockedIndex(indexPath, func(raws []json.RawMessage, sessions []Session) ([]json.RawMessage, bool, error) {
+		return ApplyBatchToRaw(raws, sessions, batch)
+	})
+}
 
+type Batch struct {
+	PinPRs      map[string]string
+	SessionURLs map[string][]string
+	MarkChecked []string
+	PRMetas     map[string]PRMeta
+	EndUpdates  map[string]EndUpdate
+}
+
+type PRMeta struct {
+	IsMerged         bool
+	ReviewComments   int
+	ChangesRequested int
+	Title            string
+}
+
+type EndUpdate struct {
+	EndedAt string
+	Reason  string
+}
+
+func ApplyBatchToRaw(raws []json.RawMessage, sessions []Session, batch Batch) ([]json.RawMessage, bool, error) {
+	updated := false
+	if len(batch.MarkChecked) > 0 {
+		targetSet := make(map[string]struct{}, len(batch.MarkChecked))
+		for _, id := range batch.MarkChecked {
+			targetSet[id] = struct{}{}
+		}
+		next, ok, err := applyMarkChecked(raws, sessions, targetSet)
+		if err != nil {
+			return nil, false, err
+		}
+		raws, updated = next, updated || ok
+	}
+	for sessionID, url := range batch.PinPRs {
+		next, ok, err := applyPinPR(raws, sessions, sessionID, url)
+		if err != nil {
+			return nil, false, err
+		}
+		raws, updated = next, updated || ok
+		_, sessions, _ = decodeRawSessions(raws)
+	}
+	for sessionID, urls := range batch.SessionURLs {
+		next, ok, err := applyUpdate(raws, sessions, sessionID, urls)
+		if err != nil {
+			return nil, false, err
+		}
+		raws, updated = next, updated || ok
+		_, sessions, _ = decodeRawSessions(raws)
+	}
+	for sessionID, end := range batch.EndUpdates {
+		next, ok, err := applyUpdateEnd(raws, sessions, sessionID, end.EndedAt, end.Reason)
+		if err != nil {
+			return nil, false, err
+		}
+		raws, updated = next, updated || ok
+		_, sessions, _ = decodeRawSessions(raws)
+	}
+	for prURL, meta := range batch.PRMetas {
+		next, ok, err := applyPRMeta(raws, sessions, prURL, meta.IsMerged, meta.ReviewComments, meta.ChangesRequested, meta.Title)
+		if err != nil {
+			return nil, false, err
+		}
+		raws, updated = next, updated || ok
+		_, sessions, _ = decodeRawSessions(raws)
+	}
+	return raws, updated, nil
+}
+
+func decodeRawSessions(raws []json.RawMessage) ([]json.RawMessage, []Session, error) {
+	sessions := make([]Session, len(raws))
+	for i, raw := range raws {
+		_ = json.Unmarshal(raw, &sessions[i])
+	}
+	return raws, sessions, nil
+}
+
+func applyUpdate(raws []json.RawMessage, sessions []Session, sessionID string, newURLs []string) ([]json.RawMessage, bool, error) {
 	updated := false
 	for i, s := range sessions {
-		// Match if any of the session's pr_urls matches
+		if s.SessionID != sessionID || s.PRPinned {
+			continue
+		}
+		merged, added := appendUniqueURLs(s.PRURLs, newURLs)
+		if !added {
+			continue
+		}
+		raw, err := remarshalWithUpdate(raws[i], "pr_urls", merged)
+		if err != nil {
+			return nil, false, err
+		}
+		raws[i] = raw
+		updated = true
+	}
+	return raws, updated, nil
+}
+
+func applyPinPR(raws []json.RawMessage, sessions []Session, sessionID string, prURL string) ([]json.RawMessage, bool, error) {
+	updated := false
+	for i, s := range sessions {
+		if s.SessionID != sessionID {
+			continue
+		}
+		alreadyPinned := s.PRPinned && len(s.PRURLs) == 1 && s.PRURLs[0] == prURL
+		if alreadyPinned {
+			continue
+		}
+		raw := raws[i]
+		var err error
+		raw, err = remarshalWithUpdate(raw, "pr_urls", []string{prURL})
+		if err != nil {
+			return nil, false, err
+		}
+		raw, err = remarshalWithUpdate(raw, "pr_pinned", true)
+		if err != nil {
+			return nil, false, err
+		}
+		raws[i] = raw
+		updated = true
+	}
+	return raws, updated, nil
+}
+
+func applyMarkChecked(raws []json.RawMessage, sessions []Session, targetSet map[string]struct{}) ([]json.RawMessage, bool, error) {
+	updated := false
+	for i, s := range sessions {
+		if _, ok := targetSet[s.SessionID]; !ok || s.BackfillChecked {
+			continue
+		}
+		raw, err := remarshalWithUpdate(raws[i], "backfill_checked", true)
+		if err != nil {
+			return nil, false, err
+		}
+		raws[i] = raw
+		updated = true
+	}
+	return raws, updated, nil
+}
+
+func applyUpdateEnd(raws []json.RawMessage, sessions []Session, sessionID string, endedAt string, reason string) ([]json.RawMessage, bool, error) {
+	updated := false
+	for i, s := range sessions {
+		if s.SessionID != sessionID {
+			continue
+		}
+		if s.EndedAt == endedAt && s.EndReason == reason {
+			continue
+		}
+		raw := raws[i]
+		var err error
+		raw, err = remarshalWithUpdate(raw, "ended_at", endedAt)
+		if err != nil {
+			return nil, false, err
+		}
+		raw, err = remarshalWithUpdate(raw, "end_reason", reason)
+		if err != nil {
+			return nil, false, err
+		}
+		raws[i] = raw
+		updated = true
+	}
+	return raws, updated, nil
+}
+
+func applyPRMeta(raws []json.RawMessage, sessions []Session, prURL string, isMerged bool, reviewComments, changesRequested int, prTitle string) ([]json.RawMessage, bool, error) {
+	updated := false
+	for i, s := range sessions {
 		match := false
 		for _, u := range s.PRURLs {
 			if u == prURL {
@@ -288,39 +327,34 @@ func UpdatePRMeta(indexPath string, prURL string, isMerged bool, reviewComments,
 		if !match {
 			continue
 		}
-		if s.IsMerged == isMerged && s.ReviewComments == reviewComments && s.ChangesRequested == changesRequested && s.PRTitle == prTitle {
+		sameTitle := prTitle == "" || s.PRTitle == prTitle
+		if s.IsMerged == isMerged && s.ReviewComments == reviewComments && s.ChangesRequested == changesRequested && sameTitle {
 			continue
 		}
-
 		raw := raws[i]
+		var err error
 		raw, err = remarshalWithUpdate(raw, "is_merged", isMerged)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		raw, err = remarshalWithUpdate(raw, "review_comments", reviewComments)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		raw, err = remarshalWithUpdate(raw, "changes_requested", changesRequested)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
-		// gh が title を返さなかったケース（取得失敗）で既存 pr_title を空で上書きしないよう、
-		// 空文字列の prTitle は書かない。明示的にクリアしたい場合はそもそも呼び出さない。
 		if prTitle != "" {
 			raw, err = remarshalWithUpdate(raw, "pr_title", prTitle)
 			if err != nil {
-				return false, err
+				return nil, false, err
 			}
 		}
 		raws[i] = raw
 		updated = true
 	}
-
-	if updated {
-		return true, WriteAll(indexPath, raws)
-	}
-	return false, nil
+	return raws, updated, nil
 }
 
 // remarshalWithUpdate decodes raw JSON as a map, sets key=value, and re-encodes.
