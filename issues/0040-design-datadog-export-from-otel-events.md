@@ -4,7 +4,6 @@ affected_paths:
   - docs/spec.md
   - docs/design.md
   - docs/metrics.md
-  - deploy/otel-collector/
 depends_on: [0038]
 tags: [datadog, otel, export, observability-backend, semantic-conventions]
 ---
