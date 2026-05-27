@@ -4,6 +4,7 @@ affected_paths:
   - docs/spec.md
   - docs/design.md
   - docs/metrics.md
+  - internal/serverclient/
 depends_on: [0038]
 tags: [otel, export, pluggable-backend, observability-backend, datadog, semantic-conventions]
 ---
@@ -82,7 +83,7 @@ OTLP Logs を外部 backend に送ると、各 attribute は backend の log att
 
 ### export 能力と 2 つのデプロイレシピ（A）
 
-当初は「(1) client 直送 / (2) Collector / (3) やらない」の **択一**として整理していたが、実体は択一ではない。0038 後、client は既に **OTLP exporter → 設定可能な宛先（+ 任意の auth header）** を持つ。client から見ると direct も collector も「OTLP を URL に投げる」だけで差が無く、Collector を挟むかは **実装分岐ではなくデプロイ選択**。
+当初は「(1) client 直送 / (2) Collector / (3) やらない」の **択一**として整理していたが、実体は択一ではない。ただし現状は **`[server].endpoint` + 固定 Bearer + JSON OTLP Logs**（`internal/serverclient/`）に限定されており、「設定可能な宛先 + 可変 auth + encoding/protocol + signal」を **client に持たせる拡張が必要**（「既にある」ではない。child issue の実装範囲を過小評価しないこと）。その能力を持たせれば、宛先を増やすのは設定で済み、Collector を挟むかは **デプロイ選択**になる（ただし「OTLP を URL に投げるだけ」で済むのは同 encoding/protocol の宛先に限る。Datadog direct は protobuf exporter 切替を伴う＝概要 A 参照）。
 
 したがってツールが提供するのは **「設定可能な OTLP export」という 1 能力**で、これが旧 3 択を畳む:
 
@@ -101,7 +102,7 @@ OTLP Logs を外部 backend に送ると、各 attribute は backend の log att
 
 > **なぜ team では collector か（credential モデルの帰結）**: Datadog の ingestion API key (`DD-API-KEY`) は **org-wide でスコープ不可**（scopes は read/管理用の Application key にのみ適用、[API and Application Keys](https://docs.datadoghq.com/account_management/api-app-keys/)）。「ログ送信のみ」の key は作れない。submit 専用ではあるが、漏洩時は org 全体 rotate・濫用（コスト増幅）の blast-radius が残り、RUM client token のような app スコープ / 公開耐性 / 個別失効は無い。RUM が安全なのは token そのものではなく「**信頼できない多数クライアントは強い秘密を持たず、信頼できる intake だけが特権 submit する**」アーキテクチャ由来であり、それを OTLP で再現するのが collector レシピ（client は秘密なし＝RUM 等価）。個人は公開環境ではないので direct + submit-only key で十分。
 
-これにより backend 固有のもの（endpoint / auth header 名 / representation）は設定に追い出せ、Grafana 経路（SQLite）も両レシピで並列に保てる。少なくとも意味分類（B）は spec / docs に書き残す（その作業は本 issue で行う）。
+これにより backend 固有のもの（endpoint / auth header 名 / encoding/protocol / representation）は設定に追い出せ、Grafana 経路（SQLite）も両レシピで並列に保てる。意味分類（B）の**決定は本 issue 本文に記録**し、`docs/spec.md` への正式反映は child issue で行う（本 issue の deliverable 範囲は下記「段階実装」冒頭を参照）。
 
 **送信経路の形（2 representation の帰結）**: 効率指標は client のローカル VIEW で集約するので、**集約は client 側に固定**される（collector は stateless で cross-event join できないため **router であって aggregator ではない**。server 側集約は SQLite ingest を必須化し Datadog-only 個人と矛盾するので採らない）。結果、同じローカル SoR から **raw events（Logs）と `pr_metrics` gauge（Metrics）の 2 projection** を作って別宛先に送る。差分検出は 1 スキャン共有・**宛先ごとに独立カーソル**（raw=append で重複防止に必須 / gauge=upsert 冪等なので最適化）。現行 `[server].endpoint + Bearer 固定` を **export target 配列（endpoint + 可変 auth header + representation）** に拡張する。
 
@@ -135,9 +136,9 @@ Grafana 版（`grafana/dashboards/agent-telemetry.json`、SQLite datasource 前�
 
 ### 段階実装の見通し（child issue 分解候補）
 
-本 issue 自体は spec/docs の更新と方針確定までを想定し、実装は次の child issue に分解する。順序は依存関係に従う:
+**本 issue（この PR）の deliverable を一つに確定する**: ①設計判断を **issue 本文に記録**する（A の export 能力・2 representation・direct/collector・B の意味分類・join 不可の帰結）と、②[0038] と矛盾する `docs/design.md` の「OTLP Metrics 不採用・Logs 統一」記述の同期更新（矛盾回避のための例外、本 PR で実施済み）まで。**`docs/spec.md` / `docs/metrics.md` の本文反映、`docs/design.md` の責務分担追記、および実装はすべて下記 child issue に分解する**（本 issue では行わない）。順序は依存関係に従う:
 
-1. **flush を export target 配列に拡張（A）**: 現行 `[server].endpoint + Bearer 固定 + JSON encoding`（`flush.go`）を、**endpoint + 可変 auth header（Bearer / `DD-API-KEY` 等）+ encoding/protocol（JSON / protobuf）+ representation を持つ target の配列**にする。1 差分スキャンから raw events（Logs）と後述の gauge（Metrics）の 2 projection を、宛先ごとの独立カーソルで送る。docs に **direct レシピ**（client → backend 直送。**Datadog direct は現行の手組み JSON poster では不可で、OTLP SDK / protobuf exporter への切替が必要**。submit-only credential を client 設定に）と **collector レシピ**（`deploy/otel-collector/` or how-to で選んだ宛先へ router fanout。**client は既存 JSON exporter のままで、Collector が protobuf + `DD-API-KEY` 変換を担う**。SQLite ingest は Grafana 併用時の任意宛先で必須ではない）を同梱。**最初の backend として Datadog を例示**
+1. **flush を export target 配列に拡張（A）**: 現行 `[server].endpoint + Bearer 固定 + JSON encoding`（`flush.go`、endpoint に `/v1/logs` を補完する base-endpoint モデル）を、**endpoint + 可変 auth header（Bearer / `DD-API-KEY` 等）+ encoding/protocol（JSON / protobuf）+ representation を持つ target の配列**にする。**endpoint モデルを明記する**: Datadog は signal ごとに別 path（Logs=`/v1/logs`、Metrics=`/v1/metrics`）なので、target の `endpoint` を「base + signal path を補完」とするか「signal ごとの完全 URL」とするかを spec で 1 つに固定し、実装時の解釈ブレを防ぐ。1 差分スキャンから raw events（Logs）と後述の gauge（Metrics）の 2 projection を、宛先ごとの独立カーソルで送る。docs に **direct レシピ**（client → backend 直送。**Datadog direct は現行の手組み JSON poster では不可で、OTLP SDK / protobuf exporter への切替が必要**。submit-only credential を client 設定に）と **collector レシピ**（`deploy/otel-collector/` or how-to で選んだ宛先へ router fanout。**client は既存 JSON exporter のままで、Collector が protobuf + `DD-API-KEY` 変換を担う**。SQLite ingest は Grafana 併用時の任意宛先で必須ではない）を同梱。**最初の backend として Datadog を例示**
 2. **`pr_metrics` の client 側集約 + gauge 送信（A、効率指標）**: client がローカル `pr_metrics` VIEW を評価し、PR 単位の値を OTLP Metrics gauge（last-value）として送る経路を実装する。`session_count` / 各 ratio もこの行に含める
 3. **attribute の意味分類を `docs/spec.md` に追記（B、backend 非依存 + Datadog リファレンス）**: 対応表を仕様本体として固定し、**2 配布形式**（direct 用の Datadog Logs Pipeline 設定 / collector 用の Collector processor サンプル）を同梱する。これは raw events 側（event-level 分析）の tag/measure 昇格に効く
 4. **`docs/metrics.md` に backend 上の representation 対応を追記（任意）**: 各メトリクスについて「`pr_metrics` 系は client 集約の gauge をそのまま使う / event-level 系は raw events から backend formula で出す」のどちらかを明示
