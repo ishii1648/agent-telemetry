@@ -1,6 +1,9 @@
 package upgrade
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestParseChecksum(t *testing.T) {
 	body := `0123abc  agent-telemetry_darwin_arm64.tar.gz
@@ -52,5 +55,70 @@ func TestNormalize(t *testing.T) {
 		if got := normalize(in); got != want {
 			t.Errorf("normalize(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestNewGitHubRequestAddsBearerToken(t *testing.T) {
+	req, err := newGitHubRequest("https://api.github.com/repos/owner/repo/releases/latest", " token-123 \n")
+	if err != nil {
+		t.Fatalf("newGitHubRequest: %v", err)
+	}
+	if got := req.Header.Get("Accept"); got != "application/vnd.github+json" {
+		t.Errorf("Accept = %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer token-123" {
+		t.Errorf("Authorization = %q", got)
+	}
+}
+
+func TestNewGitHubRequestSkipsEmptyToken(t *testing.T) {
+	req, err := newGitHubRequest("https://api.github.com/repos/owner/repo/releases/latest", " \n")
+	if err != nil {
+		t.Fatalf("newGitHubRequest: %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization = %q, want empty", got)
+	}
+}
+
+func TestResolveGitHubTokenPrefersEnvironment(t *testing.T) {
+	calledGh := false
+	got := resolveGitHubToken(
+		func(name string) string {
+			if name != "GITHUB_TOKEN" {
+				t.Fatalf("unexpected env lookup %q", name)
+			}
+			return " env-token "
+		},
+		func() (string, error) {
+			calledGh = true
+			return "gh-token", nil
+		},
+	)
+	if got != "env-token" {
+		t.Errorf("token = %q, want env-token", got)
+	}
+	if calledGh {
+		t.Errorf("gh token command should not be called when GITHUB_TOKEN is set")
+	}
+}
+
+func TestResolveGitHubTokenFallsBackToGh(t *testing.T) {
+	got := resolveGitHubToken(
+		func(string) string { return "" },
+		func() (string, error) { return " gh-token\n", nil },
+	)
+	if got != "gh-token" {
+		t.Errorf("token = %q, want gh-token", got)
+	}
+}
+
+func TestResolveGitHubTokenAllowsUnauthenticatedFallback(t *testing.T) {
+	got := resolveGitHubToken(
+		func(string) string { return "" },
+		func() (string, error) { return "", errors.New("gh unavailable") },
+	)
+	if got != "" {
+		t.Errorf("token = %q, want empty", got)
 	}
 }
