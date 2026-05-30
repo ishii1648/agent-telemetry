@@ -8,6 +8,7 @@ import (
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 )
 
@@ -106,4 +107,65 @@ func parseUint64(s string) (uint64, error) {
 		return 0, nil
 	}
 	return strconv.ParseUint(s, 10, 64)
+}
+
+// marshalOTLPMetricsProtobuf serializes the same logical OTLP Metrics payload
+// the JSON path sends (pr_metrics gauges, issue 0043) as binary protobuf.
+// Datadog's OTLP metrics intake accepts both JSON and protobuf, but a target
+// configured with encoding = "protobuf" (e.g. one that also sends logs to
+// Datadog) gets a consistent wire encoding across both signals. As with the
+// logs path we convert from the JSON-shaped struct rather than adopting the
+// full OTel metric SDK, keeping the cursor/batching contract in flush.go.
+func marshalOTLPMetricsProtobuf(p otlpMetricsPayload) ([]byte, error) {
+	msg, err := toProtoMetrics(p)
+	if err != nil {
+		return nil, err
+	}
+	return proto.Marshal(msg)
+}
+
+func toProtoMetrics(p otlpMetricsPayload) (*metricspb.MetricsData, error) {
+	out := &metricspb.MetricsData{ResourceMetrics: make([]*metricspb.ResourceMetrics, 0, len(p.ResourceMetrics))}
+	for _, rm := range p.ResourceMetrics {
+		protoRM := &metricspb.ResourceMetrics{
+			Resource:     &resourcepb.Resource{Attributes: toProtoAttrs(rm.Resource.Attributes)},
+			ScopeMetrics: make([]*metricspb.ScopeMetrics, 0, len(rm.ScopeMetrics)),
+		}
+		for _, sm := range rm.ScopeMetrics {
+			protoSM := &metricspb.ScopeMetrics{
+				Scope:   &commonpb.InstrumentationScope{Name: sm.Scope.Name},
+				Metrics: make([]*metricspb.Metric, 0, len(sm.Metrics)),
+			}
+			for _, m := range sm.Metrics {
+				points := make([]*metricspb.NumberDataPoint, 0, len(m.Gauge.DataPoints))
+				for _, dp := range m.Gauge.DataPoints {
+					t, err := parseUint64(dp.TimeUnixNano)
+					if err != nil {
+						return nil, fmt.Errorf("metric %s timeUnixNano: %w", m.Name, err)
+					}
+					pdp := &metricspb.NumberDataPoint{
+						Attributes:   toProtoAttrs(dp.Attributes),
+						TimeUnixNano: t,
+					}
+					if dp.AsDouble != nil {
+						pdp.Value = &metricspb.NumberDataPoint_AsDouble{AsDouble: *dp.AsDouble}
+					} else {
+						n, err := strconv.ParseInt(dp.AsInt, 10, 64)
+						if err != nil {
+							return nil, fmt.Errorf("metric %s asInt %q: %w", m.Name, dp.AsInt, err)
+						}
+						pdp.Value = &metricspb.NumberDataPoint_AsInt{AsInt: n}
+					}
+					points = append(points, pdp)
+				}
+				protoSM.Metrics = append(protoSM.Metrics, &metricspb.Metric{
+					Name: m.Name,
+					Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: points}},
+				})
+			}
+			protoRM.ScopeMetrics = append(protoRM.ScopeMetrics, protoSM)
+		}
+		out.ResourceMetrics = append(out.ResourceMetrics, protoRM)
+	}
+	return out, nil
 }
