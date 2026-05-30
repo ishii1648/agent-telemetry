@@ -444,6 +444,31 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 - **raw JSONL 転送 + サーバ側 transcript 解析**: 送信サイズ膨張・プライバシー観点・サーバ側のパーサ保守の 3 点が大きく、旧設計の議論で既に却下されている（[0009]）。append-only 化でもこの判断は変わらない
 - **イベント table を持たず、行 mutation で済ます append-only シミュレーション**: 一見「集計行に `updated_at` を持たせて INSERT OR REPLACE すれば append-only っぽくなる」が、過去の状態を保てないので replay ができず、events table に置き換えるべき以上のものは生まれない
 
+### 外部 backend 経路の責務分担（client / server / Collector / backend）
+
+外部 observability backend（Datadog 等）への export 経路（[0040] / [0042] / [0043]）が加わり、集約・整形をどの主体が担うかが増えた。混線を避けるため責務を 4 主体に固定する。内部転送（client → server → Grafana/SQLite）は従来どおりで、本節は **外部 backend 向けに増えた経路**の責務を明文化する。
+
+| 主体 | 担うこと | 担わないこと |
+|---|---|---|
+| **client**（`internal/serverclient/`） | 設定可能な OTLP export（export target 配列）と、**`pr_metrics` のローカル集約（gauge 化）**。1 差分スキャンから raw events（OTLP Logs）と pre-aggregated `pr_metrics`（OTLP Metrics gauge, PR 単位）の 2 projection を作り、宛先ごとの独立カーソルで送る | — |
+| **server**（`internal/serverpipe/`） | OTLP Logs receiver + SQLite ingest（`INSERT OR IGNORE`）だけ。cross-event 集約は SQLite VIEW（`sessions` / `transcript_stats` / `pr_metrics`）が担う | **gauge は server を経由しない**（gauge は client から外部 backend / Collector に直行）。ingest に集約ロジックを持たない |
+| **外部 backend**（Datadog 等） | client が送った gauge の格納・表示と、raw events の **event-level 集計**（素の token 推移・流量・カウント・イベント種別ごとの count） | **cross-event 集約は行わない**（log-metric backend は record 間 join をしないため、効率指標を backend formula で再現しない） |
+| **Collector**（collector レシピ採用時のみ） | router として選んだ宛先への fanout と、raw events 側の **attribute 整形**（意味分類昇格の前処理: rename / resource 付与 / 高 cardinality drop）。direct ではこの整形を Datadog Logs Pipeline が同等に担う | **集約はしない**（stateless で cross-event join できない ＝ router であって aggregator ではない） |
+
+**cross-event 集約が client + SQLite VIEW にロックインされる理由（join 不可）**: `pr_metrics`（`total_tokens` / `fresh_tokens` / `per_million_tokens` 等）は、token が `agent.transcript.scanned`、`pr_url` / `is_merged` が `agent.pr.observed`、`user_id` / `repo` が `agent.session.started` に分散した events を `session_id` で cross-event join し、latest-wins + sum して算出する。log-metric backend（Datadog Logs to Metrics 等）も Collector も **record 間 join をしない / できない**ため、normalized な raw events を流すだけでは backend 側で `pr_metrics` を組み立てられない。したがって cross-event 集約は **join を実行できる主体——ローカル SQLite VIEW を持つ client（外部 backend 向け）、または同 VIEW を持つ server（Grafana 向け）——にロックインされる**。外部 backend 向けには client がローカル VIEW を評価し、PR 単位の pre-aggregated 値を OTLP Metrics gauge（last-value）として送る（server 側集約に寄せる案は SQLite ingest を必須化し Datadog-only 個人と矛盾するため採らない）。gauge の temporality / timestamp の扱いは `docs/spec.md`「`pr_metrics` gauge representation」、設計判断の根拠は [0040] 本文を参照。
+
+**direct と collector で差し替わるもの / 同じもの**: attribute 整形は両レシピで実施するが置き場所が違い、facet / measure 化は Collector processor では代替できず Datadog 側 index 設定が両レシピ共通で必須になる。
+
+| 観点 | direct | collector | 差し替わるか |
+|---|---|---|---|
+| client の OTLP exporter | protobuf + `dd-api-key`（Datadog direct logs は protobuf 必須＝実装切替を伴う） | 既存 JSON exporter のまま（Collector が protobuf + `dd-api-key` 変換を担う） | **差し替わる** |
+| credential 保持 | client（submit-only key を自マシンに置く） | Collector が 1 箇所で保持し client は backend credential を持たない | **差し替わる** |
+| attribute 整形（rename / resource 付与 / drop） | Datadog Logs Pipeline remapper | Collector processor | **両方で実施**（置き場所のみ差し替わる） |
+| facet / measure 化（検索 facet・集計 measure 昇格） | Datadog 側 index 設定 | Datadog 側 index 設定（Collector processor では代替不可） | **同じ**（recipe を問わず Datadog 側） |
+| cross-event 集約（`pr_metrics` gauge） | client ローカル VIEW | client ローカル VIEW | **同じ**（client に固定） |
+
+attribute 意味分類の表本体と 2 配布形式（direct 用 Datadog Logs Pipeline / collector 用 Collector processor サンプル）は `docs/spec.md`「OTLP export の attribute 意味分類」を正とし、本節には複製しない。各メトリクスが「client 集約 gauge をそのまま使う / raw events から backend formula で出す」のどちらで表現されるかは `docs/metrics.md` を参照する。
+
 ### プロトコル — OTLP/HTTP Logs
 
 OTel SDK / Collector エコシステムに乗ることを優先し、独自 JSON ではなく **OTLP/HTTP JSON エンコード** を採用する。クライアントは `go.opentelemetry.io/otel/sdk/log` + `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp` を使い、`/v1/logs` に POST する。サーバは自前の OTLP Logs receiver を `internal/serverpipe/` に持つ（OTel Collector を間に挟まないことで運用構成を単純化する）。
