@@ -64,8 +64,9 @@ func Run(opts Options) error {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
+	token := resolveGitHubToken(os.Getenv, ghAuthToken)
 
-	rel, err := fetchLatest(client)
+	rel, err := fetchLatest(client, token)
 	if err != nil {
 		return fmt.Errorf("fetch latest release: %w", err)
 	}
@@ -165,12 +166,11 @@ func exePath() (string, error) {
 	return resolved, nil
 }
 
-func fetchLatest(client *http.Client) (*release, error) {
-	req, err := http.NewRequest(http.MethodGet, releaseAPI, nil)
+func fetchLatest(client *http.Client, token string) (*release, error) {
+	req, err := newGitHubRequest(releaseAPI, token)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -187,6 +187,38 @@ func fetchLatest(client *http.Client) (*release, error) {
 		return nil, fmt.Errorf("empty tag_name in github api response")
 	}
 	return &r, nil
+}
+
+func newGitHubRequest(url, token string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req, nil
+}
+
+func resolveGitHubToken(getenv func(string) string, ghToken func() (string, error)) string {
+	if token := strings.TrimSpace(getenv("GITHUB_TOKEN")); token != "" {
+		return token
+	}
+	token, err := ghToken()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(token)
+}
+
+func ghAuthToken() (string, error) {
+	cmd := exec.Command("gh", "auth", "token")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func fetchChecksum(client *http.Client, url, assetName string) (string, error) {
