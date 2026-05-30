@@ -3,6 +3,7 @@ decision_type: spec
 affected_paths:
   - docs/spec.md
   - deploy/otel-collector/
+  - deploy/datadog/
 depends_on: [0040]
 tags: [otel, export, semantic-conventions, datadog, attributes]
 # 0042 が生成する collector レシピへ processor サンプルを追加配置する path
@@ -35,5 +36,18 @@ Created: 2026-05-30
 
 ## 触らない
 
-- gauge tag の VIEW projection 拡張は [0042] で（gauge は本 issue 範囲外）
+- gauge tag の VIEW projection 拡張は [0043] で（gauge は本 issue 範囲外）
 - 他 backend（New Relic / Honeycomb / Grafana Cloud）への concrete マッピングは後続 issue
+
+Completed: 2026-05-30
+
+## 解決方法
+
+[0040] 本文（B）の意味分類を `docs/spec.md` の正規仕様として固定し、2 配布形式 + facet/measure 成果物を同梱した。
+
+- **`docs/spec.md`**: 「OTLP export の attribute 意味分類」セクションを追加。5 群（低 cardinality 次元タグ / `pr_url` / 高 cardinality 識別子 facet only / 数値 measure / OTel resource 規約）を backend 非依存の分類 + Datadog concrete マッピングとして 1 つの表に固定。raw events（Logs）側の全 attribute が対象で `pr_metrics` gauge tag は VIEW projection 限定の別物であること、`is_merged` / `is_subagent` / `is_ghost` は raw events 側で次元タグ扱いであること、`event_name` / `occurred_at` は LogRecord field で attribute ではないことを明記。
+- **`deploy/otel-collector/`**（collector レシピ）: `collector-config.yaml` に resource 付与 / rename / 高 cardinality drop の processor サンプル。
+- **`deploy/datadog/`**（direct レシピ）: `logs-pipeline.md` + `logs-pipeline.tf` に attribute 整形（remapper による tag 昇格 / drop / `is_subagent` 導出）。
+- **`deploy/datadog/facets-measures.md`**: facet / measure 化は recipe を問わず Datadog 側 index 設定でしか実現できず **Collector processor では代替不可**な点を明記し、手順 + API payload を切り出し。
+
+実装範囲外: gauge tag の VIEW projection 拡張は [0043]、export target 配列拡張は [0042]、他 backend の concrete マッピングは後続 issue。
