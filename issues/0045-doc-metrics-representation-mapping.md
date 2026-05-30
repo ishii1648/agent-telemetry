@@ -2,7 +2,7 @@
 decision_type: spec
 affected_paths:
   - docs/metrics.md
-depends_on: [0040, 0042, 0043]
+depends_on: [0040, 0043, 0044]
 tags: [otel, export, metrics, docs]
 ---
 
@@ -20,12 +20,12 @@ Created: 2026-05-30
 
 ## 対応方針
 
-[0042] / [0043] の実装が固まったあとに着手する（任意 issue 扱い、優先度低）:
+[0043] / [0044] の実装が固まったあとに着手する（任意 issue 扱い、優先度低）:
 
 1. `docs/metrics.md` の各 metric 行に representation 列を追加（gauge / event-level）
 2. event-level 系は backend formula の例（Datadog count / sum query 例）を参考程度に添える
 
 ## 触らない
 
-- spec 本体（attribute 分類）は [0043]
-- 責務分担の design.md 追記は [0045]
+- spec 本体（attribute 分類）は [0044]
+- 責務分担の design.md 追記は [0046]

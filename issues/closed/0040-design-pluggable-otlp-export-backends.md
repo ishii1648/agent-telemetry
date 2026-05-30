@@ -188,16 +188,18 @@ Completed: 2026-05-30
 
 実装は本 issue 本文の「段階実装」で挙げた child issue に分解した:
 
-- [0041] feat: flush を export target 配列に拡張（A、direct/collector 同梱、Datadog をリファレンス）
-- [0042] feat: `pr_metrics` の client 側集約 + OTLP Metrics gauge 送信（A、効率指標、gauge temporality/timestamp spike 含む）
-- [0043] spec: attribute の意味分類を `docs/spec.md` に追記（B、direct 用 Datadog Logs Pipeline + collector processor サンプル同梱）
-- [0044] doc: `docs/metrics.md` に backend 上の representation 対応を追記（任意）
-- [0045] design: `docs/design.md` に client / server / Collector / 外部 backend の責務分担を追記
+- [0042] feat: flush を export target 配列に拡張（A、direct/collector 同梱、Datadog をリファレンス）
+- [0043] feat: `pr_metrics` の client 側集約 + OTLP Metrics gauge 送信（A、効率指標、gauge temporality/timestamp spike 含む）
+- [0044] spec: attribute の意味分類を `docs/spec.md` に追記（B、direct 用 Datadog Logs Pipeline + collector processor サンプル同梱）
+- [0045] doc: `docs/metrics.md` に backend 上の representation 対応を追記（任意）
+- [0046] design: `docs/design.md` に client / server / Collector / 外部 backend の責務分担を追記
+
+> Note: 当初 0041〜0045 で発番していたが、origin/main で 0041 が `0041-bug-upgrade-github-api-auth` に占有済みだったため renumber して衝突回避した。
 
 ## 採用しなかった代替
 
 - **event 名を OTel `gen_ai.*` semantic conventions に寄せる**: PR 単位のトークン効率・transcript scan の latest-wins snapshot は `gen_ai.*`（個々の LLM 呼び出しを記述）に構造的にマップできない。部分寄せは二重命名が増えるだけで OOTB 認識の利得が出ない
-- **backend 側で `pr_metrics` を再現する formula**: log-metric backend は record 間 join をしないため不可能。client がローカル VIEW で集約して gauge 送信する経路（[0042]）に決定
+- **backend 側で `pr_metrics` を再現する formula**: log-metric backend は record 間 join をしないため不可能。client がローカル VIEW で集約して gauge 送信する経路（[0043]）に決定
 - **denormalized な session-rollup を log で送り backend で集約**: `session_id` を高 cardinality tag にせざるを得ず custom metric が膨張、log の sum も二重カウントしやすい。代わりに PR 単位 gauge に決定
 - **client 直送 / Collector / やらない の 3 択**: 「設定可能な OTLP export」1 能力に畳み、direct / collector はデプロイレシピとして両対応する整理に変更（「やらない」は能力に内包される）
 - **Datadog 以外の backend を同 PR でリファレンス化**: 検証対象を 1 つに固定するため Datadog 1 本に絞り、横展開は同じ A + B 上の後続 issue に回す

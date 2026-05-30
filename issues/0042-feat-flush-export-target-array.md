@@ -39,6 +39,6 @@ Created: 2026-05-30
 
 ## 触らない
 
-- gauge 送信（child issue [0042] で）
-- attribute の意味分類の spec 反映（child issue [0043] で）
-- raw events 側の representation は本 issue 範囲。`pr_metrics` gauge representation は [0042] で別 cursor として加わる
+- gauge 送信（child issue [0043] で）
+- attribute の意味分類の spec 反映（child issue [0044] で）
+- raw events 側の representation は本 issue 範囲。`pr_metrics` gauge representation は [0043] で別 cursor として加わる

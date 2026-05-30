@@ -4,7 +4,7 @@ affected_paths:
   - internal/serverclient/
   - internal/syncdb/schema/
   - docs/spec.md
-depends_on: [0040, 0041]
+depends_on: [0040, 0042]
 tags: [otel, export, metrics, gauge, pr-metrics]
 ---
 

@@ -2,7 +2,7 @@
 decision_type: design
 affected_paths:
   - docs/design.md
-depends_on: [0040, 0041, 0042]
+depends_on: [0040, 0042, 0043]
 tags: [design, otel, export, responsibility]
 ---
 
@@ -25,7 +25,7 @@ Created: 2026-05-30
 
 ## 対応方針
 
-[0041] / [0042] の実装が固まったあとに着手する（後続 PR で 1 セクション追記）:
+[0042] / [0043] の実装が固まったあとに着手する（後続 PR で 1 セクション追記）:
 
 1. `docs/design.md` の既存「採用しなかった代替」/「外部 backend」周辺に責務分担セクションを追加
 2. cross-event 集約が client / SQLite VIEW にロックインされる理由（join 不可）を明記
