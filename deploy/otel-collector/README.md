@@ -50,7 +50,7 @@ token = "${COLLECTOR_TOKEN}"                  # Collector の前段に置く認�
 ## 使い方
 
 1. `DD_API_KEY` / `DD_SITE`（既定 `datadoghq.com`）/ `DEPLOY_ENV` を環境変数で設定。
-2. `collector-config.yaml` で Collector を起動（[OpenTelemetry Collector Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib) ディストリビューションが必要 — `datadog` exporter / `transform` / `resource` processor を含む）。ローカル検証は同梱の `docker-compose.yaml`:
+2. `collector-config.yaml` で Collector を起動（[OpenTelemetry Collector Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib) ディストリビューションが必要 — `datadog` exporter / `transform` / `resource` processor を含む）。再現性のため image は `otel/opentelemetry-collector-contrib:0.153.0` に pin している（`:latest` だと OTTL の挙動が版で動く）。ローカル検証は同梱の `docker-compose.yaml`:
 
    ```fish
    set -x DD_API_KEY <your-datadog-api-key>
