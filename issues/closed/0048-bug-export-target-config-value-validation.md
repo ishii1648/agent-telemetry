@@ -5,6 +5,7 @@ affected_paths:
   - internal/serverclient/flush.go
   - internal/doctor/doctor.go
 tags: [otel, export, config, validation, datadog]
+closed_at: 2026-05-30
 ---
 
 # export target config の `encoding` / `signals` 値が未検証で不正値が silent に通る
@@ -85,3 +86,26 @@ flush[claude]: export target 設定なし — eligible=112 sent=0 (skipped netwo
 - 併せて `doctor` に export target の lint（`LoadConfig` を呼んでエラーを表示、
   representation を持たない target の警告）を足すか検討する。
 - 関連実装: [0042] flush export target 配列化。
+
+Completed: 2026-05-30
+
+## 解決方法
+
+`LoadConfig`（`internal/serverclient/config.go`）に `validateTarget` を追加し、
+`normalizeTarget` の defaulting 後に **`encoding ∈ {json, protobuf}`・
+`signals ⊆ {logs, metrics}`** を allow-list 検証して、`id` 検証と同じく
+fail-fast させた。空値は従来どおり default 補完されるため、検証が見るのは
+「非空かつ未知値」のみ。エラーメッセージは target id と許容値を含む。
+encoding/signals のリテラルは `signalJSON`/`signalProtobuf`/`signalLogs`/
+`signalMetrics` 定数に集約し、`defaultEncoding = signalJSON` とした。
+
+`config_test.go` に「不正 encoding」「不正 signal」「複数 signal の一部が不正」
+の 3 ケースを追加。既存テスト（重複 id・欠落 id・正常系・legacy [server]）は不変。
+
+### フォローアップ（未対応）
+
+`doctor` への export config lint（`LoadConfig` を呼んで設定エラー／representation
+を持たない target を表示）は本 PR の scope 外として見送った。silent 受理という
+本バグは flush が実際に config を読む `LoadConfig` の fail-fast で解消済み。
+doctor lint は診断強化の別タスクとして残す（`internal/doctor` に新 check +
+Report フィールド + writer + Env 注入テストが必要で、chore 寄りの拡張）。

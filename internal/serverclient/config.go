@@ -27,9 +27,16 @@ import (
 const (
 	defaultAuthHeader = "Authorization"
 	defaultAuthScheme = "Bearer"
-	defaultEncoding   = "json"
-	signalLogs        = "logs"
-	signalMetrics     = "metrics"
+
+	// Allowed `encoding` values (issue 0048 allow-list). signalJSON is also the
+	// default applied when the key is omitted.
+	signalJSON      = "json"
+	signalProtobuf  = "protobuf"
+	defaultEncoding = signalJSON
+
+	// Allowed `signals` values (issue 0048 allow-list).
+	signalLogs    = "logs"
+	signalMetrics = "metrics"
 
 	// legacyServerTargetID is the stable target_id synthesized for a config
 	// that only has the legacy [server] section. Keeping it stable lets the
@@ -179,6 +186,11 @@ func LoadConfig(path string) ([]ExportTarget, error) {
 	if err := assertUniqueIDs(targets); err != nil {
 		return nil, err
 	}
+	for i := range targets {
+		if err := validateTarget(targets[i]); err != nil {
+			return nil, err
+		}
+	}
 	return targets, nil
 }
 
@@ -222,6 +234,29 @@ func normalizeTarget(t *ExportTarget) {
 	if len(t.Signals) == 0 {
 		t.Signals = []string{signalLogs}
 	}
+}
+
+// validateTarget rejects non-empty but unknown `encoding` / `signals` values
+// (issue 0048). normalizeTarget runs first, so empty values are already
+// defaulted (json / ["logs"]); this only ever sees configured values. Unknown
+// values are fail-fast like a missing/duplicate id rather than silently
+// fed to encodeBatch's JSON default branch (encoding) or dropped from both
+// logs/metrics target sets (signals), which made flush mislabel the wire or
+// report "export target 設定なし" with exit 0.
+func validateTarget(t ExportTarget) error {
+	switch t.Encoding {
+	case signalJSON, signalProtobuf:
+	default:
+		return fmt.Errorf("export target %q: unknown encoding %q (allowed: %q, %q)", t.ID, t.Encoding, signalJSON, signalProtobuf)
+	}
+	for _, s := range t.Signals {
+		switch s {
+		case signalLogs, signalMetrics:
+		default:
+			return fmt.Errorf("export target %q: unknown signal %q (allowed: %q, %q)", t.ID, s, signalLogs, signalMetrics)
+		}
+	}
+	return nil
 }
 
 // assertUniqueIDs rejects duplicate target ids: cursors are keyed by id, so two
