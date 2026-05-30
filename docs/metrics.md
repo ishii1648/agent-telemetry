@@ -145,6 +145,23 @@ agent 跨ぎでは `model` / `agent_version` の混在で平均化が壊れや�
 
 snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セッションで複数行が events に残り、VIEW が `MAX(local_sequence)` で最新を採る。
 
+### 外部 backend 上の representation
+
+各メトリクスは外部 observability backend 上で 2 通りの representation のどちらかで再現する（join 不可ゆえに 2 表現へ分けた帰結は親 issue [0040] を参照）。カタログ各表の **representation** 列がメトリクスごとの分類を示す。
+
+- **gauge** — client がローカル `pr_metrics` VIEW を集約し、PR 単位の pre-aggregated 値を OTLP Metrics gauge（last-value）として送る（[0043]）。`agent_pr_*` 系がこれにあたり、backend では同名の gauge series をそのまま参照する（range 集計は `last` を取る前提。naive な SUM は二重計上になる）
+- **event-level** — raw events（OTLP Logs）の attribute を backend の measure / 次元タグに昇格し（attribute の意味分類は [0044] / `docs/spec.md`）、backend formula（count / sum / 区間計算）で算出する。session 単位・同時実行数の各メトリクスがこれにあたる
+
+event-level の backend formula 例（Datadog の log-based metric。`agent.transcript.scanned` ログから token 流量を出す場合）:
+
+```
+metric 名 : agent.session.input_tokens
+集計      : sum of @input_tokens   （measure）
+group by  : @coding_agent, @model, @repo   （次元タグ）
+```
+
+snapshot 系（`transcript.scanned` / `pr.observed`）は同一 session で複数ログが残るため、event-level で count / sum を取る際は latest-wins の重複を考慮する（PR 単位の正しい集約は join が要るので gauge 側で担保する。だからこその 2 表現分け）。
+
 ### セッション単位（`sessions` + `transcript_stats` VIEW）
 
 すべてのセッション単位メトリクスは次の共通ラベル集合を持つ:
@@ -162,23 +179,23 @@ snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セ�
 | `parent_session_id` | 親セッション ID（top-level なら空） |
 | `end_reason` | SessionEnd hook の終了理由（Codex は `stop` 固定） |
 
-| メトリクス名 | 型 | 値 | 説明 |
-|---|---|---|---|
-| `agent_session_tool_use_total` | counter | int | セッション内のツール呼び出し回数 |
-| `agent_session_mid_session_msgs_total` | counter | int | セッション中の人間追加メッセージ数（`tool_result` のみで構成されるエントリは除外） |
-| `agent_session_ask_user_question_total` | counter | int | AskUserQuestion ツール発火回数（Codex は常に 0） |
-| `agent_session_input_tokens_total` | counter | int | 入力トークン |
-| `agent_session_output_tokens_total` | counter | int | 出力トークン |
-| `agent_session_cache_write_tokens_total` | counter | int | プロンプトキャッシュへの書き込みトークン |
-| `agent_session_cache_read_tokens_total` | counter | int | プロンプトキャッシュからの読み込みトークン |
-| `agent_session_reasoning_tokens_total` | counter | int | reasoning トークン（Claude は常に 0。Anthropic API が thinking を `output_tokens` から分離しないため） |
-| `agent_session_started_timestamp_seconds` | gauge | int | セッション開始時刻（Unix epoch） |
-| `agent_session_ended_timestamp_seconds` | gauge | int | セッション終了時刻（Unix epoch、未設定なら 0） |
-| `agent_session_is_subagent` | gauge | 0\|1 | `parent_session_id` が非空なら 1 |
-| `agent_session_is_ghost` | gauge | 0\|1 | transcript に user 相当エントリが 0 件なら 1 |
-| `agent_session_pr_merged` | gauge | 0\|1 | セッションの PR が merged なら 1 |
-| `agent_session_pr_review_comments` | gauge | int | セッションの PR のレビューコメント数 |
-| `agent_session_pr_changes_requested` | gauge | int | セッションの PR の CHANGES_REQUESTED レビュー数 |
+| メトリクス名 | 型 | 値 | representation | 説明 |
+|---|---|---|---|---|
+| `agent_session_tool_use_total` | counter | int | event-level | セッション内のツール呼び出し回数 |
+| `agent_session_mid_session_msgs_total` | counter | int | event-level | セッション中の人間追加メッセージ数（`tool_result` のみで構成されるエントリは除外） |
+| `agent_session_ask_user_question_total` | counter | int | event-level | AskUserQuestion ツール発火回数（Codex は常に 0） |
+| `agent_session_input_tokens_total` | counter | int | event-level | 入力トークン |
+| `agent_session_output_tokens_total` | counter | int | event-level | 出力トークン |
+| `agent_session_cache_write_tokens_total` | counter | int | event-level | プロンプトキャッシュへの書き込みトークン |
+| `agent_session_cache_read_tokens_total` | counter | int | event-level | プロンプトキャッシュからの読み込みトークン |
+| `agent_session_reasoning_tokens_total` | counter | int | event-level | reasoning トークン（Claude は常に 0。Anthropic API が thinking を `output_tokens` から分離しないため） |
+| `agent_session_started_timestamp_seconds` | gauge | int | event-level | セッション開始時刻（Unix epoch） |
+| `agent_session_ended_timestamp_seconds` | gauge | int | event-level | セッション終了時刻（Unix epoch、未設定なら 0） |
+| `agent_session_is_subagent` | gauge | 0\|1 | event-level | `parent_session_id` が非空なら 1 |
+| `agent_session_is_ghost` | gauge | 0\|1 | event-level | transcript に user 相当エントリが 0 件なら 1 |
+| `agent_session_pr_merged` | gauge | 0\|1 | event-level | セッションの PR が merged なら 1 |
+| `agent_session_pr_review_comments` | gauge | int | event-level | セッションの PR のレビューコメント数 |
+| `agent_session_pr_changes_requested` | gauge | int | event-level | セッションの PR の CHANGES_REQUESTED レビュー数 |
 
 ### PR 単位の集約（`pr_metrics` VIEW）
 
@@ -186,24 +203,26 @@ snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セ�
 
 ラベル: `pr_url`, `coding_agent`, `model`
 
-| メトリクス名 | 型 | 値 | 説明 |
-|---|---|---|---|
-| `agent_pr_session_count` | gauge | int | PR に寄与したセッション数 |
-| `agent_pr_tool_use_total` | counter | int | PR 内全セッションのツール呼び出し合計 |
-| `agent_pr_mid_session_msgs_total` | counter | int | PR 内全セッションの mid_session_msgs 合計 |
-| `agent_pr_ask_user_question_total` | counter | int | PR 内全セッションの AskUserQuestion 合計 |
-| `agent_pr_input_tokens_total` | counter | int | PR 全セッションの input トークン合計 |
-| `agent_pr_output_tokens_total` | counter | int | PR 全セッションの output トークン合計 |
-| `agent_pr_cache_write_tokens_total` | counter | int | PR 全セッションの cache write トークン合計 |
-| `agent_pr_cache_read_tokens_total` | counter | int | PR 全セッションの cache read トークン合計 |
-| `agent_pr_reasoning_tokens_total` | counter | int | PR 全セッションの reasoning トークン合計 |
-| `agent_pr_total_tokens` | counter | int | input + output + cache_write + cache_read + reasoning の合計 |
-| `agent_pr_fresh_tokens` | counter | int | input + output + cache_write + reasoning（`cache_read` を除外、実質的な作業量に近い） |
-| `agent_pr_review_comments` | gauge | int | PR レビューコメント数 |
-| `agent_pr_changes_requested` | gauge | int | CHANGES_REQUESTED レビュー数 |
-| `agent_pr_tokens_per_session` | gauge | float | PR 内の平均セッショントークン（派生） |
-| `agent_pr_tokens_per_tool_use` | gauge | float | PR 内のツール 1 回あたりトークン（派生） |
-| `agent_pr_per_million_tokens` | gauge | float | 100 万 token あたりに完了した PR 数（効率の逆数指標、派生） |
+representation は全行 **gauge**（client がローカル `pr_metrics` VIEW を集約し OTLP Metrics gauge として送る。[0043]）。backend では同名 gauge series を `last` で参照する。
+
+| メトリクス名 | 型 | 値 | representation | 説明 |
+|---|---|---|---|---|
+| `agent_pr_session_count` | gauge | int | gauge | PR に寄与したセッション数 |
+| `agent_pr_tool_use_total` | counter | int | gauge | PR 内全セッションのツール呼び出し合計 |
+| `agent_pr_mid_session_msgs_total` | counter | int | gauge | PR 内全セッションの mid_session_msgs 合計 |
+| `agent_pr_ask_user_question_total` | counter | int | gauge | PR 内全セッションの AskUserQuestion 合計 |
+| `agent_pr_input_tokens_total` | counter | int | gauge | PR 全セッションの input トークン合計 |
+| `agent_pr_output_tokens_total` | counter | int | gauge | PR 全セッションの output トークン合計 |
+| `agent_pr_cache_write_tokens_total` | counter | int | gauge | PR 全セッションの cache write トークン合計 |
+| `agent_pr_cache_read_tokens_total` | counter | int | gauge | PR 全セッションの cache read トークン合計 |
+| `agent_pr_reasoning_tokens_total` | counter | int | gauge | PR 全セッションの reasoning トークン合計 |
+| `agent_pr_total_tokens` | counter | int | gauge | input + output + cache_write + cache_read + reasoning の合計 |
+| `agent_pr_fresh_tokens` | counter | int | gauge | input + output + cache_write + reasoning（`cache_read` を除外、実質的な作業量に近い） |
+| `agent_pr_review_comments` | gauge | int | gauge | PR レビューコメント数 |
+| `agent_pr_changes_requested` | gauge | int | gauge | CHANGES_REQUESTED レビュー数 |
+| `agent_pr_tokens_per_session` | gauge | float | gauge | PR 内の平均セッショントークン（派生） |
+| `agent_pr_tokens_per_tool_use` | gauge | float | gauge | PR 内のツール 1 回あたりトークン（派生） |
+| `agent_pr_per_million_tokens` | gauge | float | gauge | 100 万 token あたりに完了した PR 数（効率の逆数指標、派生） |
 
 ### 同時実行数（`session_concurrency_daily` / `session_concurrency_weekly` VIEW）
 
@@ -211,10 +230,12 @@ snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セ�
 
 ラベル: `coding_agent`, `bucket`（`day` または `week`）, `bucket_start`（ISO8601 日付）
 
-| メトリクス名 | 型 | 値 | 説明 |
-|---|---|---|---|
-| `agent_concurrent_sessions_avg` | gauge | float | bucket 内の平均同時実行数 |
-| `agent_concurrent_sessions_peak` | gauge | int | bucket 内のピーク同時実行数 |
+| メトリクス名 | 型 | 値 | representation | 説明 |
+|---|---|---|---|---|
+| `agent_concurrent_sessions_avg` | gauge | float | event-level | bucket 内の平均同時実行数 |
+| `agent_concurrent_sessions_peak` | gauge | int | event-level | bucket 内のピーク同時実行数 |
+
+同時実行数は `started` / `ended` の区間重なりから算出するため、backend では `agent_session_started/ended_timestamp_seconds`（event-level）の生ログに対する区間計算で再現する。単純な count / sum では出ない点に注意（`pr_metrics` gauge には含めない）。
 
 ---
 
