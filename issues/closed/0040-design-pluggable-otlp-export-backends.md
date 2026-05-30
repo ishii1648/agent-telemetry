@@ -7,6 +7,7 @@ affected_paths:
   - internal/serverclient/
 depends_on: [0038]
 tags: [otel, export, pluggable-backend, observability-backend, datadog, semantic-conventions]
+closed_at: 2026-05-30
 ---
 
 # OTLP events のエクスポート先バックエンドをプラガブルにする
@@ -175,3 +176,30 @@ Grafana 版（`grafana/dashboards/agent-telemetry.json`、SQLite datasource 前�
 ## 前提
 
 本 issue は [0038] の実装（OTLP/HTTP + events table + flush 経路の rename + migration）が一通り完了している前提で着手する。[0038] が pending / 実装中の間は本 issue も pending として扱ってよい。
+
+Completed: 2026-05-30
+
+## 解決方法
+
+本 issue は design issue であり、PR の完了条件は (i) A/B の設計判断を issue 本文に記録、(ii) [0038] と矛盾する `docs/design.md` の「OTLP Metrics 不採用・Logs 統一」記述を同期更新の 2 点に限定して定義した。
+
+- (i) は本文「概要」「対応方針」節に A（設定可能な OTLP export / 2 representation / direct / collector / cursor 契約 / endpoint モデル / encoding/protocol 差）と B（attribute の意味分類、raw events と `pr_metrics` gauge の責務分け、join 不可の帰結）として記録した
+- (ii) は commit [`3e89893`] / [`b22e538`] で `docs/design.md` の該当「採用しなかった代替」記述を改訂し、「server への内部転送は Logs のまま、外部 backend 向けの `pr_metrics` gauge にのみ OTLP Metrics を併用する」と [0040] の判断を反映済み
+
+実装は本 issue 本文の「段階実装」で挙げた child issue に分解した:
+
+- [0042] feat: flush を export target 配列に拡張（A、direct/collector 同梱、Datadog をリファレンス）
+- [0043] feat: `pr_metrics` の client 側集約 + OTLP Metrics gauge 送信（A、効率指標、gauge temporality/timestamp spike 含む）
+- [0044] spec: attribute の意味分類を `docs/spec.md` に追記（B、direct 用 Datadog Logs Pipeline + collector processor サンプル同梱）
+- [0045] doc: `docs/metrics.md` に backend 上の representation 対応を追記（任意）
+- [0046] design: `docs/design.md` に client / server / Collector / 外部 backend の責務分担を追記
+
+> Note: 当初 0041〜0045 で発番していたが、origin/main で 0041 が `0041-bug-upgrade-github-api-auth` に占有済みだったため renumber して衝突回避した。
+
+## 採用しなかった代替
+
+- **event 名を OTel `gen_ai.*` semantic conventions に寄せる**: PR 単位のトークン効率・transcript scan の latest-wins snapshot は `gen_ai.*`（個々の LLM 呼び出しを記述）に構造的にマップできない。部分寄せは二重命名が増えるだけで OOTB 認識の利得が出ない
+- **backend 側で `pr_metrics` を再現する formula**: log-metric backend は record 間 join をしないため不可能。client がローカル VIEW で集約して gauge 送信する経路（[0043]）に決定
+- **denormalized な session-rollup を log で送り backend で集約**: `session_id` を高 cardinality tag にせざるを得ず custom metric が膨張、log の sum も二重カウントしやすい。代わりに PR 単位 gauge に決定
+- **client 直送 / Collector / やらない の 3 択**: 「設定可能な OTLP export」1 能力に畳み、direct / collector はデプロイレシピとして両対応する整理に変更（「やらない」は能力に内包される）
+- **Datadog 以外の backend を同 PR でリファレンス化**: 検証対象を 1 つに固定するため Datadog 1 本に絞り、横展開は同じ A + B 上の後続 issue に回す
