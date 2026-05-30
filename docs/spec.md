@@ -492,7 +492,7 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 
 ### 群ごとの補足
 
-- **群 1（低 cardinality 次元タグ）**: フィルタ・group-by の軸。`user_id` は `pr_metrics` の GROUP BY 軸（`pr_url` / `coding_agent` / `user_id`、本文書「pr_metrics VIEW」参照）で、cardinality はユーザ数で有界なため次元タグに含める。
+- **群 1（低 cardinality 次元タグ）**: フィルタ・group-by の軸。`user_id` は `pr_metrics` の GROUP BY 軸（`pr_url` / `coding_agent` / `user_id`、本文書「pr_metrics VIEW」参照）で、cardinality はユーザ数で有界なため次元タグに含める。`task_type` は raw attribute としては載らず、`is_subagent` と同様 `branch`（`feat/` / `fix/` / `docs/` / `chore/` プレフィックス）から backend / pipeline 側で導出する（raw events には `branch` のみが載る）。よって collector レシピで `branch` を drop する場合は drop 前に `task_type` を導出すること。
 - **群 2（`pr_url`）**: PR 単位 gauge の主キーで、群 1 の有界な group-by 軸とは性質が違う。**PR が増えるほど timeseries が単調増加する**ため、`session_id`（無制限・再送のたび増殖）よりは穏当だが custom metric cardinality のコストドライバになる。古い PR を retention / rollup で畳むのは backend 側の運用。
 - **群 3（高 cardinality 識別子）**: backend では検索 facet にはするが **次元タグには昇格しない**。次元タグにすると課金・index が破綻する。`is_subagent` はこの群の `parent_session_id`（非空なら subagent）から導出される（raw attribute としては `parent_session_id` のみが載る）。
 - **群 4（数値 measure）**: measure に昇格しないと数値属性が集計対象にならず埋もれる。group-by はせず集計値として使う。
