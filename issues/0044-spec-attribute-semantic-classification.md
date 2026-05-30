@@ -5,6 +5,9 @@ affected_paths:
   - deploy/otel-collector/
 depends_on: [0040]
 tags: [otel, export, semantic-conventions, datadog, attributes]
+# 0042 が生成する collector レシピへ processor サンプルを追加配置する path
+lint_ignore_missing:
+  - deploy/otel-collector/
 ---
 
 # attribute の意味分類を `docs/spec.md` に追記（backend 非依存 + Datadog リファレンス）

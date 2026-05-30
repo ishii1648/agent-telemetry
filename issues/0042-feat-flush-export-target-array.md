@@ -7,6 +7,9 @@ affected_paths:
   - deploy/otel-collector/
 depends_on: [0040]
 tags: [otel, export, pluggable-backend, datadog, collector]
+# 本 issue 自身が将来生成する collector レシピの配置先
+lint_ignore_missing:
+  - deploy/otel-collector/
 ---
 
 # flush を export target 配列に拡張（OTLP/HTTP pluggable export）
