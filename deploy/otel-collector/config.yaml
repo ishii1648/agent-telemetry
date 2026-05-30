@@ -1,0 +1,71 @@
+# agent-telemetry — OTel Collector recipe (collector deployment)
+#
+# Role: the client flushes raw events as OTLP/HTTP **JSON Logs** to this
+# Collector (no client changes — the default `encoding = "json"` target). The
+# Collector holds the backend credential and fans out to the chosen
+# destinations. This is the recommended shape for teams / many clients: the
+# Datadog API key lives in ONE place and clients carry no secret (RUM-equivalent
+# trust model — see issues/closed/0040-design-pluggable-otlp-export-backends.md).
+#
+# What the Collector does that the client cannot do directly:
+#   - converts OTLP Logs JSON -> the Datadog exporter's protobuf + DD-API-KEY
+#     (Datadog's direct OTLP Logs intake requires protobuf; the Collector hides
+#     that, so clients keep the simple JSON exporter)
+#   - fans out to multiple destinations (Datadog, and optionally the
+#     agent-telemetry-server for the SQLite/Grafana path)
+#
+# Client config to point at this Collector (no DD key on the client):
+#   [[export]]
+#   id = "collector"
+#   endpoint = "http://collector-host:4318"   # base; client appends /v1/logs
+#   token = "${COLLECTOR_TOKEN}"              # whatever auth you put in front
+#
+# Env required when running this Collector:
+#   DD_API_KEY  — Datadog ingestion API key (org-scoped submit credential)
+#   DD_SITE     — e.g. datadoghq.com, datadoghq.eu, us5.datadoghq.com
+
+receivers:
+  # Clients POST OTLP/HTTP JSON to /v1/logs on this listener.
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bound batches before export (Datadog recommends batching).
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+  # NOTE: attribute reshaping (rename / resource enrichment / dropping
+  # high-cardinality identifiers) for event-level analysis is defined in
+  # child issue 0044 as a Collector processor sample. It is intentionally
+  # NOT included here so this recipe stays focused on the 0042 transport
+  # plumbing. facet/measure promotion is a Datadog-side index setting that a
+  # processor cannot replace (0040 B).
+
+exporters:
+  # Reference backend: Datadog. The exporter performs the protobuf + DD-API-KEY
+  # conversion the client would otherwise need for a direct connection.
+  datadog:
+    api:
+      key: ${env:DD_API_KEY}
+      site: ${env:DD_SITE}
+
+  # Optional second destination: forward the same raw events to the
+  # agent-telemetry-server so the SQLite + Grafana path keeps working in
+  # parallel. Drop this exporter (and from the pipeline) for a Datadog-only
+  # deployment.
+  otlphttp/server:
+    logs_endpoint: ${env:AGENT_TELEMETRY_SERVER_URL}/v1/logs
+    headers:
+      Authorization: Bearer ${env:AGENT_TELEMETRY_SERVER_TOKEN}
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      # Fan out: Datadog + (optional) our server. Remove otlphttp/server for
+      # a Datadog-only fanout.
+      exporters: [datadog, otlphttp/server]

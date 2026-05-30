@@ -1,36 +1,77 @@
 // Package serverclient implements `agent-telemetry flush`: extracting unsent
-// events from the local sync-db SQLite and POSTing them as OTLP/HTTP Logs to a
-// central server's /v1/logs endpoint.
+// events from the local sync-db SQLite and POSTing them as OTLP/HTTP to one or
+// more configured export targets (a central agent-telemetry-server, an OTel
+// Collector, or a backend OTLP intake such as Datadog).
 //
-// The on-disk contract (state.json `last_flushed_sequence`, OTLP payload shape)
-// is documented in docs/spec.md ## サーバ送信. The reasons behind the
-// append-only event-sourced design are recorded in
-// issues/closed/0038-spec-event-sourced-metrics-otel.md (it supersedes the
-// /v1/metrics aggregated-row push from 0009).
+// The on-disk contract (config `[[export]]` targets, state.json per-target
+// cursors, OTLP payload shape) is documented in docs/spec.md ## サーバ送信. The
+// reasons behind the append-only event-sourced design are recorded in
+// issues/closed/0038-spec-event-sourced-metrics-otel.md; the pluggable export
+// target design is recorded in
+// issues/closed/0040-design-pluggable-otlp-export-backends.md and implemented
+// per issues/0042-feat-flush-export-target-array.md.
 package serverclient
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strings"
 
 	"github.com/ishii1648/agent-telemetry/internal/configpath"
 )
 
-// ServerConfig holds the resolved [server] section from agent-telemetry.toml.
-// Both fields must be non-empty for flush to attempt a network call; that gate
-// is enforced by Configured().
-type ServerConfig struct {
-	Endpoint string
-	Token    string
+// Default values applied to an ExportTarget when the corresponding config key
+// is omitted. The defaults reproduce the legacy single-[server] behavior
+// (Bearer auth, JSON OTLP, logs only) so existing configs keep working.
+const (
+	defaultAuthHeader = "Authorization"
+	defaultAuthScheme = "Bearer"
+	defaultEncoding   = "json"
+	signalLogs        = "logs"
+	signalMetrics     = "metrics"
+
+	// legacyServerTargetID is the stable target_id synthesized for a config
+	// that only has the legacy [server] section. Keeping it stable lets the
+	// per-target cursor (state.json flush_cursors) survive the migration from
+	// the old single last_flushed_sequence field.
+	legacyServerTargetID = "server"
+)
+
+// ExportTarget is one resolved OTLP/HTTP destination. It carries everything
+// that differs between a central server, an OTel Collector, and a backend
+// intake: where to send, how to authenticate, and how to encode the wire bytes.
+//
+// ID is the *stable* identity used as the per-target cursor key in state.json.
+// It is intentionally decoupled from Endpoint so that changing a URL does not
+// orphan the cursor and re-send every event (0040 cursor contract).
+type ExportTarget struct {
+	ID         string
+	Endpoint   string
+	Token      string
+	AuthHeader string   // HTTP header carrying credentials (e.g. "Authorization", "dd-api-key")
+	AuthScheme string   // value prefix (e.g. "Bearer"); empty means the raw token
+	Encoding   string   // "json" or "protobuf"
+	Signals    []string // representations to send: "logs" (this issue), "metrics" (0043)
 }
 
-// Configured reports whether the [server] section is populated enough to send
-// a request. A missing config is intentionally not an error — `agent-telemetry
-// flush` is meant to be safe in cron without first checking whether the user
-// has opted into server upload.
-func (c ServerConfig) Configured() bool {
-	return c.Endpoint != "" && c.Token != ""
+// Configured reports whether the target can attempt a network call. An empty
+// endpoint or token is treated as "not opted in" rather than an error, so
+// flush stays safe in cron.
+func (t ExportTarget) Configured() bool {
+	return t.Endpoint != "" && t.Token != ""
+}
+
+// SendsLogs reports whether this target wants the raw-events (OTLP Logs)
+// representation. Targets default to logs-only; the pr_metrics gauge (OTLP
+// Metrics) representation is added by 0043.
+func (t ExportTarget) SendsLogs() bool {
+	for _, s := range t.Signals {
+		if s == signalLogs {
+			return true
+		}
+	}
+	return false
 }
 
 // ConfigPath returns the resolved path of agent-telemetry's TOML config
@@ -41,53 +82,182 @@ func ConfigPath() string {
 	return configpath.Resolve()
 }
 
-// LoadConfig reads the [server] section of the TOML file. Missing file or
-// missing keys returns a zero-value ServerConfig with no error — the caller
-// inspects Configured() to decide whether to proceed.
+// LoadConfig reads the export targets from the TOML file. It accepts two
+// shapes, which may coexist:
 //
-// The parser is intentionally minimal (no nested tables, no arrays) to match
-// userid.readConfigUser. Adding a real TOML library is overkill for the two
-// keys this project reads.
-func LoadConfig(path string) (ServerConfig, error) {
+//   - The legacy [server] section (endpoint + token), normalized into a single
+//     target with the stable id "server", Bearer auth, JSON encoding, logs only.
+//   - One or more [[export]] array-of-tables entries, each a full ExportTarget
+//     with per-target auth header/scheme, encoding, and signals.
+//
+// Missing file or no targets returns an empty slice with no error — the caller
+// decides whether to proceed based on whether any target is Configured().
+//
+// The parser is intentionally minimal (line-based, only the keys this project
+// reads) to match userid.readConfigUser; a full TOML library is overkill for
+// the handful of keys here. Array-of-tables support is limited to the flat
+// [[export]] shape documented in docs/spec.md.
+func LoadConfig(path string) ([]ExportTarget, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return ServerConfig{}, nil
+			return nil, nil
 		}
-		return ServerConfig{}, err
+		return nil, err
 	}
 	defer f.Close()
 
-	cfg := ServerConfig{}
-	inServer := false
+	var server ExportTarget // legacy [server] accumulator
+	hasServer := false
+	var exports []ExportTarget
+	section := "" // "", "server", or "export" (current [[export]] table)
+
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") {
-			inServer = strings.HasPrefix(line, "[server]")
+		if strings.HasPrefix(line, "[[export]]") {
+			section = "export"
+			exports = append(exports, ExportTarget{})
 			continue
 		}
-		if !inServer {
+		if strings.HasPrefix(line, "[") {
+			if strings.HasPrefix(line, "[server]") {
+				section = "server"
+				hasServer = true
+			} else {
+				section = ""
+			}
 			continue
 		}
 		key, value, ok := splitKV(line)
 		if !ok {
 			continue
 		}
-		switch key {
-		case "endpoint":
-			cfg.Endpoint = unquote(value)
-		case "token":
-			cfg.Token = unquote(value)
+		switch section {
+		case "server":
+			switch key {
+			case "endpoint":
+				server.Endpoint = unquote(value)
+			case "token":
+				server.Token = expandEnv(unquote(value))
+			}
+		case "export":
+			applyExportKey(&exports[len(exports)-1], key, value)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return ServerConfig{}, err
+		return nil, err
 	}
-	return cfg, nil
+
+	var targets []ExportTarget
+	if hasServer {
+		server.ID = legacyServerTargetID
+		normalizeTarget(&server)
+		targets = append(targets, server)
+	}
+	for i := range exports {
+		if exports[i].ID == "" {
+			return nil, fmt.Errorf("[[export]] entry #%d missing required `id`", i+1)
+		}
+		normalizeTarget(&exports[i])
+		targets = append(targets, exports[i])
+	}
+	if err := assertUniqueIDs(targets); err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
+// applyExportKey sets one key on the in-progress [[export]] target.
+func applyExportKey(t *ExportTarget, key, value string) {
+	switch key {
+	case "id":
+		t.ID = unquote(value)
+	case "endpoint":
+		t.Endpoint = unquote(value)
+	case "token":
+		t.Token = expandEnv(unquote(value))
+	case "auth_header":
+		t.AuthHeader = unquote(value)
+	case "auth_scheme":
+		t.AuthScheme = unquote(value)
+	case "encoding":
+		t.Encoding = unquote(value)
+	case "signals":
+		t.Signals = parseStringArray(value)
+	}
+}
+
+// normalizeTarget fills in defaults for any unset field so callers never see
+// an empty auth header / encoding / signal list.
+func normalizeTarget(t *ExportTarget) {
+	if t.AuthHeader == "" {
+		t.AuthHeader = defaultAuthHeader
+	}
+	// AuthScheme is intentionally left as-is: an explicit empty string is a
+	// valid choice (raw token, no prefix — e.g. dd-api-key). We only default
+	// it when the key was never present, which the parser can't distinguish
+	// from "" on its own; the [server] legacy path and the documented default
+	// both want "Bearer", so we default only when the header is the default.
+	if t.AuthHeader == defaultAuthHeader && t.AuthScheme == "" {
+		t.AuthScheme = defaultAuthScheme
+	}
+	if t.Encoding == "" {
+		t.Encoding = defaultEncoding
+	}
+	if len(t.Signals) == 0 {
+		t.Signals = []string{signalLogs}
+	}
+}
+
+// assertUniqueIDs rejects duplicate target ids: cursors are keyed by id, so two
+// targets sharing an id would clobber each other's cursor.
+func assertUniqueIDs(targets []ExportTarget) error {
+	seen := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		if seen[t.ID] {
+			return fmt.Errorf("duplicate export target id %q (ids must be unique; they key the per-target cursor)", t.ID)
+		}
+		seen[t.ID] = true
+	}
+	return nil
+}
+
+// parseStringArray parses a minimal inline TOML string array:
+// `["logs", "metrics"]`. Anything it can't parse yields an empty slice, which
+// normalizeTarget then defaults to ["logs"].
+func parseStringArray(value string) []string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "[")
+	value = strings.TrimSuffix(value, "]")
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		s := unquote(strings.TrimSpace(part))
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// expandEnv resolves a ${VAR} reference so secrets (Datadog API keys) can live
+// in the environment instead of being written into config.toml. Only the exact
+// form "${VAR}" is expanded; any other value is returned verbatim so tokens
+// that legitimately contain "$" are not mangled.
+func expandEnv(v string) string {
+	if strings.HasPrefix(v, "${") && strings.HasSuffix(v, "}") {
+		name := v[2 : len(v)-1]
+		if name != "" {
+			return os.Getenv(name)
+		}
+	}
+	return v
 }
 
 func splitKV(line string) (key, value string, ok bool) {

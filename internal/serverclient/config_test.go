@@ -6,9 +6,22 @@ import (
 	"testing"
 )
 
-func TestLoadConfig_ServerSection(t *testing.T) {
+// targetByID is a test helper that finds a parsed target by its stable id.
+func targetByID(targets []ExportTarget, id string) (ExportTarget, bool) {
+	for _, t := range targets {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return ExportTarget{}, false
+}
+
+// TestLoadConfig_LegacyServerSection pins backward compatibility: a config with
+// only the legacy [server] section is normalized into a single target with the
+// stable id "server", Bearer auth, JSON encoding, and the logs signal.
+func TestLoadConfig_LegacyServerSection(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "agent-telemetry.toml")
+	path := filepath.Join(dir, "config.toml")
 	body := `user = "alice@example.com"
 
 [server]
@@ -18,81 +31,207 @@ token = "secret-token"
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadConfig(path)
+	targets, err := LoadConfig(path)
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Endpoint != "https://telemetry.example.com" {
-		t.Errorf("endpoint: got %q", cfg.Endpoint)
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
 	}
-	if cfg.Token != "secret-token" {
-		t.Errorf("token: got %q", cfg.Token)
+	srv, ok := targetByID(targets, legacyServerTargetID)
+	if !ok {
+		t.Fatalf("missing legacy server target: %+v", targets)
 	}
-	if !cfg.Configured() {
+	if srv.Endpoint != "https://telemetry.example.com" {
+		t.Errorf("endpoint: got %q", srv.Endpoint)
+	}
+	if srv.Token != "secret-token" {
+		t.Errorf("token: got %q", srv.Token)
+	}
+	if srv.AuthHeader != "Authorization" || srv.AuthScheme != "Bearer" {
+		t.Errorf("auth: got %q / %q, want Authorization / Bearer", srv.AuthHeader, srv.AuthScheme)
+	}
+	if srv.Encoding != "json" {
+		t.Errorf("encoding: got %q, want json", srv.Encoding)
+	}
+	if !srv.SendsLogs() {
+		t.Errorf("legacy server target should send logs: %+v", srv.Signals)
+	}
+	if !srv.Configured() {
 		t.Error("Configured() = false")
 	}
 }
 
 func TestLoadConfig_NoServerSection(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "agent-telemetry.toml")
+	path := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(path, []byte(`user = "alice@example.com"`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadConfig(path)
+	targets, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Configured() {
-		t.Errorf("Configured()=true on missing section: %+v", cfg)
+	if len(targets) != 0 {
+		t.Errorf("want 0 targets on missing section, got %d: %+v", len(targets), targets)
 	}
 }
 
 func TestLoadConfig_MissingFile(t *testing.T) {
-	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "nope.toml"))
+	targets, err := LoadConfig(filepath.Join(t.TempDir(), "nope.toml"))
 	if err != nil {
 		t.Fatalf("missing file should not error: %v", err)
 	}
-	if cfg.Configured() {
-		t.Error("missing file produced configured cfg")
+	if len(targets) != 0 {
+		t.Errorf("missing file produced %d targets", len(targets))
 	}
 }
 
-func TestLoadConfig_UnknownSectionIgnored(t *testing.T) {
+func TestLoadConfig_PartialServerNotConfigured(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "agent-telemetry.toml")
-	body := `[other]
-endpoint = "https://wrong"
-[server]
-endpoint = "https://right"
-token = "tok"
-`
-	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Endpoint != "https://right" {
-		t.Errorf("endpoint: got %q", cfg.Endpoint)
-	}
-}
-
-func TestLoadConfig_PartialSectionNotConfigured(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agent-telemetry.toml")
+	path := filepath.Join(dir, "config.toml")
 	body := `[server]
 endpoint = "https://only-endpoint"
 `
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadConfig(path)
+	targets, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Configured() {
-		t.Error("partial config should not be Configured()")
+	srv, ok := targetByID(targets, legacyServerTargetID)
+	if !ok {
+		t.Fatalf("want a server target even when partial: %+v", targets)
+	}
+	if srv.Configured() {
+		t.Error("partial config (no token) should not be Configured()")
+	}
+}
+
+// TestLoadConfig_ExportArray covers the new [[export]] array-of-tables: an
+// explicit id, a custom auth header with no scheme (raw token), protobuf
+// encoding, and ${VAR} token expansion from the environment.
+func TestLoadConfig_ExportArray(t *testing.T) {
+	t.Setenv("DD_API_KEY_TEST", "dd-secret")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "central"
+endpoint = "https://telemetry.example.com"
+token = "tok-central"
+
+[[export]]
+id = "datadog"
+endpoint = "https://otlp.datadoghq.com"
+token = "${DD_API_KEY_TEST}"
+auth_header = "dd-api-key"
+encoding = "protobuf"
+signals = ["logs"]
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("want 2 targets, got %d: %+v", len(targets), targets)
+	}
+
+	central, ok := targetByID(targets, "central")
+	if !ok {
+		t.Fatal("missing central target")
+	}
+	if central.AuthHeader != "Authorization" || central.AuthScheme != "Bearer" || central.Encoding != "json" {
+		t.Errorf("central defaults wrong: %+v", central)
+	}
+
+	dd, ok := targetByID(targets, "datadog")
+	if !ok {
+		t.Fatal("missing datadog target")
+	}
+	if dd.Token != "dd-secret" {
+		t.Errorf("env expansion failed: token=%q", dd.Token)
+	}
+	if dd.AuthHeader != "dd-api-key" {
+		t.Errorf("auth_header: got %q", dd.AuthHeader)
+	}
+	if dd.AuthScheme != "" {
+		t.Errorf("custom auth header should default to empty scheme (raw token), got %q", dd.AuthScheme)
+	}
+	if dd.Encoding != "protobuf" {
+		t.Errorf("encoding: got %q", dd.Encoding)
+	}
+}
+
+// TestLoadConfig_ServerAndExportCoexist verifies the legacy [server] and new
+// [[export]] entries are both surfaced as targets.
+func TestLoadConfig_ServerAndExportCoexist(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[server]
+endpoint = "https://legacy.example.com"
+token = "legacy-tok"
+
+[[export]]
+id = "datadog"
+endpoint = "https://otlp.datadoghq.com"
+token = "dd"
+auth_header = "dd-api-key"
+encoding = "protobuf"
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("want server + datadog, got %d: %+v", len(targets), targets)
+	}
+	if _, ok := targetByID(targets, legacyServerTargetID); !ok {
+		t.Error("legacy server target missing")
+	}
+	if _, ok := targetByID(targets, "datadog"); !ok {
+		t.Error("datadog target missing")
+	}
+}
+
+func TestLoadConfig_DuplicateIDRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "dup"
+endpoint = "https://a"
+token = "t1"
+
+[[export]]
+id = "dup"
+endpoint = "https://b"
+token = "t2"
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("duplicate target id must be rejected")
+	}
+}
+
+func TestLoadConfig_ExportMissingIDRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+endpoint = "https://a"
+token = "t1"
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("[[export]] without id must be rejected")
 	}
 }

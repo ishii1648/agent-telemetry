@@ -153,7 +153,7 @@ user = "ishii1492@gmail.com"
 | キー | 型 | 説明 |
 |---|---|---|
 | `user` | string | `session-index.jsonl` の `user_id` フィールドに焼き付ける識別子。形式は任意（メールアドレス / pseudonym / UUID 等）。複数マシンで同一人物として束ねたい場合はマシン間で同じ値を揃える運用 |
-| `[server]` セクション | table | サーバ送信を有効化する場合のみ設定する。詳細は本文書「サーバ送信」節を参照 |
+| `[server]` セクション / `[[export]]` 配列 | table / array-of-tables | サーバ送信（export）を有効化する場合のみ設定する。詳細は本文書「サーバ送信」節を参照 |
 
 ファイルが存在しない・キーが欠落・パース不能の場合は無視して次の優先順位にフォールバックする（hook を失敗させない）。
 
@@ -286,17 +286,21 @@ GROUP BY は (`pr_url`, `coding_agent`, `user_id`)。同一 PR が複数 agent /
 
 ## サーバ送信
 
-サーバ送信は **オプトイン** 機能。`~/.config/agent-telemetry/config.toml` の `[server]` セクションが設定された場合のみ有効になる。設定なしのローカル単独利用は従来通り動作する（旧パス `~/.claude/agent-telemetry.toml` も fallback として読まれる）。
+サーバ送信は **オプトイン** 機能。`~/.config/agent-telemetry/config.toml` に `[server]` または `[[export]]` が設定された場合のみ有効になる。設定なしのローカル単独利用は従来通り動作する（旧パス `~/.claude/agent-telemetry.toml` も fallback として読まれる）。
 
-転送モデルは **append-only イベント列の OTLP/HTTP flush**。クライアントはローカル `events` テーブルから未送信行を抽出し、OTel Logs 形式でサーバへ送る。サーバは受信した events を冪等に追記し、`sessions` / `transcript_stats` / `pr_metrics` などは VIEW として組み立てる。実装方針・差分検知・配布形態の詳細は `docs/design.md ## サーバ側集約パイプライン` を参照。本節はクライアント・サーバの外部契約のみ記述する。
+転送モデルは **append-only イベント列の OTLP/HTTP flush**。クライアントはローカル `events` テーブルから未送信行を抽出し、OTel Logs 形式で **1 つ以上の export target**（中央サーバ / OTel Collector / backend の OTLP intake）に送る。中央サーバ（`agent-telemetry-server`）は受信した events を冪等に追記し、`sessions` / `transcript_stats` / `pr_metrics` などは VIEW として組み立てる。実装方針・差分検知・配布形態の詳細は `docs/design.md ## サーバ側集約パイプライン` を参照。本節はクライアント・サーバの外部契約のみ記述する。
+
+> **pluggable export（[0040] / [0042]）**: 旧来の「単一 `[server]` + 固定 Bearer + JSON OTLP Logs」を、**endpoint + 可変 auth header + encoding/protocol + signal/representation を持つ export target の配列**に拡張した。`[server]` は安定 ID `"server"` の単一 target として後方互換に正規化される。**direct**（client → backend intake 直送）と **collector**（client → OTel Collector → fanout）の 2 デプロイレシピをサポートし、Datadog をリファレンス実装とする。本節は raw events（OTLP Logs）の representation を記述する。`pr_metrics` gauge（OTLP Metrics）の representation は [0043] で追加する。
 
 ### 送信するデータ — events のみ
 
 クライアントは `events` テーブルから `last_flushed_sequence` より後に挿入された行を抽出して送る。`session-index.jsonl` の生行や transcript JSONL / rollout JSONL（会話本体）は **送らない**。`is_merged` / `pr_url` / `review_comments` 等の後追い更新は、backfill が新しい `agent.pr.observed` イベントを追記し、それが次の flush で送られることで反映される。
 
-### クライアント側設定
+### クライアント側設定 — export target
 
-`~/.config/agent-telemetry/config.toml`（旧パス: `~/.claude/agent-telemetry.toml`）に `[server]` セクションを追加:
+`~/.config/agent-telemetry/config.toml`（旧パス: `~/.claude/agent-telemetry.toml`）に export target を設定する。2 つの書式があり、併存も可能:
+
+**(1) レガシー単一サーバ（後方互換）** — `[server]` セクション:
 
 ```toml
 [server]
@@ -304,39 +308,98 @@ endpoint = "https://telemetry.example.com"
 token = "xxx"
 ```
 
-| キー | 型 | 説明 |
-|---|---|---|
-| `endpoint` | string | サーバの base URL（パスは含めない、例 `https://telemetry.example.com`）。クライアントは内部で `/v1/logs` を補完する |
-| `token` | string | Bearer 認証用 API key。サーバ起動時の `AGENT_TELEMETRY_SERVER_TOKEN` と一致させる |
+`[server]` は安定 ID `"server"`・`Authorization: Bearer <token>`・`encoding = "json"`・`signals = ["logs"]` の単一 target に正規化される。既存設定はそのまま動く。
 
-`[server]` セクションが欠落 / `endpoint` または `token` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。
+**(2) export target 配列** — `[[export]]`（array-of-tables、複数可）:
+
+```toml
+# 中央サーバ（既存の [server] と等価）
+[[export]]
+id = "central"
+endpoint = "https://telemetry.example.com"
+token = "xxx"
+
+# Datadog direct（protobuf + dd-api-key）
+[[export]]
+id = "datadog"
+endpoint = "https://otlp.datadoghq.com"
+token = "${DD_API_KEY}"
+auth_header = "dd-api-key"
+encoding = "protobuf"
+signals = ["logs"]
+```
+
+| キー | 型 | 既定 | 説明 |
+|---|---|---|---|
+| `id` | string | （必須） | target の**安定 ID**。per-target cursor（後述 `flush_cursors`）のキー。URL を変えても cursor を保つため endpoint とは別に持つ。重複は起動エラー |
+| `endpoint` | string | （必須） | **base URL**（signal path を含めない）。クライアントが signal path を補完する（**endpoint モデル**節を参照） |
+| `token` | string | （必須） | 認証用 credential。`${VAR}` のみ環境変数展開する（秘密を config に直書きしない direct レシピ向け） |
+| `auth_header` | string | `Authorization` | credential を載せる HTTP ヘッダ名。Datadog は `dd-api-key` |
+| `auth_scheme` | string | `Authorization` 時は `Bearer`、それ以外は空 | ヘッダ値の prefix。空なら raw token（`dd-api-key: <token>`）、非空なら `<scheme> <token>`（`Authorization: Bearer <token>`） |
+| `encoding` | string | `json` | wire encoding。`json`（自前サーバ / Collector）または `protobuf`（Datadog direct logs は protobuf 必須） |
+| `signals` | array | `["logs"]` | 送る representation。本仕様では `logs`（raw events / OTLP Logs）。`metrics`（`pr_metrics` gauge）は [0043] |
+
+設定された target が 1 つも無い、または全 target の `endpoint`/`token` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。`signals` に `logs` を含まない target は本仕様の logs flush では skip される（[0043] の metrics flush が扱う）。
+
+#### endpoint モデル（base + signal path 補完）
+
+target の `endpoint` は **base URL** とし、クライアントが signal ごとの path を補完する（実装時の解釈ブレを防ぐため 1 つに固定）:
+
+| signal | 補完される path | 例（base = `https://otlp.datadoghq.com`） |
+|---|---|---|
+| logs | `/v1/logs` | `https://otlp.datadoghq.com/v1/logs` |
+| metrics（[0043]） | `/v1/metrics` | `https://otlp.datadoghq.com/v1/metrics` |
+
+Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metrics`）も自前サーバ（base + `/v1/logs`）もこのモデルに一致する。「signal ごとの完全 URL を設定する」方式は採らない。
+
+#### direct / collector の 2 デプロイレシピ
+
+| レシピ | client encoding | credential の所在 | 補足 |
+|---|---|---|---|
+| **direct** | backend に依存（Datadog logs は `protobuf`） | client（submit-only key） | 個人 / 小チーム向け。追加プロセス無し。Datadog direct は protobuf + `dd-api-key` |
+| **collector** | `json`（変更不要） | Collector が 1 箇所集約（client は秘密なし） | team / 多 client 向け。Collector が protobuf + `dd-api-key` 変換と fanout を担う。レシピは `deploy/otel-collector/` |
 
 ### `agent-telemetry flush` のフラグ
 
 | フラグ | 説明 |
 |---|---|
-| `--since-last`（既定） | `state.json` の `last_flushed_sequence` より後に挿入された events を OTLP/HTTP で送信 |
-| `--full` | `last_flushed_sequence` を無視して events 全体を送信（サーバ初期化や障害復旧で使う。冪等なので二重送信は害がない） |
-| `--dry-run` | 送信せず対象件数とサイズだけ表示 |
+| `--since-last`（既定） | `state.json` の `flush_cursors[target_id]`（各 target の cursor）より後に挿入された events を OTLP/HTTP で送信 |
+| `--full` | cursor を無視して events 全体を全 target に送信（サーバ初期化や障害復旧で使う。冪等なので二重送信は害がない） |
+| `--dry-run` | 送信せず target ごとの対象件数とサイズだけ表示 |
 | `--agent <claude\|codex>` | agent を絞り込む。省略時は検出された全 agent |
 
 進行中セッション（`agent.session.ended` が未着）の events も送る。サーバ側 VIEW が「`session.ended` が無いセッションは `ended_at = NULL`」として表現するため、進行中の状態もダッシュボードに反映できる（旧設計と異なり、Stop 完了を待つ必要がない）。
 
-### `agent-telemetry-state.json` への追加フィールド
+### `agent-telemetry-state.json` への追加フィールド — per-target cursor
 
 ```json
 {
   "last_backfill_offset": 123,
   "last_meta_check": "...",
-  "last_flushed_sequence": 12345
+  "last_flushed_sequence": 12345,
+  "flush_cursors": {
+    "server": 12345,
+    "datadog": 12000
+  }
 }
 ```
 
-- `last_flushed_sequence` は最後に成功した flush で送り終えた events の最大 `local_sequence`。`event_id` は冪等性キーであり、差分 cursor には使わない
-- 既存 state.json にこのフィールドが欠けていれば 0 扱い（= 次の flush で全 events を送る）
-- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは `last_flushed_sequence` より大きい `local_sequence` を持ち、次の flush で自動的に拾われる。SHA-256 hash 追跡や `pushed_session_versions` は不要
+- `flush_cursors` は **`{target_id: last_flushed_sequence}` の map**。各 target は自身の cursor を**独立**に持ち、その target への送信成功時のみ前進する（[0040] per-target cursor 契約）。`event_id` は冪等性キーであり差分 cursor には使わない（cursor は単調増加する `local_sequence`）
+- **独立前進**: target A 成功 / B 失敗の部分失敗時、A の cursor だけ進み B は据え置く。次回 flush で B の範囲のみ再送する（A は二重送信しない）。受理済み events は受信側 `INSERT OR IGNORE` で無害にスキップされる
+- **新規 target**: cursor 不在は 0 扱い（= 全 events を送る。冪等にスキップされるが raw-logs を新サーバに向ける初期同期は重い）
+- **レガシー seed**: `flush_cursors` に `"server"` エントリが無い場合に限り、旧フィールド `last_flushed_sequence` を `"server"` target の cursor として seed する（pre-0042 binary からのアップグレードで全履歴を再送しないため）。`last_flushed_sequence` 自体は後方互換のため残す
+- **target removal**: 設定から消えた target の cursor は次回 save 時に GC される。**rename** は安定 ID を保てば cursor 継続（ID を変えると新規 target 扱いで cursor=0）
+- backfill が新しい `agent.pr.observed` イベントを events に追記すると、それは各 target の cursor より大きい `local_sequence` を持ち、次の flush で自動的に拾われる
 
 ### プロトコル — OTLP/HTTP Logs
+
+target は base endpoint + signal path（`/v1/logs`）に POST する。auth header / encoding は target 設定に従う:
+
+- **auth header**: 既定 `Authorization: Bearer <token>`。`auth_header` / `auth_scheme` で `dd-api-key: <token>`（raw token）等に切替
+- **encoding**: 既定 `json`（`Content-Type: application/json`）。`encoding = "protobuf"` の target は **OTLP/HTTP protobuf**（`Content-Type: application/x-protobuf`）で送る。論理的な payload は両者同一で、wire serialization と Content-Type のみが異なる。Datadog direct logs intake は protobuf 必須なので protobuf を使う
+- **gzip** は両 encoding で optional（`Content-Encoding: gzip`）
+
+JSON encoding の例（自前サーバ / Collector 宛て）:
 
 ```
 POST /v1/logs
@@ -377,8 +440,9 @@ Content-Encoding: gzip   (optional)
 }
 ```
 
-- payload は **OTLP/HTTP JSON エンコード** に準拠する（OTel collector / Prometheus / Loki / Tempo などの標準ツールでそのまま受け取れることを優先）
+- payload は **OTLP/HTTP**（既定 JSON エンコード）に準拠する（OTel collector / Prometheus / Loki / Tempo などの標準ツールでそのまま受け取れることを優先）。`encoding = "protobuf"` の target には同一 payload を OTLP protobuf でシリアライズして送る
 - `eventName` は本文書「`events` テーブル」の `event_name` と 1:1。属性も同じセマンティクス
+- `resource.attributes` の `service.name` は **`agent-telemetry` 固定**（agent 別 service にはしない）。`claude` / `codex` の区別は各 logRecord の `coding_agent` 属性で表現する（[0040] の service.name 決定）
 - `event_id` 属性はクライアントが一意に採番。サーバは `event_id` で `INSERT OR IGNORE`（重複は害なく排除される）
 - HTTP gzip は **optional**。1 セッションあたり events 数〜十数件 × 1 KB 程度なので、無圧縮でも数百 KB に収まるケースが多い
 - 1 リクエストあたり最大 50 MB（保険）。events だけなので通常は超えない
@@ -394,13 +458,15 @@ Content-Encoding: gzip   (optional)
 }
 ```
 
-OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う。クライアントの cursor 前進は **transport の成否** で判断し、partial success では再送しない（OTLP 仕様で partial success は「サーバが永続的に拒否した不正レコード」を表し、クライアントは retry しない前提）。
+OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う（自前サーバ宛て / JSON）。target の cursor 前進は **transport の成否** で判断し、partial success では再送しない（OTLP 仕様で partial success は「サーバが永続的に拒否した不正レコード」を表し、クライアントは retry しない前提）。cursor は **target ごと**に独立して前進する（`flush_cursors[target_id]`）。
 
 | サーバ応答 | 意味 | クライアント挙動 |
 |---|---|---|
-| HTTP 2xx + `rejectedLogRecords == 0` | 全件受理 | `last_flushed_sequence` を送信した最大 `local_sequence` に進める |
-| HTTP 2xx + `rejectedLogRecords > 0` | 一部レコードが **永続的に拒否**（`event_id` / `session_id` / `coding_agent` / `event_name` 欠落などの validation 失敗） | サーバが `rejected.log` に記録済み。クライアントは `last_flushed_sequence` を **進め**（同じ不正データを再送しても通らず無限ループになるため retry しない）、`errorMessage` と件数を warning として stderr に出す |
-| ネットワークエラー / 非2xx（5xx / 429 / 401 等） | 配送自体が失敗 | バッチ全体を失敗扱いにし `last_flushed_sequence` を **進めない**。次回 flush で同じ範囲を再送。受理済み events は `INSERT OR IGNORE` で無害にスキップされる |
+| HTTP 2xx + `rejectedLogRecords == 0` | 全件受理 | その target の cursor を送信した最大 `local_sequence` に進める |
+| HTTP 2xx + `rejectedLogRecords > 0` | 一部レコードが **永続的に拒否**（`event_id` / `session_id` / `coding_agent` / `event_name` 欠落などの validation 失敗） | サーバが `rejected.log` に記録済み。クライアントは cursor を **進め**（同じ不正データを再送しても通らず無限ループになるため retry しない）、`errorMessage` と件数を warning として stderr に出す |
+| ネットワークエラー / 非2xx（5xx / 429 / 401 等） | 配送自体が失敗 | バッチ全体を失敗扱いにし、その target の cursor を **進めない**。次回 flush で同じ範囲を再送。受理済み events は `INSERT OR IGNORE` で無害にスキップされる。他 target の cursor 前進には影響しない |
+
+> backend（Datadog protobuf 等）は OTLP の `ExportLogsServiceResponse`（protobuf）を返すため、クライアントは JSON `partialSuccess` を decode しない（2xx を全件受理として扱う）。`partialSuccess` の解釈は JSON encoding の自前サーバ宛てに限る。
 
 `rejectedLogRecords` は reject **件数**しか返さず、どの record が拒否されたかは示さない。永続拒否は同一データの再送で解消しないため、cursor を据え置く設計は無限ループになる。よって永続拒否はサーバ側 `rejected.log` への記録に委ね、クライアントは前進する。スキーマ不一致での全拒否は廃止（events table の DDL は安定で、新メトリクスは新属性で追加可能なため）。
 

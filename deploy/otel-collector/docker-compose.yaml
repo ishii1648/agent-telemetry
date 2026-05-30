@@ -1,0 +1,23 @@
+# Local OTel Collector for the agent-telemetry collector recipe.
+#
+#   DD_API_KEY=... DD_SITE=datadoghq.com \
+#   AGENT_TELEMETRY_SERVER_URL=https://telemetry.example.com \
+#   AGENT_TELEMETRY_SERVER_TOKEN=... \
+#   docker compose up
+#
+# Then point the client at http://localhost:4318 (see config.yaml header).
+# For a Datadog-only deployment, unset the AGENT_TELEMETRY_SERVER_* vars and
+# remove the otlphttp/server exporter from config.yaml.
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/otelcol/config.yaml:ro
+    environment:
+      DD_API_KEY: ${DD_API_KEY:?set DD_API_KEY}
+      DD_SITE: ${DD_SITE:-datadoghq.com}
+      AGENT_TELEMETRY_SERVER_URL: ${AGENT_TELEMETRY_SERVER_URL:-}
+      AGENT_TELEMETRY_SERVER_TOKEN: ${AGENT_TELEMETRY_SERVER_TOKEN:-}
+    ports:
+      - "4318:4318" # OTLP/HTTP (clients flush here)

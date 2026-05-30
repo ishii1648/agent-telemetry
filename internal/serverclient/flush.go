@@ -49,17 +49,30 @@ type FlushResult struct {
 	PerAgent map[string]*FlushAgentResult
 }
 
+// FlushAgentResult collects the per-target outcomes for one coding agent.
+// NoConfig is set when no export target is configured at all (the common
+// opt-out case); Targets is then empty and Eligible reports how many events
+// would have been sent so the CLI can show a useful "not configured" hint.
 type FlushAgentResult struct {
-	Eligible      int
+	NoConfig bool
+	DryRun   bool
+	Eligible int
+	Targets  map[string]*FlushTargetResult
+}
+
+// FlushTargetResult is the outcome of flushing to a single export target. Each
+// target advances its own cursor independently, so Sent / StateUpdated are
+// per-target (issue 0040 per-target cursor contract).
+type FlushTargetResult struct {
+	Endpoint      string
+	Encoding      string
 	Sent          int
 	Skipped       int
 	Batches       int
 	PayloadBytes  int64
 	Rejected      int
 	RejectedError string
-	NoConfig      bool
 	StateUpdated  bool
-	DryRun        bool
 }
 
 type EventRow struct {
@@ -136,7 +149,7 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 		opts.SinceLast = true
 	}
 
-	cfg, err := LoadConfig(opts.ConfigPath)
+	targets, err := LoadConfig(opts.ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
@@ -153,7 +166,7 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 	res := &FlushResult{PerAgent: make(map[string]*FlushAgentResult, len(agents))}
 	var firstErr error
 	for _, a := range agents {
-		ar, err := runFlushForAgent(ctx, db, a, cfg, opts)
+		ar, err := runFlushForAgent(ctx, db, a, targets, opts)
 		res.PerAgent[a.Name] = ar
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -162,78 +175,154 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 	return res, firstErr
 }
 
-func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, cfg ServerConfig, opts FlushOptions) (*FlushAgentResult, error) {
-	ar := &FlushAgentResult{DryRun: opts.DryRun}
+func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, targets []ExportTarget, opts FlushOptions) (*FlushAgentResult, error) {
+	ar := &FlushAgentResult{DryRun: opts.DryRun, Targets: map[string]*FlushTargetResult{}}
+
+	// logsTargets are the destinations that want the raw-events (OTLP Logs)
+	// representation and are populated enough to send. A metrics-only target
+	// (signals = ["metrics"]) is skipped here and handled by the gauge path
+	// (issue 0043); an unconfigured target (missing endpoint/token) is the
+	// opt-out case.
+	var logsTargets []ExportTarget
+	for _, t := range targets {
+		if t.Configured() && t.SendsLogs() {
+			logsTargets = append(logsTargets, t)
+		}
+	}
+
+	total, err := countEvents(db, a.Name)
+	if err != nil {
+		return ar, fmt.Errorf("count events[%s]: %w", a.Name, err)
+	}
+
+	if len(logsTargets) == 0 {
+		// No destination opted in: report what would be sent (from a zero
+		// cursor) so the CLI can print the "not configured" hint, then return.
+		ar.NoConfig = true
+		ar.Eligible = total
+		return ar, nil
+	}
+
 	state, err := backfill.LoadState(a.StatePath())
 	if err != nil {
 		return ar, fmt.Errorf("load state[%s]: %w", a.Name, err)
 	}
-	after := state.LastFlushedSequence
-	if opts.Full {
-		after = 0
-	}
-	events, err := LoadEvents(db, a.Name, after)
-	if err != nil {
-		return ar, fmt.Errorf("load events[%s]: %w", a.Name, err)
-	}
-	ar.Sent = len(events)
-	ar.Eligible = ar.Sent
-	if !opts.Full && state.LastFlushedSequence > 0 {
-		var total int
-		_ = db.QueryRow(`SELECT COUNT(*) FROM events WHERE coding_agent = ?`, a.Name).Scan(&total)
-		ar.Eligible = total
-		ar.Skipped = total - ar.Sent
-	}
 
-	batches, err := splitEventBatches(events, opts.ClientVersion, MaxBatchBytes)
-	if err != nil {
-		return ar, err
-	}
-	ar.Batches = len(batches)
-	for _, b := range batches {
-		body, _ := json.Marshal(b)
-		ar.PayloadBytes += int64(len(body))
-	}
+	var firstErr error
+	stateDirty := false
+	for _, t := range logsTargets {
+		tr := &FlushTargetResult{Endpoint: t.Endpoint, Encoding: t.Encoding}
+		ar.Targets[t.ID] = tr
 
-	if !cfg.Configured() {
-		ar.NoConfig = true
-		return ar, nil
-	}
-	if opts.DryRun {
-		return ar, nil
-	}
-	endpoint, err := logsURL(cfg.Endpoint)
-	if err != nil {
-		return ar, err
-	}
-	for _, b := range batches {
-		resp, sentBytes, err := postLogsBatch(ctx, opts.HTTPClient, endpoint, cfg.Token, b)
-		ar.PayloadBytes += int64(sentBytes)
-		// A transport failure (network error / non-2xx) means the batch never
-		// landed: return without advancing the cursor so the next flush resends
-		// the same range. postLogsBatch already maps >=400 to an error.
+		after := cursorFor(state, t.ID)
+		if opts.Full {
+			after = 0
+		}
+		events, err := LoadEvents(db, a.Name, after)
 		if err != nil {
-			return ar, err
+			if firstErr == nil {
+				firstErr = fmt.Errorf("load events[%s/%s]: %w", a.Name, t.ID, err)
+			}
+			continue
 		}
-		// HTTP 2xx + rejectedLogRecords>0 is OTLP partial success: the server
-		// permanently rejected those records (failed validation — missing
-		// event_id/session_id/etc.) and logged them. Per the OTLP spec a partial
-		// success MUST NOT be retried; resending the same malformed records would
-		// loop forever. So we count them, surface a warning, and let the cursor
-		// advance past the batch. See docs/spec.md ## プロトコル.
-		ar.Rejected += resp.PartialSuccess.RejectedLogRecords
-		if resp.PartialSuccess.RejectedLogRecords > 0 && resp.PartialSuccess.ErrorMessage != "" {
-			ar.RejectedError = resp.PartialSuccess.ErrorMessage
+		tr.Sent = len(events)
+		tr.Skipped = total - tr.Sent
+
+		batches, err := splitEventBatches(events, opts.ClientVersion, MaxBatchBytes)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		tr.Batches = len(batches)
+
+		if opts.DryRun {
+			// Report the size in the target's own encoding so a protobuf
+			// destination shows its actual wire size, not the JSON estimate.
+			for _, b := range batches {
+				body, _, err := encodeBatch(t.Encoding, b)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					break
+				}
+				tr.PayloadBytes += int64(len(body))
+			}
+			continue
+		}
+
+		if err := sendBatches(ctx, opts.HTTPClient, t, batches, tr); err != nil {
+			// Transport failure: the cursor stays put so the next flush resends
+			// this target's range. Other targets are unaffected (independent
+			// advance). Surface the first error but keep flushing the rest.
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if len(events) > 0 {
+			if state.FlushCursors == nil {
+				state.FlushCursors = map[string]int64{}
+			}
+			state.FlushCursors[t.ID] = events[len(events)-1].LocalSequence
+			stateDirty = true
+			tr.StateUpdated = true
 		}
 	}
-	if len(events) > 0 {
-		state.LastFlushedSequence = events[len(events)-1].LocalSequence
+
+	if stateDirty {
 		if err := backfill.SaveState(a.StatePath(), state); err != nil {
 			return ar, fmt.Errorf("save state[%s]: %w", a.Name, err)
 		}
-		ar.StateUpdated = true
 	}
-	return ar, nil
+	return ar, firstErr
+}
+
+// sendBatches posts every batch to one target. On the first transport failure
+// it returns the error without touching subsequent batches (the caller then
+// leaves the cursor un-advanced). Permanent OTLP partial-success rejections are
+// accumulated and do NOT stop the cursor — resending malformed records would
+// loop forever (see docs/spec.md ## プロトコル).
+func sendBatches(ctx context.Context, client *http.Client, t ExportTarget, batches []otlpPayload, tr *FlushTargetResult) error {
+	endpoint, err := logsURL(t.Endpoint)
+	if err != nil {
+		return err
+	}
+	for _, b := range batches {
+		resp, sentBytes, err := postLogsBatch(ctx, client, t, endpoint, b)
+		tr.PayloadBytes += int64(sentBytes)
+		if err != nil {
+			return err
+		}
+		tr.Rejected += resp.PartialSuccess.RejectedLogRecords
+		if resp.PartialSuccess.RejectedLogRecords > 0 && resp.PartialSuccess.ErrorMessage != "" {
+			tr.RejectedError = resp.PartialSuccess.ErrorMessage
+		}
+	}
+	return nil
+}
+
+// cursorFor returns the last flushed local_sequence for a target. The legacy
+// [server] target (id "server") falls back to the single last_flushed_sequence
+// field written by pre-0042 binaries, so upgrading does not re-send the whole
+// history. New targets with no cursor start at 0 (full backfill, idempotently
+// deduped server-side).
+func cursorFor(s backfill.State, targetID string) int64 {
+	if v, ok := s.FlushCursors[targetID]; ok {
+		return v
+	}
+	if targetID == legacyServerTargetID {
+		return s.LastFlushedSequence
+	}
+	return 0
+}
+
+func countEvents(db *sql.DB, codingAgent string) (int, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE coding_agent = ?`, codingAgent).Scan(&n)
+	return n, err
 }
 
 func LoadEvents(db *sql.DB, codingAgent string, after int64) ([]EventRow, error) {
@@ -262,6 +351,10 @@ ORDER BY local_sequence`, codingAgent, after)
 	return out, rows.Err()
 }
 
+// logsURL completes a target's base endpoint with the OTLP Logs signal path.
+// The endpoint model is fixed as "base + signal path" (docs/spec.md): a target
+// configures the base URL (e.g. https://otlp.datadoghq.com) and the client
+// appends /v1/logs. This matches Datadog's OTLP intake and our own server.
 func logsURL(base string) (string, error) {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -389,10 +482,14 @@ func unixNanoString(ts string) string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
-func postLogsBatch(ctx context.Context, client *http.Client, endpoint, token string, p otlpPayload) (flushResponse, int, error) {
-	body, err := json.Marshal(p)
+// postLogsBatch serializes one batch in the target's encoding (JSON or
+// protobuf), applies the target's auth header/scheme, optionally gzips, and
+// POSTs it. It returns the parsed OTLP partialSuccess, the wire size, and a
+// transport error (network failure or >=400) if the batch never landed.
+func postLogsBatch(ctx context.Context, client *http.Client, t ExportTarget, endpoint string, p otlpPayload) (flushResponse, int, error) {
+	body, contentType, err := encodeBatch(t.Encoding, p)
 	if err != nil {
-		return flushResponse{}, 0, fmt.Errorf("marshal payload: %w", err)
+		return flushResponse{}, 0, err
 	}
 	var reqBody io.Reader = bytes.NewReader(body)
 	contentEncoding := ""
@@ -414,8 +511,8 @@ func postLogsBatch(ctx context.Context, client *http.Client, endpoint, token str
 	if err != nil {
 		return flushResponse{}, 0, fmt.Errorf("new request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
 	if contentEncoding != "" {
 		req.Header.Set("Content-Encoding", contentEncoding)
 	}
@@ -432,12 +529,40 @@ func postLogsBatch(ctx context.Context, client *http.Client, endpoint, token str
 		return flushResponse{}, wireSize, fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	var r flushResponse
-	if len(respBody) > 0 {
+	// A protobuf intake (Datadog) replies with a protobuf
+	// ExportLogsServiceResponse, not JSON. We only need partialSuccess for
+	// JSON destinations (our server); a decode failure on a non-JSON 2xx body
+	// is treated as "fully accepted, no partial success".
+	if len(respBody) > 0 && t.Encoding == defaultEncoding {
 		if err := json.Unmarshal(respBody, &r); err != nil {
 			return flushResponse{}, wireSize, fmt.Errorf("decode response: %w", err)
 		}
 	}
 	return r, wireSize, nil
+}
+
+// encodeBatch serializes a payload in the requested wire encoding and returns
+// the body plus its Content-Type. JSON is the default (our server, OTel
+// Collector); protobuf is required by Datadog's direct OTLP Logs intake.
+func encodeBatch(encoding string, p otlpPayload) (body []byte, contentType string, err error) {
+	switch encoding {
+	case "protobuf":
+		body, err = marshalOTLPLogsProtobuf(p)
+		return body, "application/x-protobuf", err
+	default: // "json"
+		body, err = json.Marshal(p)
+		return body, "application/json", err
+	}
+}
+
+// authValue builds the credential header value. An empty scheme yields the raw
+// token (e.g. dd-api-key: <token>); a scheme prefixes it (Authorization: Bearer
+// <token>).
+func authValue(scheme, token string) string {
+	if scheme == "" {
+		return token
+	}
+	return scheme + " " + token
 }
 
 func (r *FlushResult) Summarize(w io.Writer) {
@@ -448,20 +573,29 @@ func (r *FlushResult) Summarize(w io.Writer) {
 	sort.Strings(names)
 	for _, name := range names {
 		ar := r.PerAgent[name]
-		switch {
-		case ar.NoConfig:
-			fmt.Fprintf(w, "flush[%s]: [server] 設定なし — eligible=%d sent=0 (skipped network)\n", name, ar.Eligible)
-		case ar.DryRun:
-			fmt.Fprintf(w, "flush[%s] dry-run: eligible=%d sent=%d skipped=%d batches=%d payload=%d bytes\n",
-				name, ar.Eligible, ar.Sent, ar.Skipped, ar.Batches, ar.PayloadBytes)
-		default:
-			fmt.Fprintf(w, "flush[%s]: eligible=%d sent=%d skipped=%d batches=%d payload=%d bytes rejected=%d\n",
-				name, ar.Eligible, ar.Sent, ar.Skipped, ar.Batches, ar.PayloadBytes, ar.Rejected)
-			if ar.Rejected > 0 {
+		if ar.NoConfig {
+			fmt.Fprintf(w, "flush[%s]: export target 設定なし — eligible=%d sent=0 (skipped network)\n", name, ar.Eligible)
+			continue
+		}
+		ids := make([]string, 0, len(ar.Targets))
+		for id := range ar.Targets {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			tr := ar.Targets[id]
+			if ar.DryRun {
+				fmt.Fprintf(w, "flush[%s→%s] dry-run: sent=%d skipped=%d batches=%d payload=%d bytes encoding=%s\n",
+					name, id, tr.Sent, tr.Skipped, tr.Batches, tr.PayloadBytes, tr.Encoding)
+				continue
+			}
+			fmt.Fprintf(w, "flush[%s→%s]: sent=%d skipped=%d batches=%d payload=%d bytes encoding=%s rejected=%d\n",
+				name, id, tr.Sent, tr.Skipped, tr.Batches, tr.PayloadBytes, tr.Encoding, tr.Rejected)
+			if tr.Rejected > 0 {
 				// Rejected records are permanently dropped (cursor advanced past
 				// them); warn so the operator can inspect the server's rejected.log.
-				fmt.Fprintf(w, "  warning: %d records permanently rejected by server (not retried): %s\n",
-					ar.Rejected, ar.RejectedError)
+				fmt.Fprintf(w, "  warning: %d records permanently rejected by %s (not retried): %s\n",
+					tr.Rejected, id, tr.RejectedError)
 			}
 		}
 	}
