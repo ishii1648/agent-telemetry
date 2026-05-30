@@ -64,10 +64,21 @@ func (t ExportTarget) Configured() bool {
 
 // SendsLogs reports whether this target wants the raw-events (OTLP Logs)
 // representation. Targets default to logs-only; the pr_metrics gauge (OTLP
-// Metrics) representation is added by 0043.
+// Metrics) representation is opt-in via signals = ["metrics"].
 func (t ExportTarget) SendsLogs() bool {
+	return t.hasSignal(signalLogs)
+}
+
+// SendsMetrics reports whether this target wants the pre-aggregated pr_metrics
+// gauge (OTLP Metrics, last-value) representation (issue 0043). A target may
+// send both ("logs" and "metrics"); each representation rides its own cursor.
+func (t ExportTarget) SendsMetrics() bool {
+	return t.hasSignal(signalMetrics)
+}
+
+func (t ExportTarget) hasSignal(want string) bool {
 	for _, s := range t.Signals {
-		if s == signalLogs {
+		if s == want {
 			return true
 		}
 	}
