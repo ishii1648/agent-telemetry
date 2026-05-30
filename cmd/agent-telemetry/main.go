@@ -283,7 +283,7 @@ func runFlush(args []string) {
 		res.Summarize(os.Stderr)
 		for _, ar := range res.PerAgent {
 			if ar.NoConfig {
-				fmt.Fprintf(os.Stderr, "flush: [server] セクションが %s に未設定です。docs/spec.md ## サーバ送信 を参照してください。\n", configpath.Preferred())
+				fmt.Fprintf(os.Stderr, "flush: export target（[server] または [[export]]）が %s に未設定です。docs/spec.md ## サーバ送信 を参照してください。\n", configpath.Preferred())
 				break
 			}
 		}

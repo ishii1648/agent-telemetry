@@ -9,10 +9,18 @@ import (
 
 // State holds the cursor for incremental backfill processing.
 //
-// LastFlushedSequence is owned by the serverclient flush pipeline (issue 0038)
-// but lives in the same on-disk file. Keeping it on this struct lets either
-// package round-trip the file without a custom merge: backfill leaves the
-// cursor untouched and flush leaves the backfill fields untouched.
+// FlushCursors / LastFlushedSequence are owned by the serverclient flush
+// pipeline but live in the same on-disk file. Keeping them on this struct lets
+// either package round-trip the file without a custom merge: backfill leaves
+// the cursors untouched and flush leaves the backfill fields untouched.
+//
+// FlushCursors maps a stable export target_id to the max local_sequence
+// successfully flushed to that target (issue 0040 per-target cursor contract).
+// Each target advances independently so a partial failure (target A ok, target
+// B down) re-sends only B's range on the next flush. LastFlushedSequence is the
+// legacy single cursor from 0038; it is retained for backward compatibility and
+// seeds the "server" target's cursor on the first flush after upgrade (the seed
+// lives in serverclient.cursorFor, keyed by the stable id "server").
 //
 // The legacy push pipeline's `pushed_session_versions` map (issue 0028) was
 // removed with the /v1/metrics path in 0038; any leftover key in an old
@@ -23,6 +31,7 @@ type State struct {
 	LastWorkerRun       time.Time            `json:"last_worker_run,omitempty"`
 	MetaURLChecks       map[string]time.Time `json:"meta_url_checks,omitempty"`
 	LastFlushedSequence int64                `json:"last_flushed_sequence,omitempty"`
+	FlushCursors        map[string]int64     `json:"flush_cursors,omitempty"`
 }
 
 // StatePath returns ~/.claude/agent-telemetry-state.json (Claude default).
