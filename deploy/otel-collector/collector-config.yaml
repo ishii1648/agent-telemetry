@@ -1,0 +1,98 @@
+# OTel Collector 設定サンプル — agent-telemetry の raw events (OTLP Logs) を
+# 整形して Datadog へ fanout する collector レシピ。
+#
+# このサンプルが担うのは「attribute 整形」層のみ（resource 付与 / rename /
+# 高 cardinality の drop）。facet / measure 化は Datadog 側 index 設定であり
+# Collector processor では代替できない → deploy/datadog/facets-measures.md。
+#
+# 分類の正本: docs/spec.md「OTLP export の attribute 意味分類」
+# 必要なディストリビューション: opentelemetry-collector-contrib
+#   (datadog exporter / transform / resource / attributes processor を含む)
+
+receivers:
+  # client (agent-telemetry flush) は JSON OTLP/HTTP Logs を投げてくる。
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # --- 群 5: OTel resource 規約の付与 ----------------------------------------
+  # service.name / deployment.environment(env) を resource attribute として固定。
+  # service.version は per-record の agent_version とは別概念なので resource では
+  # ビルド version を入れる運用にし、agent_version は log attribute(tag) のまま残す。
+  resource:
+    attributes:
+      - key: service.name
+        value: agent-telemetry
+        action: upsert
+      - key: deployment.environment
+        value: ${env:DEPLOY_ENV}
+        action: upsert
+
+  # --- attribute 整形 (rename / drop) ----------------------------------------
+  # OTTL(transform processor) で LogRecord attribute を整形する。
+  transform/agent_telemetry:
+    log_statements:
+      - context: log
+        statements:
+          # rename 例: deployment.environment の慣習に合わせ env エイリアスを残す。
+          # (Datadog 予約 tag `env` は deployment.environment から導出されるが、
+          #  独自に env attribute を参照するクエリ向けにエイリアスを張る例)
+          - set(attributes["env"], resource.attributes["deployment.environment"]) where attributes["env"] == nil
+
+          # 派生次元タグ: is_subagent / task_type は raw attribute に無く
+          #   (spec「0/1 フラグ」「群 1」参照)、それぞれ parent_session_id / branch から
+          #   導出する。下の drop で元属性を落とすので、必ず drop より前に導出する。
+          #   どちらの元属性も agent.session.started のみが載せる (他イベントでは nil)
+          #   ので、属性が在るレコードに限って導出する。
+          - set(attributes["is_subagent"], "true")  where attributes["parent_session_id"] != nil and attributes["parent_session_id"] != ""
+          - set(attributes["is_subagent"], "false") where attributes["parent_session_id"] == ""
+          - set(attributes["task_type"], "feat")  where attributes["branch"] != nil and IsMatch(attributes["branch"], "^feat/")
+          - set(attributes["task_type"], "fix")   where attributes["branch"] != nil and IsMatch(attributes["branch"], "^fix/")
+          - set(attributes["task_type"], "docs")  where attributes["branch"] != nil and IsMatch(attributes["branch"], "^docs/")
+          - set(attributes["task_type"], "chore") where attributes["branch"] != nil and IsMatch(attributes["branch"], "^chore/")
+
+          # 群 3: 高 cardinality 識別子の drop。
+          #   コスト/index を抑えたい場合に「次元タグに昇格させたくない」属性を落とす。
+          #   検索 facet として残したいものは drop せず、Datadog 側 facet 設定で扱う
+          #   (facet 化は Collector では不可)。下記は全部 drop する最も保守的な例。
+          - delete_key(attributes, "session_id")
+          - delete_key(attributes, "parent_session_id")
+          - delete_key(attributes, "branch")
+          - delete_key(attributes, "pr_title")
+
+          # 既定で facet/tag に昇格しない低価値 attribute も drop する。
+          - delete_key(attributes, "cwd")
+          - delete_key(attributes, "transcript")
+          - delete_key(attributes, "started_at")
+          - delete_key(attributes, "ended_at")
+          - delete_key(attributes, "pr_pinned")
+          - delete_key(attributes, "backfill_checked")
+
+          # 内部構造 (export しても backend では無価値)。
+          - delete_key(attributes, "event_id")
+          - delete_key(attributes, "local_sequence")
+          - delete_key(attributes, "received_at")
+
+  batch:
+    timeout: 5s
+
+exporters:
+  # Datadog exporter が protobuf + DD-API-KEY への変換を担う。
+  # client 側は JSON exporter のまま変更不要 (collector レシピの利点)。
+  datadog:
+    api:
+      site: ${env:DD_SITE}
+      key: ${env:DD_API_KEY}
+
+  # 任意: 他 backend / SQLite ingest へ同時 fanout したい場合に追加する。
+  # otlphttp/secondary:
+  #   logs_endpoint: https://other-backend.example.com/v1/logs
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [resource, transform/agent_telemetry, batch]
+      exporters: [datadog]

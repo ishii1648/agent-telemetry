@@ -521,6 +521,74 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 
 ---
 
+## OTLP export の attribute 意味分類
+
+`agent-telemetry flush` が出力する OTLP/HTTP Logs を **外部 observability backend**（Datadog 等）へ流すとき、各 attribute は backend の log attribute にマップされる。だが log attribute のままでは検索・集計・monitor 対象として一級にならず、逆に `session_id` のような高 cardinality 属性を次元タグに昇格すると backend の課金・index 設計を破壊する。そこで **どの属性を次元タグ / 識別子（索引のみ）/ measure に落とすか** を backend 非依存に固定する。設計判断の根拠は [0040] 本文（B）に集約。
+
+### 適用範囲
+
+- **対象は raw events（OTLP Logs）側の全 attribute。** ここでの分類は `events` テーブルの各イベントが載せる attribute（「[イベント名と属性](#イベント名と属性)」）に効く。event-level 分析（素の token 推移・流量・カウント）を一級にするための整形である。
+- **`pr_metrics` gauge（OTLP Metrics）が載せる tag はこの分類とは別物。** gauge の tag は client 側 VIEW projection の出力（`pr_url` / `coding_agent` / `user_id` / `task_type` / `model`）に限られ、`repo` / `pr_state` / `branch` は VIEW に出力されておらず、`is_merged` は `pr_metrics` の WHERE で 1 固定（gauge では常に true なので tag にしても無意味）。下表の次元タグをそのまま gauge に載せられる前提にはしないこと。gauge へ追加の tag を載せたい場合は **VIEW projection 拡張が必要**で、これは [0043] の範囲（本節は raw events 側のみを扱う）。
+- gauge（Metrics）は最初から metric なので facet / measure 概念は不要。本節の整形・facet/measure 化は **event-level 分析（Logs）の経路にのみ** 効く。
+
+### 意味分類の対応表（backend 非依存 + Datadog リファレンス）
+
+5 群に分類する。最右列は最初のリファレンス実装である **Datadog** での concrete マッピング（tag / facet only / measure）。
+
+| 群 | 意味分類（backend 非依存） | Datadog concrete | attribute | 出所イベント |
+|---|---|---|---|---|
+| 1 | **低 cardinality の次元タグ**（有界・フィルタ / group-by 用） | tag | `coding_agent` | `agent.session.started`（`coding_agent` 列） |
+| 1 | 同上 | tag | `agent_version` | `agent.session.started` |
+| 1 | 同上 | tag | `user_id` | `agent.session.started` |
+| 1 | 同上 | tag | `repo` | `agent.session.started` |
+| 1 | 同上 | tag | `task_type` | `agent.session.started` の `branch` から導出（feat/fix/docs/chore） |
+| 1 | 同上 | tag | `end_reason` | `agent.session.ended` |
+| 1 | 同上 | tag | `model` | `agent.transcript.scanned` |
+| 1 | 同上 | tag | `pr_state` | `agent.pr.observed` |
+| 1 | 同上 | tag | `is_merged` / `is_subagent` / `is_ghost` | 下記「0/1 フラグ」参照 |
+| 2 | **単調増加するが gauge 識別に必須な次元**（1 とは別枠・cardinality コストドライバ） | tag（要注意） | `pr_url` | `agent.pr.observed` |
+| 3 | **高 cardinality の識別子**（索引のみ・次元タグに昇格しない） | facet only | `branch` | `agent.session.started` |
+| 3 | 同上 | facet only | `pr_title` | `agent.pr.observed` |
+| 3 | 同上 | facet only | `session_id` | 全イベント（`session_id` 列） |
+| 3 | 同上 | facet only | `parent_session_id` | `agent.session.started` |
+| 4 | **数値 measure**（集計対象） | measure | `input_tokens` / `output_tokens` / `cache_write_tokens` / `cache_read_tokens` / `reasoning_tokens` | `agent.transcript.scanned` |
+| 4 | 同上 | measure | `tool_use_total` / `mid_session_msgs` / `ask_user_question` | `agent.transcript.scanned` |
+| 4 | 同上 | measure | `review_comments` / `changes_requested` | `agent.pr.observed` |
+| 5 | **OTel resource 規約**（resource attribute） | `service` / `env` / `version` | `service.name` / `env`(deployment.environment) / `version` | resource（後述） |
+
+### 群ごとの補足
+
+- **群 1（低 cardinality 次元タグ）**: フィルタ・group-by の軸。`user_id` は `pr_metrics` の GROUP BY 軸（`pr_url` / `coding_agent` / `user_id`、本文書「pr_metrics VIEW」参照）で、cardinality はユーザ数で有界なため次元タグに含める。`task_type` は raw attribute としては載らず、`is_subagent` と同様 `branch`（`feat/` / `fix/` / `docs/` / `chore/` プレフィックス）から backend / pipeline 側で導出する（raw events には `branch` のみが載る）。よって collector レシピで `branch` を drop する場合は drop 前に `task_type` を導出すること。
+- **群 2（`pr_url`）**: PR 単位 gauge の主キーで、群 1 の有界な group-by 軸とは性質が違う。**PR が増えるほど timeseries が単調増加する**ため、`session_id`（無制限・再送のたび増殖）よりは穏当だが custom metric cardinality のコストドライバになる。古い PR を retention / rollup で畳むのは backend 側の運用。
+- **群 3（高 cardinality 識別子）**: backend では検索 facet にはするが **次元タグには昇格しない**。次元タグにすると課金・index が破綻する。`is_subagent` はこの群の `parent_session_id`（非空なら subagent）から導出される（raw attribute としては `parent_session_id` のみが載る）。
+- **群 4（数値 measure）**: measure に昇格しないと数値属性が集計対象にならず埋もれる。group-by はせず集計値として使う。
+- **群 5（OTel resource 規約）**: `service.name=agent-telemetry`、`env=<deploy environment>`、`version=<agent_version>` を resource attribute として付与（Datadog の `service` / `env` / `version` 予約 tag に対応）。現行 flush は resource に `service.name` / `service.version` を出している（本文書「プロトコル — OTLP/HTTP Logs」参照）。`coding_agent` 別に service を割るか単一 service + 次元タグ分離にするかは [0042] の実装 spike で固める。
+
+### 0/1 フラグ（`is_merged` / `is_subagent` / `is_ghost`）
+
+これらは 0/1 の数値だが、event-level 分析でフィルタ次元として強く使うため **raw events 側では次元タグ扱い**（Datadog なら `is_merged:true` 等）にする。measure（群 4）ではない。`is_merged`（`agent.pr.observed`）/ `is_ghost`（`agent.transcript.scanned`）は raw attribute として載るが、`is_subagent` は raw attribute には無く `parent_session_id` の非空判定で backend / pipeline 側が導出する。
+
+### LogRecord field は attribute ではない
+
+- **`event_name` / `occurred_at` は attribute ではなく LogRecord の field**（flush では `LogRecord.eventName` / `timeUnixNano`）。「イベント種別ごとの count」は backend が **LogRecord の event name を facet 化**して行うものであり、attribute tag ではない。
+- **export せず facet 化もしない内部構造**: `event_id` / `local_sequence` / `received_at`（冪等性キー・cursor・受信監査用途）。
+- **既定では facet / tag に昇格しない低価値 attribute**: `cwd` / `transcript`（パス）/ `started_at` / `ended_at` / `pr_pinned` / `backfill_checked`。必要になった時点で個別に昇格判断する。
+
+### 整形（rename / drop）と facet/measure 化は層が違う
+
+この意味分類の適用は **2 層**に分かれ、層ごとに成果物の置き場所が異なる。
+
+| 層 | 内容 | collector レシピ | direct レシピ |
+|---|---|---|---|
+| **attribute 整形** | rename / resource 付与 / 高 cardinality の drop | Collector processor（[`deploy/otel-collector/`](../deploy/otel-collector/)） | Datadog Logs Pipeline remapper（[`deploy/datadog/`](../deploy/datadog/)） |
+| **facet / measure 化** | 属性を検索 facet・集計 measure に昇格 | **Collector processor では代替不可** → Datadog 側 index 設定（[`deploy/datadog/facets-measures.md`](../deploy/datadog/facets-measures.md)） | 同左（Datadog 側 index 設定） |
+
+**facet / measure 化は Datadog 側の index 設定でしか実現できず、Collector processor では代替できない。** よって collector レシピを採っても Datadog 側の facet/measure 設定は別途必要で、これは recipe を問わず Datadog 側成果物として同梱する（[`deploy/datadog/facets-measures.md`](../deploy/datadog/facets-measures.md)）。collector の deliverable は attribute 整形まで。
+
+> 2 つのデプロイレシピ（direct / collector）の使い分けと export target 配列の拡張は [0042]、`pr_metrics` の client 側集約 + gauge 送信は [0043] の範囲。本節は B（attribute の意味分類）のみを正規仕様として固定する。
+
+---
+
 ## 環境変数
 
 | 変数 | 説明 |
