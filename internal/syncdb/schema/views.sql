@@ -356,6 +356,7 @@ SELECT
     s.coding_agent,
     COUNT(DISTINCT s.session_id) AS session_count,
     COALESCE(SUM(ts.input_tokens + ts.output_tokens + ts.cache_write_tokens + ts.cache_read_tokens + ts.reasoning_tokens), 0) AS total_tokens,
+    COALESCE(SUM(ts.ask_user_question), 0) AS ask_user_question,
     CASE WHEN COUNT(DISTINCT s.session_id) > 0
          THEN ROUND(SUM(ts.input_tokens + ts.output_tokens + ts.cache_write_tokens + ts.cache_read_tokens + ts.reasoning_tokens) * 1.0 / COUNT(DISTINCT s.session_id), 1)
          ELSE 0 END AS tokens_per_session,

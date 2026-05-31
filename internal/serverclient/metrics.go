@@ -239,26 +239,37 @@ func buildMetricsPayload(rows []PRMetricRow, clientVersion string, timeNano int6
 // stay together; PR count is bounded so this rarely produces more than one
 // batch. An empty input yields no batches.
 func splitMetricBatches(rows []PRMetricRow, clientVersion string, timeNano int64, maxBytes int) ([]otlpMetricsPayload, error) {
+	return splitGaugeBatches(rows, maxBytes, func(chunk []PRMetricRow) otlpMetricsPayload {
+		return buildMetricsPayload(chunk, clientVersion, timeNano)
+	})
+}
+
+// splitGaugeBatches is the row-type-generic byte splitter shared by every gauge
+// family (pr_metrics, weekly session). It accumulates rows into a payload via
+// build until the marshaled body would exceed maxBytes, then starts a new batch.
+// Splitting on whole rows (not individual metrics) keeps every metric's points
+// for a chunk together. An empty input yields no batches.
+func splitGaugeBatches[T any](rows []T, maxBytes int, build func([]T) otlpMetricsPayload) ([]otlpMetricsPayload, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
 	var batches []otlpMetricsPayload
-	var cur []PRMetricRow
+	var cur []T
 	for _, r := range rows {
-		next := append(append([]PRMetricRow{}, cur...), r)
-		body, err := json.Marshal(buildMetricsPayload(next, clientVersion, timeNano))
+		next := append(append([]T{}, cur...), r)
+		body, err := json.Marshal(build(next))
 		if err != nil {
 			return nil, err
 		}
 		if len(cur) > 0 && len(body) > maxBytes {
-			batches = append(batches, buildMetricsPayload(cur, clientVersion, timeNano))
-			cur = []PRMetricRow{r}
+			batches = append(batches, build(cur))
+			cur = []T{r}
 			continue
 		}
 		cur = next
 	}
 	if len(cur) > 0 {
-		batches = append(batches, buildMetricsPayload(cur, clientVersion, timeNano))
+		batches = append(batches, build(cur))
 	}
 	return batches, nil
 }

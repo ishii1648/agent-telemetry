@@ -5,7 +5,7 @@
   "graphTooltip": 1,
   "links": [],
   "liveNow": false,
-  "description": "otel+grafana 一本化後の主可視化。Tier 1（PR 単位 gauge agent_pr_* ＋ raw events Loki）に加え、Tier 2（既存 gauge の last_over_time 集約で出すヘッドライン stat / 週別 merged PR trend）を表示。Tier 2 は pr_metrics（is_merged=1 限定）由来のため merged-PR 寄与分のみで、全 session 総量ではない（各パネル description 参照）。session-grain（Tier 3）は issues/0053、並列度（Tier 4）は issues/0054 で別管理。",
+  "description": "otel+grafana 一本化後の主可視化。Tier 1（PR 単位 gauge agent_pr_* ＋ raw events Loki）、Tier 2（既存 gauge の last_over_time 集約で出すヘッドライン stat / 週別 merged PR trend）、Tier 3（session-grain 週次 gauge agent_weekly_session_* による top-level sessions / 週別 token・tokens per session・ask_user_question per session）を表示。Tier 2 は pr_metrics（is_merged=1 限定）由来のため merged-PR 寄与分のみだが、Tier 3 は非 PR・未マージを含む全 top-level session を session 単位で集計する（各パネル description 参照）。並列度（Tier 4）は issues/0054 で abandon。",
   "panels": [
     {
       "id": 100,
@@ -160,10 +160,192 @@
       }
     },
     {
+      "id": 101,
+      "title": "session-grain — top-level セッションの週次推移（Tier 3: weekly_session_metrics gauge）",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 30,
+      "title": "top-level sessions",
+      "description": "期間内の top-level セッション数（subagent / ghost / dotfiles repo を除く）。`agent_weekly_session_*` gauge は client が `weekly_session_metrics` VIEW（JST 月曜起点週で session を集約）を送る sparse 系列なので、`sum(last_over_time([$__range]))` で各週バケットの最新値を拾い全週・全 agent を合算する。`pr_metrics`（is_merged=1 限定）の session_count と違い、非 PR・未マージ・放棄を含む top-level session の総数。⚠ 範囲は週バケット単位に丸まる（週次 pre-aggregation の帰結）ので、SQLite 版の任意 timestamp 範囲 stat とは境界がずれる。",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "sum(last_over_time(agent_weekly_session_count{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 31,
+      "title": "週別 token 消費",
+      "description": "週ごとの top-level session 総 token 消費。`sum by (week_start)(last_over_time(agent_weekly_session_total_tokens[$__range]))` で各 JST 暦週バケットを選択 agent 跨ぎで合算する。week_start ラベル（client 側で `date(timestamp,'weekday 0','-6 days')` 算出）を x 軸に使うので、PromQL `[1w]` 窓（UTC 木曜起点）の境界ずれが無く SQLite 版の週バケットと一致する。total（sum 系）は agent 跨ぎ合算が正しい。",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "sum by (week_start) (last_over_time(agent_weekly_session_total_tokens{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": { "Value": "total_tokens" }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "week_start" }] }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#a855f7", "mode": "fixed" },
+          "unit": "short",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "week_start",
+        "orientation": "auto",
+        "showValue": "auto",
+        "barWidth": 0.7,
+        "legend": { "showLegend": false },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "id": 32,
+      "title": "週別 tokens / session",
+      "description": "週ごとの session あたり平均 token。agent 跨ぎ集約で ratio の平均を取ると誤るため、base measure から再計算する: `sum by (week_start)(total_tokens) / sum by (week_start)(count)`（加重平均 = 集約安全）。client は単一 agent 表示用に `agent_weekly_session_tokens_per_session`（(week,agent) 単位 ratio）も送るが、本パネルは All 選択でも正しいよう base から再計算する。week_start を x 軸に使い JST 暦週で並べる。",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "sum by (week_start) (last_over_time(agent_weekly_session_total_tokens{coding_agent=~\"$coding_agent\"}[$__range])) / sum by (week_start) (last_over_time(agent_weekly_session_count{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": { "Value": "tokens_per_session" }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "week_start" }] }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#0ea5e9", "mode": "fixed" },
+          "unit": "short",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "week_start",
+        "orientation": "auto",
+        "showValue": "auto",
+        "barWidth": 0.7,
+        "legend": { "showLegend": false },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "id": 33,
+      "title": "週別 ask_user_question / session",
+      "description": "週ごとの session あたり AskUserQuestion 発火数（仕様確認の頻度）。base measure から集約安全に再計算: `sum by (week_start)(ask_user_question_total) / sum by (week_start)(count)`。⚠ ask_user_question は Claude 固有で Codex は常に 0（agent 非対称、agent 跨ぎ比較に使わない）。week_start を x 軸に使い JST 暦週で並べる。",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "sum by (week_start) (last_over_time(agent_weekly_session_ask_user_question_total{coding_agent=~\"$coding_agent\"}[$__range])) / sum by (week_start) (last_over_time(agent_weekly_session_count{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": { "Value": "ask_user_question_per_session" }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "week_start" }] }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#f59e0b", "mode": "fixed" },
+          "unit": "short",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "week_start",
+        "orientation": "auto",
+        "showValue": "auto",
+        "barWidth": 0.7,
+        "legend": { "showLegend": false },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
       "id": 102,
       "title": "改善のきっかけ — PR 単位の外れ値検出",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "collapsed": false,
       "panels": []
     },
@@ -172,7 +354,7 @@
       "title": "PR 別 token スコアカード",
       "description": "PR ごとの token 消費・効率・品質指標一覧。複雑度の異なる PR を比較するのではなく、外れ値を発見しドリルダウンする用途。pr_title は gauge ラベルに含まれないため列にしない（[docs/spec.md] gauge tag は VIEW projection に限定）",
       "type": "table",
-      "gridPos": { "h": 16, "w": 16, "x": 0, "y": 15 },
+      "gridPos": { "h": 16, "w": 16, "x": 0, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "oss-mimir" },
       "targets": [
         {
@@ -327,7 +509,7 @@
       "title": "PR 別 session_count 分布",
       "description": "多セッション PR の外れ値検出。脱線・やり直しの兆候。上位 5 件のみ",
       "type": "barchart",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "oss-mimir" },
       "targets": [
         {
@@ -378,7 +560,7 @@
       "title": "PR 別 tokens / tool_use",
       "description": "1 tool_use あたりの token 消費が大きい PR。ファイル肥大・無駄な再読みの兆候。上位 5 件のみ",
       "type": "barchart",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
       "datasource": { "type": "prometheus", "uid": "oss-mimir" },
       "targets": [
         {
@@ -428,7 +610,7 @@
       "id": 103,
       "title": "Raw events — Loki / OTLP Logs",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
       "collapsed": false,
       "panels": []
     },
@@ -437,7 +619,7 @@
       "title": "Raw events (Loki / OTLP Logs)",
       "description": "OTel Collector 経由で Loki に流れた raw events（OTLP Logs）。PR 集約 gauge では追えない個々のイベントを LogQL でドリルダウンする",
       "type": "logs",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 49 },
       "datasource": { "type": "loki", "uid": "oss-loki" },
       "options": {
         "dedupStrategy": "none",
@@ -482,6 +664,6 @@
   "timezone": "Asia/Tokyo",
   "title": "agent-telemetry (OSS backend)",
   "uid": "agent-telemetry-oss",
-  "version": 5,
+  "version": 6,
   "weekStart": ""
 }

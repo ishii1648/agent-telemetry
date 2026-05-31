@@ -337,7 +337,7 @@ signals = ["logs"]
 | `auth_header` | string | `Authorization` | credential を載せる HTTP ヘッダ名。Datadog は `dd-api-key` |
 | `auth_scheme` | string | `Authorization` 時は `Bearer`、それ以外は空 | ヘッダ値の prefix。空なら raw token（`dd-api-key: <token>`）、非空なら `<scheme> <token>`（`Authorization: Bearer <token>`） |
 | `encoding` | string | `json` | wire encoding。`json`（自前サーバ / Collector）または `protobuf`（Datadog direct logs は protobuf 必須） |
-| `signals` | array | `["logs"]` | 送る representation。`logs`（raw events / OTLP Logs）と `metrics`（`pr_metrics` gauge / OTLP Metrics、後述「`pr_metrics` gauge representation」節）の 2 種。両方指定可（`["logs", "metrics"]`）で、representation ごとに別 cursor で独立に前進する |
+| `signals` | array | `["logs"]` | 送る representation。`logs`（raw events / OTLP Logs）と `metrics`（OTLP Metrics gauge＝`pr_metrics` gauge ＋ session-grain 週次 gauge、後述各節）の 2 種。両方指定可（`["logs", "metrics"]`）で、representation ごとに別 cursor で独立に前進する。`metrics` を指定すると `pr_metrics` と `weekly_session_metrics` の両 gauge family が同一 `/v1/metrics` flush で送られる |
 
 設定された target が 1 つも無い、または全 target の `endpoint` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。target が configured とみなされる条件は **`endpoint` が非空**であること（`token` の有無は問わない）。`endpoint` を持つ一部 target だけが誤設定（`endpoint` 空）の場合は、その target の id を stderr に明示してスキップする（黙殺しない）。`signals` に `logs` を含む target だけが logs flush の対象、`metrics` を含む target だけが metrics flush の対象になる（両 representation は同一 flush 内で別経路として処理される）。
 
@@ -363,7 +363,7 @@ Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metri
 
 | フラグ | 説明 |
 |---|---|
-| `--since-last`（既定） | logs target には `flush_cursors[target_id]` より後の events を送信。metrics target には新規イベントがあれば `pr_metrics` の現在値を gauge 送信（`metrics_cursors[target_id]` で判定、後述「`pr_metrics` gauge representation」節） |
+| `--since-last`（既定） | logs target には `flush_cursors[target_id]` より後の events を送信。metrics target には新規イベントがあれば `pr_metrics` ＋ `weekly_session_metrics` の現在値を gauge 送信（`metrics_cursors[target_id]` で判定、後述「`pr_metrics` gauge representation」「session-grain 週次 gauge representation」節） |
 | `--full` | cursor を無視して全件送信。logs は events 全体、metrics は全 PR の現在 gauge 値を再送（サーバ初期化や障害復旧で使う。logs は冪等、gauge は新 timestamp の別点になるが `last` 集計では無害） |
 | `--dry-run` | 送信せず target ごとの対象件数とサイズだけ表示（logs / metrics それぞれの行を出す） |
 | `--agent <claude\|codex>` | agent を絞り込む。省略時は検出された全 agent |
@@ -536,6 +536,20 @@ Content-Type: application/json
   }]
 }
 ```
+
+### session-grain 週次 gauge representation（OTLP Metrics）
+
+`signals` に `metrics` を含む target には、`pr_metrics` gauge と **同じ flush・同じ `/v1/metrics` POST・同じ `metrics_cursors`** で、`weekly_session_metrics` VIEW を client 側で評価した **session 単位の週次集約値** も `agent_weekly_session_*` gauge として送る（[0053] Tier 3）。gauge の意味論（送信時刻スタンプ・`last` 集計前提・dimension の重複なし・transport 失敗時 cursor 据え置き）は `pr_metrics` gauge と同一。
+
+**なぜ session-grain が別に要るか**: `pr_metrics` は `is_merged = 1` 限定かつ `pr_url` 単位なので、その `session_count` は「PR に寄与した session 数」であって **top-level session の総数ではない**。非 PR・未マージ・放棄 session を取りこぼす。top-level session 数・session 単位の総 token・tokens/session・ask_user_question/session はこの新 representation でしか出せない（raw events の LogQL 集約では cross-event join を backend で再現できないため不可、[0043]）。
+
+**なぜ週次で pre-aggregate するか（weekday-0 バケット問題）**: SQLite の `weekly_session_metrics` は `date(timestamp, 'weekday 0', '-6 days')`（Asia/Tokyo の月曜起点週）でバケットする。PromQL の `[1w]` 窓は epoch 整列（UTC 木曜起点）で、この暦週と境界がずれる。そこで **client 側（SQLite）で週次集約し、`week_start` を gauge の label として載せる**。dashboard は `week_start` label で group するだけで、`[1w]` 窓を一切使わない。recording rule で backend 再集約する案は UTC 境界を再導入してしまい、点を `week_start` に back-date する案は ingest の out-of-order 却下リスクがあるため、いずれも採らない（判断記録は [0053]）。
+
+**dimension（tag）**: `weekly_session_metrics` の GROUP BY に等しく **`week_start`（JST 月曜起点 ISO 日付）/ `coding_agent`** のみ。`session_id` は出さない（cardinality を 週 × agent で有界に抑える）。`user_id` は VIEW が GROUP BY しないため tag に出さない。
+
+**送る metric**: base measure（`agent_weekly_session_count` / `agent_weekly_session_total_tokens` / `agent_weekly_session_ask_user_question_total`）と派生 ratio（`agent_weekly_session_tokens_per_session` / `agent_weekly_session_ask_user_question_per_session`）を `docs/metrics.md` の名前で gauge 送信する。`pr_metrics` gauge と同じく **base と ratio を両方** 同梱する（[0043] の方針）。`coding_agent` を跨いで集約する dashboard は ratio を平均するのではなく **base measure から再計算する**（`sum by (week_start)(total_tokens) / sum by (week_start)(count)`）ことで集約安全にする。`weekly_session_metrics` は 1 バケットに最低 1 session 含む構造なので ratio が NULL になることはなく、全点を送る（`pr_metrics` の NULL ratio スキップとは異なる）。
+
+**cursor**: `pr_metrics` gauge と `metrics_cursors[target_id]` を共有する。新規イベントが無ければ（= どの VIEW の値も変わりようがない）2 family まとめて skip し、送信成功時に現在の `max(local_sequence)` まで一度だけ前進する。`--full` は両 family の全点を再送する。
 
 ### サーバ binary
 
