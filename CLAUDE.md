@@ -50,12 +50,17 @@ Contextual Commits を使用。Conventional Commits プレフィックス + 構�
 
 ### リンク健全性（link-check / lychee）
 
-`.md` / `site/**` を変更すると `link-check` workflow（lychee）が走り、壊れたリンクで CI が落ちる。再発しやすい 2 パターンに注意する:
+`.md` / `site/**` を変更すると `link-check` workflow（lychee）が走り、壊れたリンクで CI が落ちる。再発しやすい 3 パターンに注意する:
 
 - **issue を `issues/closed/` に move したら、その issue を指す相対リンクを全て追従する。** move 後に `rg 'issues/<NNNN>-' -l` で参照元を洗い出し、`issues/<NNNN>-...` → `issues/closed/<NNNN>-...` に書き換える（README・docs・他 issue が対象）。これを忘れると lychee が「File not found」で落ちる。
 - **同一 PR で新規追加した repo 内ファイル/dir を `https://github.com/ishii1648/agent-telemetry/(tree|blob)/main/...` の絶対 URL で参照しても良い。** merge 前は main に存在せず本来 404 になるが、`link-check.yml` の `--remap` で自リポジトリの main URL を checkout 済み local file に向け直しているため通る（typo は local 不在として引き続き検出される）。新しい self-main リンクのために `.lycheeignore` へ追記する必要はない。
+- **bare URL の直後に全角文字（特に閉じ括弧 `）`）を続けない。** lychee の URL パーサは末尾のマルチバイト文字を URL に巻き込み、`https://example.com/x）で` を 1 つの URL として解決して 404 で落とす（例: `…hooks）で` が `…hooks%EF%BC%89%E3%81%A7` 化）。日本語に隣接させる URL は必ず markdown リンク `[テキスト](URL)` か autolink `<URL>` で明示的に区切る。半角空白で挟むだけでは括弧を巻き込む場合があるので、リンク記法に統一する。
 
 ローカル再現は CI と同じ lychee で行う（`./**/*.md` を対象に `--remap "https://github.com/ishii1648/agent-telemetry/(?:tree|blob)/main/(.*) file://$PWD/\$1"` を付ける）。
+
+### PR description の issue リンク必須（pr-issue-link）
+
+`.github/workflows/intent.yml` の `pr-issue-link` チェックが **全 PR の本文**に「issue リンク（`issues/NNNN-<cat>-<slug>.md` の文字列を含む）」または `(N/A — chore)` の明示を必須化する。どちらも無いと merge がブロックされる。**PR 作成時（`git-ship` 含む）は本文に必ずどちらかを入れる**こと。後付けで本文だけ編集した場合は、その編集イベントで走った run が古い本文で失敗扱いのまま残ることがあるので、`git push`（synchronize イベント）で現本文を再評価させて緑にする。ルール本体（issue 化の要否・命名・SEQUENCE 運用）は AGENTS.md「issues について」を正とする。
 
 ### テスト
 
