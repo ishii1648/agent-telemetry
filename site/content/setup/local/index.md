@@ -69,13 +69,13 @@ agent-telemetry setup --agent codex
       {"matcher": "", "hooks": [{"type": "command", "command": "agent-telemetry hook session-end --agent claude", "timeout": 10}]}
     ],
     "Stop": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "agent-telemetry hook stop --agent claude"}]}
+      {"matcher": "", "hooks": [{"type": "command", "command": "agent-telemetry hook stop --agent claude", "async": true}]}
     ]
   }
 }
 ```
 
-`--agent` を省略しても既定値が `claude` のため動作します。
+`--agent` を省略しても既定値が `claude` のため動作します。`Stop` は応答ターンごとに発火するため `"async": true` を付けて登録し、Claude Code が hook プロセスの終了を待たずユーザの次操作に進めるようにします（Claude Code v2.1.0+ の Command hook フィールド）。
 
 ### Codex CLI (`~/.codex/hooks.json` または `~/.codex/config.toml`)
 

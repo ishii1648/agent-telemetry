@@ -17,6 +17,10 @@ func TestRunWith_ClaudeOutput(t *testing.T) {
 	if !strings.Contains(out, "session-start --agent claude") {
 		t.Errorf("missing claude session-start example:\n%s", out)
 	}
+	// Stop は応答ターンごとに発火するので非ブロッキング登録 (async) を必須にする。
+	if !strings.Contains(out, "hook stop --agent claude\", \"async\": true") {
+		t.Errorf("claude Stop example must register with \"async\": true:\n%s", out)
+	}
 	if strings.Contains(out, "PostToolUse") {
 		t.Error("Claude output should not include PostToolUse")
 	}

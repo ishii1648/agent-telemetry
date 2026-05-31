@@ -18,13 +18,18 @@ type HookSpec struct {
 	Event      string // hook event name as written in settings (e.g. "SessionStart")
 	Subcommand string // agent-telemetry hook subcommand
 	Optional   bool   // true → doctor flags as info, not failure
+	Async      bool   // true → hook should be registered with "async": true (doctor hints when missing)
 }
 
 // ClaudeHookSpecs lists the canonical hooks for Claude Code.
+//
+// Stop is Async: it fires every response turn, so it must be registered with
+// "async": true to keep Claude Code from blocking the user's response cycle on
+// the hook process. doctor surfaces a hint when Stop is registered without it.
 var ClaudeHookSpecs = []HookSpec{
 	{Event: "SessionStart", Subcommand: "session-start"},
 	{Event: "SessionEnd", Subcommand: "session-end"},
-	{Event: "Stop", Subcommand: "stop"},
+	{Event: "Stop", Subcommand: "stop", Async: true},
 }
 
 // CodexHookSpecs lists the canonical hooks for Codex CLI. PostToolUse is
@@ -125,10 +130,13 @@ func printClaude(w io.Writer) {
 	fmt.Fprintln(w, "        {\"matcher\": \"\", \"hooks\": [{\"type\": \"command\", \"command\": \"agent-telemetry hook session-end --agent claude\", \"timeout\": 10}]}")
 	fmt.Fprintln(w, "      ],")
 	fmt.Fprintln(w, "      \"Stop\": [")
-	fmt.Fprintln(w, "        {\"matcher\": \"\", \"hooks\": [{\"type\": \"command\", \"command\": \"agent-telemetry hook stop --agent claude\"}]}")
+	fmt.Fprintln(w, "        {\"matcher\": \"\", \"hooks\": [{\"type\": \"command\", \"command\": \"agent-telemetry hook stop --agent claude\", \"async\": true}]}")
 	fmt.Fprintln(w, "      ]")
 	fmt.Fprintln(w, "    }")
 	fmt.Fprintln(w, "  }")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  Stop は応答ターンごとに発火するため \"async\": true で登録します")
+	fmt.Fprintln(w, "  （Claude Code v2.1.0+。hook プロセスの終了をユーザ応答サイクルが待たない）。")
 }
 
 func printCodex(w io.Writer) {

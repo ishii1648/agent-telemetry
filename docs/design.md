@@ -138,6 +138,19 @@ spawn の要点:
 - worker バイナリは `os.Executable()` で解決する（PATH 上の `agent-telemetry` に依存しない。絶対パスで hook 登録されていても動く）。stdio は `/dev/null` に向けて hook 自身の出力を汚さない
 - `backfill --detach` 入口が `setsid` で実 worker (`backfill --worker`) を再 spawn するため、hook プロセスが終了しても worker は生き残る
 
+#### hook プロセス自体の待ちを `async: true` で外す（Claude のみ）
+
+detached worker は **worker の重い処理** を非ブロッキングにするが、Claude Code が **`agent-telemetry hook stop` プロセスの exit を待つ** こと自体は消せない。`Stop` は応答ターンごとに発火するため、毎ターン Go バイナリのコールドスタート分（数十 ms）がユーザの次入力をブロックする。
+
+そこで Claude Code の `Stop` hook を `"async": true` で登録する（v2.1.0+ の Command hook フィールド。[hooks reference](https://code.claude.com/docs/en/hooks)）。Claude Code は hook をバックグラウンド起動して exit を待たないため、front-door の待ちが消える。detached worker と相補的: worker は重い処理を、`async` は hook プロセスの待ちを、それぞれ隠す。
+
+- `async` 時は stdout / exit code が無視される。`RunStop` の error return は元々 non-fatal（telemetry は best-effort）なので実害なし。`asyncRewake`（exit 2 で Claude を再起床）は**使わない** — 非ブロッキングの逆になるため
+- Codex には効かない。Codex の `Stop` は de-facto SessionEnd で `ended_at` を同期更新する別系統（hook 登録も `~/.codex/` 側）。`async` は Claude Code 固有フィールド
+- `SessionEnd`（Claude のみ・セッション終了時 1 回）の `sync-db` は同期のまま残す。発火が 1 回で体感が小さく、終了フェーズで background hook が完了前に kill されるリスクがドキュメント未定義なため
+- 登録判定（`isRegistered`）は `command` 文字列のみを見るため、`async` キー追加で誤検知しない。加えて doctor は `HookSpec.Async`（Claude の Stop のみ true）の hook について `settings.json` の `"async"` を別途読み、**registered だが async でない場合に hint を出す**（`✗`/failure ではなく `⚠` の情報行。telemetry は async 無しでも動くため `doctor` の exit code には影響しない）。Codex は async 概念が無いため対象外
+
+詳細な意思決定は [issues/closed/0056-design-stop-hook-async-nonblocking.md](../issues/closed/0056-design-stop-hook-async-nonblocking.md)。
+
 このモデルにより Claude / Codex のランタイムが収束する（Codex に `SessionEnd` が無い制約が worker トリガを Stop に一本化することで設計上消える）。詳細は [issues/closed/0039-bug-stop-hook-backfill-rate-limit.md](../issues/closed/0039-bug-stop-hook-backfill-rate-limit.md)。過去の fire-and-forget / launchd cron の経緯は [issues/closed/0020-design-backfill-evolution-to-stop-hook.md](../issues/closed/0020-design-backfill-evolution-to-stop-hook.md) を参照。
 
 ### PR の確定は worker で early binding
