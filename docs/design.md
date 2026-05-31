@@ -144,6 +144,8 @@ detached worker は **worker の重い処理** を非ブロッキングにする
 - `SessionEnd`（Claude のみ・セッション終了時 1 回）の `sync-db` は同期のまま残す。発火が 1 回で体感が小さく、終了フェーズで background hook が完了前に kill されるリスクがドキュメント未定義なため
 - doctor への影響は無い: `isRegistered` は `command` 文字列のみを見て登録判定するため、`async` キー追加で誤検知しない
 
+詳細な意思決定は [issues/closed/0056-design-stop-hook-async-nonblocking.md](../issues/closed/0056-design-stop-hook-async-nonblocking.md)。
+
 このモデルにより Claude / Codex のランタイムが収束する（Codex に `SessionEnd` が無い制約が worker トリガを Stop に一本化することで設計上消える）。詳細は [issues/closed/0039-bug-stop-hook-backfill-rate-limit.md](../issues/closed/0039-bug-stop-hook-backfill-rate-limit.md)。過去の fire-and-forget / launchd cron の経緯は [issues/closed/0020-design-backfill-evolution-to-stop-hook.md](../issues/closed/0020-design-backfill-evolution-to-stop-hook.md) を参照。
 
 ### PR の確定は worker で early binding
