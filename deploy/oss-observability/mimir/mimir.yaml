@@ -1,0 +1,57 @@
+# Grafana Mimir — single-process (monolithic) 設定。ローカル検証用に
+# filesystem storage + 単一レプリカ + multitenancy 無効で最小構成にする。
+# 本番では multitenancy / object storage / replication を有効化する。
+multitenancy_enabled: false
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  log_level: warn
+
+common:
+  storage:
+    backend: filesystem
+    filesystem:
+      dir: /data/mimir
+
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/mimir/blocks
+  bucket_store:
+    sync_dir: /data/mimir/tsdb-sync
+  tsdb:
+    dir: /data/mimir/tsdb
+
+compactor:
+  data_dir: /data/mimir/compactor
+  sharding_ring:
+    kvstore:
+      store: memberlist
+
+distributor:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: memberlist
+
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: memberlist
+    replication_factor: 1
+
+ruler_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/mimir/ruler
+
+store_gateway:
+  sharding_ring:
+    replication_factor: 1
+
+limits:
+  # gauge data point は flush 実行時刻で打たれる。再送や時計ずれで多少前後
+  # しても弾かれないよう out-of-order を許容する (docs/spec.md gauge 意味論)。
+  out_of_order_time_window: 1h

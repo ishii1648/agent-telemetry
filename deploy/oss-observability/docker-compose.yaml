@@ -1,0 +1,67 @@
+# OSS observability backend のローカル compose レシピ (issue 0050)。
+#
+#   DEPLOY_ENV=dev docker compose up
+#
+# agent-telemetry flush から OTel Collector を経由し、metrics は Mimir、
+# logs は Loki に push して Grafana (PromQL / LogQL) で確認する。Datadog
+# レシピ (../otel-collector/) と同じ「Collector が backend へ push」する
+# 構成を、credential 不要の OSS で再現する。
+#
+# client 側は config.toml.example の export target を http://localhost:4318
+# に向ける (signals = ["logs", "metrics"])。
+#
+# サーバ deploy への橋渡し: 各 service / config / volume は Kubernetes の
+# Deployment + ConfigMap + PVC に 1:1 で移しやすい単位で切ってある (対応方針 5)。
+services:
+  otel-collector:
+    # Datadog レシピと同じ版に pin する (OTTL / exporter 挙動の再現性)。
+    image: otel/opentelemetry-collector-contrib:0.153.0
+    command: ["--config=/etc/otelcol/collector-config.yaml"]
+    volumes:
+      - ./collector-config.yaml:/etc/otelcol/collector-config.yaml:ro
+    environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-dev}
+    ports:
+      - "4318:4318" # OTLP/HTTP (clients flush here)
+    depends_on:
+      - mimir
+      - loki
+
+  mimir:
+    image: grafana/mimir:2.14.2
+    command: ["-config.file=/etc/mimir/mimir.yaml"]
+    volumes:
+      - ./mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    ports:
+      - "9009:9009" # HTTP (OTLP ingest + Prometheus query API)
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100" # HTTP (OTLP ingest + LogQL query API)
+
+  grafana:
+    image: grafana/grafana-oss:11.5.2
+    # 既存 SQLite dashboard (top-level compose) の :13000 と衝突しないよう
+    # 既定 port を分ける (対応方針 3: 別系統の検証 dashboard)。
+    ports:
+      - "${GRAFANA_PORT:-13001}:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - mimir
+      - loki
+
+volumes:
+  mimir-data:
+  loki-data:

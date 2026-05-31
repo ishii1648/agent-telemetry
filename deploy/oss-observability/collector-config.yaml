@@ -1,0 +1,71 @@
+# OTel Collector 設定サンプル — agent-telemetry の OTLP Logs / Metrics を
+# OSS backend (Mimir / Loki) へ fanout するローカル検証用 collector レシピ。
+#
+# Datadog レシピ (../otel-collector/) との対応:
+#   - receiver は同じ OTLP/HTTP (client は encoding = "json" のまま投げられる)。
+#   - exporter だけ Datadog → Mimir(metrics) / Loki(logs) に差し替えた構成。
+# これにより「Collector が backend へ push する」失敗点・運用感を Datadog
+# レシピと揃えたまま、credential 不要の OSS で E2E を再現できる (issue 0050)。
+#
+# データフロー:
+#   client (agent-telemetry flush)
+#     --(OTLP/HTTP Logs,    JSON)--> otlp receiver --> Loki  (otlphttp/loki)
+#     --(OTLP/HTTP Metrics, JSON)--> otlp receiver --> Mimir (otlphttp/mimir)
+#
+# 必要なディストリビューション: opentelemetry-collector-contrib
+#   (otlphttp exporter は core にも含まれるが、Datadog レシピと image を揃える)
+
+receivers:
+  # client (agent-telemetry flush) は JSON OTLP/HTTP の Logs と Metrics を
+  # 同一 endpoint の /v1/logs・/v1/metrics に投げてくる (docs/spec.md「送信先」)。
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # OTel resource 規約の付与。Datadog レシピと同じく service.name /
+  # deployment.environment を resource attribute として固定する。
+  #   - Mimir では service.name が `job` ラベルへ、deployment.environment は
+  #     target_info 経由のメタになる (OTLP→Prometheus 変換規約)。
+  #   - Loki では service.name が `service_name` ラベルへ昇格する (native OTLP)。
+  resource:
+    attributes:
+      - key: service.name
+        value: agent-telemetry
+        action: upsert
+      - key: deployment.environment
+        value: ${env:DEPLOY_ENV}
+        action: upsert
+
+  batch:
+    timeout: 5s
+
+exporters:
+  # metrics -> Mimir の OTLP ingest endpoint。Mimir は OTLP gauge を
+  # そのままの metric 名で受ける (suffix 付与は既定 off)。
+  otlphttp/mimir:
+    metrics_endpoint: http://mimir:9009/otlp/v1/metrics
+    tls:
+      insecure: true
+
+  # logs -> Loki の native OTLP endpoint。専用 exporter ではなく otlphttp で
+  # Loki 3.x の /otlp/v1/logs に直接送る (issue 0050 の対応方針 2)。
+  otlphttp/loki:
+    logs_endpoint: http://loki:3100/otlp/v1/logs
+    tls:
+      insecure: true
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/mimir]
+    logs:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/loki]
