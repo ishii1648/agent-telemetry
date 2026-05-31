@@ -506,6 +506,68 @@ CREATE TABLE permission_events (id INTEGER PRIMARY KEY);
 	}
 }
 
+// TestRunWithPaths_HealsMissingViewOnHashMatch is the issue 0052 self-heal:
+// when an aggregate VIEW is dropped out-of-band but schema_hash still matches,
+// the next sync-db must recreate the VIEW instead of skipping all DDL (the
+// hash-match fast path previously left a missing VIEW unrepaired, so flush kept
+// failing until schema_meta was manually cleared).
+func TestRunWithPaths_HealsMissingViewOnHashMatch(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "agent-telemetry.db")
+	tPath := filepath.Join(dir, "t.jsonl")
+	os.WriteFile(tPath, []byte(
+		`{"type":"user","message":{"content":"hello"}}`+"\n"+
+			`{"type":"assistant","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":100,"output_tokens":20},"content":[{"type":"tool_use","name":"Read"}]}}`+"\n",
+	), 0644)
+	indexPath := filepath.Join(dir, "session-index.jsonl")
+	os.WriteFile(indexPath, []byte(
+		`{"timestamp":"2026-03-01 10:00:00","ended_at":"2026-03-01 10:30:00","session_id":"s1","cwd":"/tmp","repo":"u/r","branch":"feat/x","pr_urls":["https://github.com/u/r/pull/1"],"transcript":"`+tPath+`","parent_session_id":"","is_merged":true}`+"\n",
+	), 0644)
+
+	// First run builds the DB with the current schema_hash and all VIEWs.
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Drop pr_metrics (and the VIEW that depends on it) while leaving schema_hash
+	// intact — exactly the broken state the bug was hit on.
+	drop, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drop.Exec("DROP VIEW weekly_pr_metrics; DROP VIEW pr_metrics;"); err != nil {
+		t.Fatalf("drop view: %v", err)
+	}
+	drop.Close()
+
+	// Second run: hash still matches, so the fast path runs — it must repair the
+	// missing VIEW rather than skip.
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatalf("second run (heal): %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='pr_metrics'").Scan(&n); err != nil {
+		t.Fatalf("probe pr_metrics: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("pr_metrics VIEW not recreated by hash-match heal (count=%d)", n)
+	}
+	// And it is queryable (the merged PR resolves through the rebuilt VIEW).
+	var prs int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pr_metrics").Scan(&prs); err != nil {
+		t.Fatalf("query healed pr_metrics: %v", err)
+	}
+	if prs != 1 {
+		t.Errorf("pr_metrics rows: got %d, want 1", prs)
+	}
+}
+
 // TestRunWithPaths_BusyTimeoutWaitsForWriter verifies that a concurrent
 // sync-db invocation waits for an in-flight writer instead of failing
 // immediately with SQLITE_BUSY. Without busy_timeout configured on the

@@ -19,6 +19,7 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 	"github.com/ishii1648/agent-telemetry/internal/backfill"
 	"github.com/ishii1648/agent-telemetry/internal/syncdb"
+	"github.com/ishii1648/agent-telemetry/internal/syncdb/schema"
 )
 
 // MaxBatchBytes is the per-request hard cap from docs/spec.md. Kept as a var
@@ -177,6 +178,19 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 	}
 	defer db.Close()
 
+	// The metrics representation reads the pr_metrics VIEW, which sync-db owns
+	// and which an old binary's DB (or an out-of-band DROP) may be missing.
+	// flush does not rebuild from source, so guarantee the derived VIEWs here
+	// — non-destructively, never touching events — before any target reads them
+	// (issue 0052). Only when a metrics target is actually configured: a
+	// logs-only flush has no VIEW dependency, and on a never-synced DB the logs
+	// path fails on its own with the same missing-events signal.
+	if anyMetricsTarget(targets) {
+		if err := schema.EnsureViews(db); err != nil {
+			return nil, fmt.Errorf("ensure pr_metrics view: %w", err)
+		}
+	}
+
 	res := &FlushResult{PerAgent: make(map[string]*FlushAgentResult, len(agents))}
 	var firstErr error
 	for _, a := range agents {
@@ -187,6 +201,19 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 		}
 	}
 	return res, firstErr
+}
+
+// anyMetricsTarget reports whether at least one configured target opted into the
+// pr_metrics gauge representation. It gates the VIEW-ensure in RunFlush so a
+// logs-only (or fully opted-out) flush never pays for — or fails on — the
+// derived-VIEW guarantee.
+func anyMetricsTarget(targets []ExportTarget) bool {
+	for _, t := range targets {
+		if t.Configured() && t.SendsMetrics() {
+			return true
+		}
+	}
+	return false
 }
 
 func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, targets []ExportTarget, opts FlushOptions) (*FlushAgentResult, error) {

@@ -482,6 +482,8 @@ OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う（自�
 
 **送信先 / encoding**: base endpoint + `/v1/metrics` に POST。auth header / encoding / gzip は logs と同じ target 設定に従う（Datadog の metrics intake は JSON / protobuf 両対応だが、logs と揃えて `protobuf` にできる）。
 
+**VIEW の保証**: metrics target が設定された `flush` は、`pr_metrics` VIEW を評価する前に派生 VIEW の存在を保証する（DB オープン直後に非破壊で再生成する。events テーブルは触らない）。旧 binary 由来や VIEW が欠落した DB に対して `sync-db` を先に走らせなくても `flush` 単独で動く。events テーブル自体が無い（一度も `sync-db` していない）DB では VIEW を作れないため、`flush` は「`sync-db` を先に実行してください」と案内して exit 1 で終わる（cryptic な `no such table: pr_metrics` は出さない）。実装詳細は `docs/design.md`（[0052]）。
+
 **gauge の意味論（重要）**:
 
 - gauge は **冪等 upsert ではない**。各 data point は **送信時刻（flush 実行時刻）** で timestamp を打つ。同一 PR の再計算値は **同一 timestamp & dimensions の点のみ** last-write-wins で、新 timestamp での再送は series 内の **別の点**になる

@@ -177,12 +177,15 @@ global single-flight ロック（`~/.agent-telemetry/backfill.lock`）は別物�
 
 ### `sync-db` の incremental イベント追記戦略
 
-`sync-db` は通常実行で `events` テーブルに `INSERT OR IGNORE` でイベントを追記するだけで、テーブル / VIEW の DROP & CREATE は行わない。スキーマ DDL は `internal/syncdb/schema.sql` に集約し（events テーブル DDL + 派生 VIEW 定義）、SHA256 ハッシュを `go:generate` で `schema_hash.go` に埋め込む。起動時に埋め込みハッシュと DB の `schema_meta` テーブルに保存されたハッシュを比較する:
+`sync-db` は通常実行で `events` テーブルに `INSERT OR IGNORE` でイベントを追記するだけで、テーブル / VIEW の DROP & CREATE は行わない。スキーマ DDL は `internal/syncdb/schema/` 配下に **2 ファイルで** 集約する: `schema.sql` が耐久層（`events` / `schema_meta` テーブル + index、データを保持する破壊的 DDL）、`views.sql` が派生層（全 VIEW + `INSTEAD OF INSERT` トリガ、events から導出するため drop & create が冪等・非破壊）。`schema.SQL = schema.sql + views.sql` を `schema.go` で合成し、その合成文字列に対する SHA256 を `go:generate`（`genhash`）で `schema_hash.go` に埋め込む。起動時に埋め込みハッシュと DB の `schema_meta` テーブルに保存されたハッシュを比較する:
 
 | 状態 | DDL 実行 | events への書き込み |
 |---|---|---|
-| ハッシュ一致 | しない | `INSERT OR IGNORE` のみ |
-| ハッシュ不一致 / `schema_meta` 不在 | `schema.sql` を全実行（VIEW を DROP & CREATE。events テーブルは temp に rename → 新 DDL で再作成 → 行を流し込む）| `INSERT OR IGNORE` 後に新ハッシュを `schema_meta` へ書き込む |
+| ハッシュ一致 + 派生 VIEW 健在 | しない | `INSERT OR IGNORE` のみ |
+| ハッシュ一致 + 派生 VIEW 欠落 | `views.sql` のみ再適用（events は触らない＝非破壊。`schema.EnsureViews`）| `INSERT OR IGNORE` のみ |
+| ハッシュ不一致 / `schema_meta` 不在 | `schema.SQL`（= tables + views）を全実行（events テーブルを DROP & CREATE）| `INSERT OR IGNORE` 後に新ハッシュを `schema_meta` へ書き込む |
+
+ハッシュ一致時でも `pr_metrics` VIEW の有無を 1 クエリ確認し、欠落していれば `views.sql` を再適用する自己修復を入れている（`schema.EnsureViews`）。これは旧設計の「ハッシュ一致なら全 DDL skip」が、DROP された aggregate VIEW を復旧できず `DELETE FROM schema_meta` の手作業を強いていた問題への対処（[0052]）。**ハッシュ一致時に full `schema.SQL` を流さない**のが要点で、`schema.SQL` 先頭の `DROP TABLE events` は client なら `sync-db --recheck` で再構築できるが server では受信済み events を消すため、修復は VIEW 限定に閉じる。
 
 理由:
 
@@ -199,7 +202,9 @@ global single-flight ロック（`~/.agent-telemetry/backfill.lock`）は別物�
 
 中間ファイルが SoR である構造は、hook の書き込みを軽量に保つためでもある。hook はセッション中に同期実行されるため、JSONL への追記だけに留める。events への追記と OTel emit は `sync-db` / `flush` に委譲する。
 
-`schema.sql` の編集忘れによるハッシュ未更新を防ぐため、CI（`.github/workflows/schema-hash.yml`）で `go generate ./... && git diff --exit-code` を実行する。
+`schema.sql` / `views.sql` の編集忘れによるハッシュ未更新を防ぐため、CI（`.github/workflows/schema-hash.yml`）で `go generate ./... && git diff --exit-code` を実行する（`genhash` は両ファイルの合成に対してハッシュを計算する）。
+
+`flush` の metrics パス（`signals` に `metrics` を含む target）は `pr_metrics` VIEW を client 側で評価するが、`flush` は source からの再構築を行わない。VIEW を作るのは `sync-db` だけなので、旧 binary 由来の DB や VIEW が DROP された DB に対して `flush` 単独実行すると `no such table: pr_metrics` で落ちていた（[0052]）。対処として `RunFlush` は **metrics target が設定されているときに限り** DB オープン直後に `schema.EnsureViews` を呼び、派生 VIEW を非破壊で保証する。events テーブル自体が無い（= 一度も `sync-db` していない）DB では VIEW を定義できないため `schema.ErrEventsTableMissing` を返し、「`sync-db` を先に実行してください」と案内する。logs-only flush は VIEW 非依存なので保証をスキップする（未 sync な DB では logs パスも同じ events 欠落で失敗するため、二重に案内しない）。
 
 ### `backfill` の cursor + 2 フェーズ設計
 
