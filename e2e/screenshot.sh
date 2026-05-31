@@ -43,7 +43,11 @@ echo "Capturing full dashboard..."
 curl -sf -o "$FULL" "${BASE}/render/d/agent-telemetry/agent-telemetry?from=${FROM}&to=${TO}&width=1800&height=1500&scale=${SCALE}&tz=${TZ}&kiosk"
 echo "  → ${FULL}"
 
-# Also export key panels for README docs
+# Export the SQLite-specific PR scorecard drilldown for docs. The README hero
+# (docs/assets/dashboard-full.png) is NOT written here: after the otel cutover
+# (issue 0055) the hero is the OSS otel dashboard, owned by `make oss-screenshot`
+# / e2e/oss-screenshot.sh. Writing dashboard-full.png from the SQLite render
+# here would clobber that otel hero with the legacy SQLite image.
 DOCDIR="docs/assets"
 mkdir -p "$DOCDIR"
 for pair in "2:pr-scorecard:dashboard-pr-scorecard"; do
@@ -53,6 +57,5 @@ for pair in "2:pr-scorecard:dashboard-pr-scorecard"; do
   DOC_NAME="${rest#*:}"
   cp "${OUTDIR}/panel-${ID}-${PANEL_NAME}.png" "${DOCDIR}/${DOC_NAME}.png"
 done
-cp "$FULL" "${DOCDIR}/dashboard-full.png"
 
 echo "Done: ${#PANELS[@]} panels captured in ${OUTDIR}"

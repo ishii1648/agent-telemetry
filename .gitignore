@@ -9,3 +9,5 @@ e2e/testdata/agent-telemetry.db-shm
 e2e/testdata/agent-telemetry.db-wal
 /agent-telemetry
 /agent-telemetry-server
+# `make build` / `make oss-flush` / e2e/oss-screenshot.sh の出力先
+/bin/

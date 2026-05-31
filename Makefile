@@ -1,4 +1,4 @@
-.PHONY: build install uninstall grafana-fixtures grafana-up grafana-up-e2e grafana-down grafana-screenshot oss-up oss-down oss-flush lint-dashboard intent test-intent docs-serve docs-build docs-mod-update
+.PHONY: build install uninstall grafana-fixtures grafana-up grafana-up-e2e grafana-down grafana-screenshot oss-up oss-down oss-flush oss-screenshot lint-dashboard intent test-intent docs-serve docs-build docs-mod-update
 
 PREFIX ?= $(HOME)/.local
 BIN_DIR := $(PREFIX)/bin
@@ -94,6 +94,14 @@ oss-down:
 oss-flush: build
 	bin/$(BIN_NAME) sync-db
 	bin/$(BIN_NAME) flush
+
+# OSS otel dashboard の決定的スクショ (issue 0055 ⑤)。fixture を HOME サンドボックス
+# flush で Collector→Mimir/Loki に投入し、Grafana /render で撮る。README ヒーロー
+# (docs/assets/dashboard-full.png) はこのターゲットが owner。スクショ専用 stack を
+# `make oss-up` と別 port・別 project で立てるので並走を壊さない。スクリプトが
+# build / fixture 生成 / compose 起動 / flush / render / down -v まで一括で行う。
+oss-screenshot:
+	bash e2e/oss-screenshot.sh
 
 grafana-screenshot: grafana-up-e2e
 	GRAFANA_PORT=$(GRAFANA_E2E_PORT) bash e2e/screenshot.sh .outputs/grafana-screenshots
