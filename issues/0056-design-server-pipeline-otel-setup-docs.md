@@ -1,11 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/serverpipe/
-  - cmd/agent-telemetry-server/
-  - site/content/setup/
-  - site/content/explain/architecture/
-  - docs/design.md
 tags: [server, otel, grafana, sqlite, docs, follow-up]
 related: [0028, 0029, 0030, 0055]
 ---

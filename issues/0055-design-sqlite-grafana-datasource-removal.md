@@ -1,11 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - grafana/
-  - docker-compose.yaml
-  - Makefile
-  - docs/design.md
-  - deploy/oss-observability/
 tags: [sqlite, storage, grafana, otel, external-backend, architecture, viz-unification]
 related: [0032, 0040, 0043, 0046, 0050, 0053, 0054]
 ---
