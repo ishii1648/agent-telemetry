@@ -22,9 +22,11 @@ Codex CLI 対応の一環として、Grafana ダッシュボード `grafana/dash
   - `avg_tokens_per_pr` を `coding_agent` で GROUP BY して並べて表示
   - `pr_per_million_tokens` を同様に並べて表示
 - パネル配置はヘッドラインセクション末尾（trend / pr 詳細セクションの前）
-- `make grafana-screenshot` を実行して `docs/assets/dashboard-*.png` を更新する
+- `make lint-dashboard` で dashboard JSON を検証する
+
+> 注: ローカルの SQLite datasource render / スクショ経路（旧 root `docker-compose.yaml` + frser-sqlite-datasource / `e2e/screenshot.sh`）は otel 一本化（[0057]）で撤去済み。本 issue が対象とする `grafana/dashboards/agent-telemetry.json` はサーバ k8s 経路で配る dashboard なので、追加後の検証は `make lint-dashboard`（JSON 妥当性）とサーバ経路での表示確認で行う。OSS otel dashboard 側に同等パネルを足す場合は `make grafana-screenshot` を使う。
 
 ## 受け入れ条件
 
-- [ ] agent 別比較 stat パネルが追加され、`make grafana-up-e2e` で表示確認できる
-- [ ] `make grafana-screenshot` で `docs/assets/dashboard-*.png` を更新済み
+- [ ] agent 別比較 stat パネルが `grafana/dashboards/agent-telemetry.json`（サーバ経路）に追加される
+- [ ] `make lint-dashboard` が通る

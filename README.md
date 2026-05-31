@@ -2,9 +2,9 @@
 
 Claude Code および Codex CLI を使った開発で、**PR 単位のトークン消費効率**を追跡・可視化する計測ツール。
 
-![agent-telemetry の otel ダッシュボード（Mimir/Loki backend、`make oss-up` で起動）](docs/assets/dashboard-full.png)
+![agent-telemetry の otel ダッシュボード（Mimir/Loki backend、`make grafana-up` で起動）](docs/assets/dashboard-full.png)
 
-> ローカル可視化は **otel+grafana（Mimir/Loki）に一本化** しています。`make oss-up` で Collector→Mimir/Loki→Grafana を 1 コマンド起動し、`make oss-flush` で hook データを流すと上のダッシュボードが見られます（[setup/local](https://ishii1648.github.io/agent-telemetry/setup/local/)）。SQLite はクライアント側 SoR で、Grafana から直接読む旧経路は legacy として残置しています。
+> ローカル可視化は **otel+grafana（Mimir/Loki）に一本化** しています。`make grafana-up` で Collector→Mimir/Loki→Grafana を 1 コマンド起動し、`make grafana-flush` で hook データを流すと上のダッシュボードが見られます（[setup/local](https://ishii1648.github.io/agent-telemetry/setup/local/)）。SQLite はクライアント側 SoR で、Grafana から直接読む旧経路は legacy として残置しています。
 
 ## ドキュメント
 

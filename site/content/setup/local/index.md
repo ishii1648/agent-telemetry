@@ -7,7 +7,7 @@ weight: 10
 
 agent-telemetry は **ローカル単独で完結** します。本ページの手順を実施すると、`~/.claude/agent-telemetry.db`（client 側 SoR）に開発セッションが蓄積され、`flush` 経由で立ち上げたローカルの **otel スタック（OTel Collector → Mimir / Loki → Grafana）** で PR 単位の token 効率や開発生産性を可視化できます。
 
-ローカル可視化は **otel+grafana に一本化** しました。SQLite (`~/.claude/agent-telemetry.db`) は append-only な `events` テーブルと集約 VIEW を保持する **client 側 SoR** で、Grafana は SQLite を直接読まず、`flush` がローカルの OTel Collector に送ったデータを Mimir/Loki 経由で読みます。SQLite を Grafana datasource に直結する旧経路は [legacy 経路](#legacy-sqlite-datasource-を直接読む経路) として残していますが、新規導入では otel スタックを推奨します。
+ローカル可視化は **otel+grafana に一本化** しました。SQLite (`~/.claude/agent-telemetry.db`) は append-only な `events` テーブルと集約 VIEW を保持する **client 側 SoR** で、Grafana は SQLite を直接読まず、`flush` がローカルの OTel Collector に送ったデータを Mimir/Loki 経由で読みます。SQLite を Grafana datasource に直結するローカル経路は廃止しました（SQLite を直接 Grafana で見たい用途はサーバ向けの [server]({{< relref "/setup/server" >}}) 経路を参照）。
 
 複数マシンやチームメンバーで集計値を集約したい場合は、同じ `flush` の export target を中央 `agent-telemetry-server` や外部 backend に向けるだけで拡張できます（[server]({{< relref "/setup/server" >}})）。export を設定しなければデータ収集と SQLite 集約は従来どおり動き、どこへも送信しません。
 
@@ -19,9 +19,9 @@ agent-telemetry は **ローカル単独で完結** します。本ページの�
 |--------|------|
 | Docker + Docker Compose | otel スタック（Collector / Mimir / Loki / Grafana）の 1 コマンド起動 |
 | gh CLI | PR URL の自動補完（`backfill` コマンド） |
-| Go 1.25+（任意） | ソースからビルドする場合 / `make oss-flush` を使う場合 |
+| Go 1.25+（任意） | ソースからビルドする場合 / `make grafana-flush` を使う場合 |
 
-> otel スタックは Grafana も含めて compose が提供するため、Grafana や SQLite プラグインを個別に用意する必要はありません（[legacy SQLite datasource 経路](#legacy-sqlite-datasource-を直接読む経路) を使う場合のみ Grafana 11+ と [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource) が必要です）。
+> otel スタックは Grafana も含めて compose が提供するため、Grafana や追加プラグインを個別に用意する必要はありません。
 
 ## 1. CLI のインストール
 
@@ -144,13 +144,13 @@ signals = ["logs", "metrics"]        # raw events(logs) と pr_metrics gauge(met
 ### 4-2. スタックを起動して flush
 
 ```fish
-make oss-up      # Collector(:4318) → Mimir/Loki → Grafana(:13001) を起動
-make oss-flush   # ツリーをビルド → sync-db → flush（hook データを otel スタックへ投入）
+make grafana-up      # Collector(:4318) → Mimir/Loki → Grafana(:13001) を起動
+make grafana-flush   # ツリーをビルド → sync-db → flush（hook データを otel スタックへ投入）
 ```
 
-`make oss-up` は Grafana を <http://localhost:13001>（匿名ログイン・Admin）で立ち上げます。停止は `make oss-down`。port を変えたい場合は `OSS_GRAFANA_PORT=<port> make oss-up`。
+`make grafana-up` は Grafana を <http://localhost:13001>（匿名ログイン・Admin）で立ち上げます。停止は `make grafana-down`。port を変えたい場合は `GRAFANA_PORT=<port> make grafana-up`。
 
-> `make oss-flush` は現在のツリーをビルドしてから `sync-db` → `flush` を実行します（導入済みバイナリが `flush` 非対応の古い版でも確実に流すため）。導入済みバイナリで流す場合は `agent-telemetry sync-db; agent-telemetry flush` を手で実行します。
+> `make grafana-flush` は現在のツリーをビルドしてから `sync-db` → `flush` を実行します（導入済みバイナリが `flush` 非対応の古い版でも確実に流すため）。導入済みバイナリで流す場合は `agent-telemetry sync-db; agent-telemetry flush` を手で実行します。
 
 ### 4-3. dashboard を開く
 
@@ -165,60 +165,3 @@ Grafana（<http://localhost:13001>）の **agent-telemetry (OSS)** フォルダ�
 
 > **gauge は sparse 系列**: `agent_pr_*` / `agent_weekly_session_*` は flush した瞬間だけ push される sparse gauge です。素の instant クエリ（`sum(agent_pr_total_tokens)` 等）は最後の flush から Prometheus lookback delta（既定 5 分）を超えると空になるため、range 集計は必ず `last_over_time(metric[$__range])` で最終値を拾います（dashboard はこの idiom で実装済み）。
 
-## legacy: SQLite datasource を直接読む経路
-
-> **新規導入では非推奨**。otel スタック（上の手順 4）が第一級のローカル可視化です。以下は export を設定せず、SQLite (`~/.claude/agent-telemetry.db`) を Grafana の SQLite datasource で**直接** SQL 集計したい低レベル / オフライン用途のために残している経路です。otel 経路と機能は重複します。
-
-frser-sqlite-datasource プラグインを入れた Grafana で `grafana/dashboards/agent-telemetry.json` を読みます。
-
-### 方法 A: ローカル Grafana に手動設定
-
-1. Grafana に [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource) プラグインをインストール
-
-2. データソースを追加
-   - Type: `SQLite`
-   - Path: `~/.claude/agent-telemetry.db`（フルパスで指定）
-
-3. ダッシュボードをインポート
-   - Grafana の Import 画面で `grafana/dashboards/agent-telemetry.json` をアップロード
-   - データソースに上記で作成した SQLite データソースを選択
-
-### 方法 B: プロビジョニングファイルで自動設定
-
-Grafana の設定ディレクトリにプロビジョニングファイルを配置します。
-
-```fish
-# データソース設定をコピー（パスを環境に合わせて編集）
-cp grafana/provisioning/datasources/agent-telemetry.yaml /etc/grafana/provisioning/datasources/
-
-# ダッシュボード設定をコピー
-cp grafana/provisioning/dashboards/agent-telemetry.yaml /etc/grafana/provisioning/dashboards/
-
-# ダッシュボード JSON をコピー
-cp -r grafana/dashboards /var/lib/grafana/dashboards/agent-telemetry
-```
-
-データソース設定の `path` を自分の環境に合わせて変更してください。
-
-```yaml
-# grafana/provisioning/datasources/agent-telemetry.yaml
-jsonData:
-  path: /Users/<your-username>/.claude/agent-telemetry.db
-```
-
-### 方法 C: Docker（リポジトリ clone 環境向け）
-
-リポジトリを clone した環境では、実 DB を mount した Grafana コンテナを 1 コマンドで起動できます。
-
-```fish
-make grafana-up          # ~/.claude/agent-telemetry.db を mount → http://localhost:13010
-make grafana-down
-```
-
-別パスの DB を見たい場合は `AGENT_TELEMETRY_DB` で上書きします:
-
-```fish
-make grafana-up AGENT_TELEMETRY_DB=/custom/path/agent-telemetry.db
-```
-
-> **注意**: mount は読み書き可能です（SQLite が WAL モードのため `:ro` mount は不可）。frser-sqlite-datasource は SELECT のみで書き込みは行わないので実害はありませんが、Grafana コンテナに DB ファイルへの書き込み権限が渡る点を留意してください。

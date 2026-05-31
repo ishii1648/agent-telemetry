@@ -157,7 +157,7 @@ spec:
 
 ## 4. k8s 参考デプロイ — Grafana 同居版
 
-サーバと Grafana を **同 pod の sidecar** として配置することで、`ReadWriteOnce` PVC のまま両者で同じ SQLite を共有できます。Grafana の datasource provisioning yaml は `grafana/provisioning/datasources/agent-telemetry-docker.yaml` を **そのまま** ConfigMap として配るので、ローカル `make grafana-up` と完全に同じダッシュボードが描画されます。
+サーバと Grafana を **同 pod の sidecar** として配置することで、`ReadWriteOnce` PVC のまま両者で同じ SQLite を共有できます。Grafana の datasource provisioning yaml は `grafana/provisioning/datasources/agent-telemetry-docker.yaml` を **そのまま** ConfigMap として配るので、リポジトリ同梱の dashboard JSON がそのまま描画されます。
 
 ConfigMap はリポジトリのファイルから生成します:
 
@@ -261,7 +261,7 @@ Grafana にブラウザでアクセスする手順は次節 § 5 を参照して
 
 ## 5. サーバ DB を Grafana で見る
 
-datasource の `uid: agent-telemetry` を踏襲しているため、ローカル `make grafana-up` と **同じダッシュボード JSON** がそのまま動きます。
+datasource の `uid: agent-telemetry` を踏襲しているため、リポジトリ同梱の **dashboard JSON**（`grafana/dashboards/agent-telemetry.json`）がそのまま動きます。
 
 ### 5.1 同居版 Grafana を Port-forward（§ 4 を deploy 済みの場合）
 
@@ -276,16 +276,17 @@ NodePort / Ingress / LoadBalancer で外部公開する場合は cluster の慣�
 
 ### 5.2 サーバ DB ファイルを手元にコピーして見る
 
-サーバ側に Grafana を同居させていない場合や、個人検証 / 比較目的でスナップショットを手元で見たい場合。`AGENT_TELEMETRY_DB` を server data dir 内のファイルに向ければ `make grafana-up` がそのまま動きます:
+サーバ側に Grafana を同居させていない場合や、個人検証 / 比較目的でスナップショットを手元で見たい場合。サーバから DB をコピーし、[frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource) プラグインを入れた任意の Grafana（`grafana/provisioning/` の datasource / dashboard provisioning を流用）でそのファイルを開きます:
 
 ```fish
 # サーバから DB をコピー（k8s の場合の例。VPS / docker 環境ならその慣習で）
 kubectl cp -n agent-telemetry agent-telemetry-0:/var/lib/agent-telemetry/agent-telemetry.db /tmp/server-snapshot.db
 
-# ローカル Grafana で開く
-make grafana-up AGENT_TELEMETRY_DB=/tmp/server-snapshot.db
-# → http://localhost:13000
+# frser-sqlite-datasource 入りの Grafana を起動し、datasource path を /tmp/server-snapshot.db に向ける
+# （provisioning yaml は grafana/provisioning/datasources/agent-telemetry.yaml の path を編集して流用）
 ```
+
+> ローカルの SQLite datasource 用 compose（旧 root `docker-compose.yaml`）は otel 一本化（[0057]）で撤去したため、ローカルで SQLite を直接見る場合は上記のように任意の Grafana に frser-sqlite-datasource を入れて開きます。otel スタックで見たい場合は [setup/local]({{< relref "/setup/local" >}}) の `make grafana-up` を使います。
 
 サーバ DB スキーマはクライアント DB と同一なので、ダッシュボードは無調整で描画されます。
 

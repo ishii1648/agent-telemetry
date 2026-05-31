@@ -23,7 +23,7 @@ services:
       DEPLOY_ENV: ${DEPLOY_ENV:-dev}
     ports:
       # host port は env で可変（既定 4318）。スクショ用の e2e stack を
-      # `make oss-up` と別 port・別 project で並走させるため (issue 0055 ⑤)。
+      # `make grafana-up` と別 port・別 project で並走させるため (issue 0055 ⑤)。
       - "${OSS_COLLECTOR_PORT:-4318}:4318" # OTLP/HTTP (clients flush here)
     depends_on:
       - mimir

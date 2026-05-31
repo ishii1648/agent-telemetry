@@ -405,18 +405,18 @@ ADR-024 で task_type を集計軸から廃止したため、`pr_metrics` の集
 
 ### otel 一本化と SQLite の client 側 SoR 降格（[0055]）
 
-ローカル可視化は **otel+grafana（Mimir/Loki）に一本化** し、SQLite を Grafana datasource に直結する旧経路は legacy として残置するに留めた（[issues/closed/0055-design-local-otel-visualization-migration.md](../issues/closed/0055-design-local-otel-visualization-migration.md)）。位置づけは次の 2 層に分かれる:
+ローカル可視化は **otel+grafana（Mimir/Loki）に一本化** した（[issues/closed/0055-design-local-otel-visualization-migration.md](../issues/closed/0055-design-local-otel-visualization-migration.md)）。SQLite を Grafana datasource に直結する **ローカル経路は [0057] で撤去** し、同 datasource はサーバ k8s 経路でのみ使う（後述「legacy SQLite datasource 経路」）。位置づけは次の 2 層に分かれる:
 
 - **client 側 SoR** = SQLite (`~/.claude/agent-telemetry.db`)。append-only な `events` テーブルと、そこから導出する集約 VIEW (`sessions` / `transcript_stats` / `pr_metrics` / `weekly_session_metrics` / `session_concurrency_*`) を保持する。`flush` はこの SoR を読んで OTLP/HTTP（logs + gauge metrics）に projection する。VIEW も DDL も削除しない（[0054] 既定）。
-- **可視化** = `flush` → OTel Collector → Mimir（gauge）/ Loki（raw events）→ Grafana。`make oss-up` で 1 コマンド起動でき、ローカル第一級の可視化選択肢（[0055] ①）。メイン dashboard は SQLite を読まず Mimir/Loki だけを読む。
+- **可視化** = `flush` → OTel Collector → Mimir（gauge）/ Loki（raw events）→ Grafana。`make grafana-up` で 1 コマンド起動でき、ローカル第一級の可視化選択肢（[0055] ①）。メイン dashboard は SQLite を読まず Mimir/Loki だけを読む。
 
 **なぜ降格するか**: 中央サーバ・複数マシン集約・外部 backend（Datadog 等）はいずれも otel（OTLP）が共通言語であり、ローカルだけ SQLite datasource を主経路に残すと「ローカルと集約で dashboard・クエリ言語・gauge 意味論が二重化」する。SQLite を SoR に閉じ、可視化を otel に寄せることでローカルと集約のランタイムが収束する（[0053] / [0054] の一本化方針のローカル分が [0055]）。SQLite を完全削除しない理由は、client 側の cross-event join（`pr_metrics` 等）が外部 backend の下流で再現不能なため SoR としては不可欠だから（責務分担と cross-event join のロックインは [0040] および本節「外部 backend 経路の責務分担」を参照）。
 
-**legacy SQLite datasource 経路の残置**: frser-sqlite-datasource で `grafana/dashboards/agent-telemetry.json` を直接読む構成（`make grafana-up` / site の setup/local「方法 A/B/C」）は、export を設定せず SQLite 単独で任意日付範囲の SQL 集計を見たい低レベル用途のために残す。otel 経路と機能が重複するが、撤去はしない（後方互換・オフライン分析の余地）。E2E スクショは SQLite dashboard を `make grafana-screenshot`、OSS otel dashboard を `make oss-screenshot`（[0055] ⑤）で別々にカバーする。
+**ローカルの SQLite datasource 経路は撤去（[0057]）**: frser-sqlite-datasource で `grafana/dashboards/agent-telemetry.json` を直接読むローカル経路（旧 root `docker-compose.yaml` + frser-sqlite-datasource mount / SQLite 専用スクショ `e2e/screenshot.sh` / site setup/local「方法 A/B/C」）は、otel 経路と完全に重複し二重メンテになるため撤去した。同 dashboard JSON は **サーバ k8s 経路**（Grafana 同居 sidecar が ConfigMap で配る、`site/content/setup/server`、[0029] / [0030]）でのみ使い続ける（サーバ側 SQLite の降格は別件 [0032]）。E2E スクショは OSS otel dashboard を `make grafana-screenshot`（[0055] ⑤）でカバーし、サーバ経路の SQLite dashboard JSON は `make lint-dashboard` で検証する。
 
-### SQLite + Grafana の選定（legacy datasource 経路の背景）
+### SQLite + Grafana の選定（SQLite datasource 経路の背景）
 
-> 以下は SQLite を Grafana datasource に直結する **legacy 経路**の選定経緯。otel 一本化後のメイン可視化は上節のとおり Mimir/Loki を読むが、残置する SQLite datasource 経路の設計判断として記録を残す。
+> 以下は SQLite を Grafana datasource に直結する経路の選定経緯。otel 一本化後のローカルメイン可視化は上節のとおり Mimir/Loki を読み、ローカルの SQLite datasource 経路は [0057] で撤去した。サーバ k8s 経路（ConfigMap で同 dashboard JSON を配る）の設計判断として記録を残す。
 
 Prometheus + Grafana ではなく SQLite + Grafana を採用していた。理由は「任意の日付範囲で PR 別に集計する」という用途が SQL の典型ユースケースであり、Prometheus の「現在状態のスクレイプ」モデルとは合わないため。otel 一本化（[0055]）では、この「任意レンジ集計」を sparse gauge の `last_over_time([$__range])` と `week_start` ラベルで近似する（gauge range 集計の前提は `docs/metrics.md`、ティア整理は [0053]）。
 
@@ -436,21 +436,20 @@ ClickHouse / Loki も候補だが、個人利用規模では SQLite で十分。
 
 `make grafana-screenshot` が Docker Compose で Grafana + Image Renderer を起動し、Render API でパネルごとに PNG を取得する。Playwright 等のブラウザ自動操作は採用しない（Go プロジェクトに異質な依存を持ち込まないため、また Image Renderer で十分なため）。
 
-スクショ対象は 2 系統あり、dashboard ごとに別 make ターゲットでカバーする:
+README/docs アセットを生成する dashboard は OSS otel dashboard の 1 系統に一本化した（[0057] でローカルの SQLite datasource render 経路〔旧 root `docker-compose.yaml` / `e2e/screenshot.sh`〕を撤去）:
 
 | dashboard | backend | make ターゲット | 出力する README/docs アセット |
 |---|---|---|---|
-| `grafana/dashboards/agent-telemetry.json` | SQLite（frser-sqlite-datasource、legacy 経路） | `make grafana-screenshot` | `.outputs/grafana-screenshots/` のパネル PNG（README ヒーローは出力しない） |
-| `deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json` | Mimir/Loki（otel 一本化後のメイン） | `make oss-screenshot`（[0055] ⑤） | `docs/assets/dashboard-full.png`（README ヒーロー） |
+| `deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json` | Mimir/Loki（otel 一本化後のメイン） | `make grafana-screenshot`（[0055] ⑤） | `docs/assets/dashboard-full.png`（README ヒーロー） |
 
-otel 一本化（[0055]）で README ヒーローは **OSS otel dashboard** に切り替えた。`docs/assets/dashboard-full.png` の owner は `make oss-screenshot` で、SQLite 用 `make grafana-screenshot` はヒーローを上書きしない（過去に SQLite 版で上書きされる事故を防ぐため、`e2e/screenshot.sh` から hero コピーを外した）。SQLite dashboard（legacy）を変更したら `make grafana-screenshot`、OSS dashboard を変更したら `make oss-screenshot` を実行する（CLAUDE.md の必須作業）。
+サーバ k8s 経路が配る `grafana/dashboards/agent-telemetry.json`（SQLite datasource）は render スクショ対象から外し、`make lint-dashboard` で JSON 妥当性のみ検証する。`docs/assets/dashboard-full.png` の owner は `make grafana-screenshot` のみで、OSS dashboard を変更したら `make grafana-screenshot` を実行する（CLAUDE.md の必須作業）。
 
-**OSS dashboard の決定的スクショ（`make oss-screenshot` / `e2e/oss-screenshot.sh`、[0055] ⑤）**: SQLite e2e と同じ fixture（`e2e/testdata/`、`make grafana-fixtures` が `time.Now()` 基準にシフト）を SoR にし、その値を **fixture→Mimir/Loki に決定的に投入**して OSS dashboard を render する。要点:
+**OSS dashboard の決定的スクショ（`make grafana-screenshot` / `e2e/oss-screenshot.sh`、[0055] ⑤）**: fixture（`e2e/testdata/`、`go test -run TestGenTestDB ./e2e/` が `time.Now()` 基準にシフトして `agent-telemetry.db` を生成）を SoR にし、その値を **fixture→Mimir/Loki に決定的に投入**して OSS dashboard を render する。要点:
 
 - **HOME サンドボックス flush**: CLI は DB / config / state パスを `os.UserHomeDir()` 由来で解決し `--db`/`--config` flag を持たないため、`HOME=<tmp>` を切って `<tmp>/.claude/agent-telemetry.db`（fixture コピー）と `<tmp>/.config/agent-telemetry/config.toml`（localhost collector を指す credential 不要 target）を置き、ビルドしたツリーの binary で `flush --full --agent claude` する。実 `~/.claude` / 実 config / 実 state を一切触らない。
 - **clean stack で Loki 重複を排除**: gauge は `last_over_time` で最新値を拾うので再 flush しても値は不変だが、Loki は raw events を冪等排除しないため再 flush でログが二重化する。スクショ stack は `docker compose down -v`（volume 破棄）→ up → 単発 flush で毎回まっさらから投入し、2 回実行してもログ件数まで含めて同一データになるようにする。
 - **ingest 待ち**: Collector の batch（5s）と Mimir/Loki の ingest を待つため、render 前に Mimir `/<...>/query?query=agent_pr_total_tokens` と Loki `query` が非空を返すまでポーリングする。`mimir.yaml` は `multitenancy_enabled: false` なので `X-Scope-OrgID` ヘッダは不要。
-- **port / project 分離**: OSS compose の collector / Mimir / Loki / Grafana host port を env で可変にし、スクショ stack は `make oss-up`（既定 port）と別 project・別 port で並走できる。Image Renderer は本番 `make oss-up` に積まず、スクショ用 overlay（`docker-compose.screenshot.yaml`）でだけ足す。
+- **port / project 分離**: OSS compose の collector / Mimir / Loki / Grafana host port を env で可変にし、スクショ stack は `make grafana-up`（既定 port）と別 project・別 port で並走できる。Image Renderer は本番 `make grafana-up` に積まず、スクショ用 overlay（`docker-compose.screenshot.yaml`）でだけ足す。
 - **決定性の定義**: SQLite e2e と同じく「**fixture が同じなら同じデータ・同じパネル値**」を保証する（絶対時刻は `now` 基準で毎回ずれるため pixel 一致は狙わない。time 軸パネルの x ラベルは run ごとに数分ずれる）。
 - **単発 flush で「週別 merged PR 数」(Tier 2 timeseries, panel 20) は空になる**: gauge 点は flush 時刻（≒ `now`）に打たれるが、`[1w]` step の range クエリは epoch 整列（UTC 木曜起点）で最後の評価点が `now` の最大 7 日手前に落ちるため、`now` の点を窓に含められず "No data" になる。これは Tier 2 weekly trend が **複数回 flush を時間をかけて重ねる縦断利用**を前提にした近似（[0053]）である帰結で、単発 fixture flush では構造的に空（＝ run をまたいで安定的に空なので決定性は保たれる）。`week_start` ラベルで集計する Tier 3 の週次 barchart はこの問題が無く単発 flush でも全週が出る。README ヒーローでこのパネルが空なのは想定どおりで、tool の不具合ではない。
 
@@ -550,7 +549,7 @@ attribute 意味分類の表本体と 2 配布形式（direct 用 Datadog Logs P
 
 collector レシピと同じ「Collector が backend へ push する」経路を、credential 不要の OSS（Mimir / Loki / Grafana）でローカル E2E 再現する検証用構成（[issues/0050](../issues/closed/0050-feat-oss-observability-local-compose.md)）。Prometheus の scrape（pull）型で検証すると Datadog exporter と失敗点（OTLP push の経路・`service.name` の昇格）がずれるため、あえて Collector push 経路に揃え、metrics は Mimir・logs は Loki に流す（`service.name` は Mimir で `job` ラベル・Loki で `service_name` ラベルに昇格する）。既存 SQLite ダッシュボードとは別系統の検証用ダッシュボードとして切り、single-process・filesystem storage の検証用最小構成にとどめることで、service / config / volume を Kubernetes manifest に移しやすい単位で分割している。
 
-`make oss-up` / `oss-down` / `oss-flush`（`Makefile`）でこの compose を 1 コマンドで起動・停止し、token 不要の `config.toml.example` で hook の OTLP export（flush → Collector:4318）を流せる。これにより本スタックは検証専用ではなく、ローカル単独利用での **第一級の可視化選択肢**として使える（issue [0055](../issues/closed/0055-design-local-otel-visualization-migration.md) ① runtime cutover）。SQLite を client 側 SoR に降格し otel 経路の Grafana からは読まない明文化（[0055] ③、本書「## 可視化層」）、site の otel 前提書換（④）、OSS dashboard の決定的スクショ（⑤、`make oss-screenshot`）、README ヒーローの OSS 画像差し替え（⑥）まで完了し、SQLite + Grafana（`make grafana-up`）は legacy datasource 経路として残置する。
+`make grafana-up` / `grafana-down` / `grafana-flush`（`Makefile`）でこの compose を 1 コマンドで起動・停止し、token 不要の `config.toml.example` で hook の OTLP export（flush → Collector:4318）を流せる。これにより本スタックは検証専用ではなく、ローカル単独利用での **第一級の可視化選択肢**として使える（issue [0055](../issues/closed/0055-design-local-otel-visualization-migration.md) ① runtime cutover）。SQLite を client 側 SoR に降格し otel 経路の Grafana からは読まない明文化（[0055] ③、本書「## 可視化層」）、site の otel 前提書換（④）、OSS dashboard の決定的スクショ（⑤、`make grafana-screenshot`）、README ヒーローの OSS 画像差し替え（⑥）まで完了。さらに [0057] でローカルの SQLite datasource 経路（旧 root `docker-compose.yaml` + frser-sqlite-datasource / site 方法 A/B/C）を撤去し、同 dashboard JSON はサーバ k8s 経路でのみ使う。
 
 ### プロトコル — OTLP/HTTP Logs
 

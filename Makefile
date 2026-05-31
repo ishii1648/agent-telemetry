@@ -1,26 +1,18 @@
-.PHONY: build install uninstall grafana-fixtures grafana-up grafana-up-e2e grafana-down grafana-screenshot oss-up oss-down oss-flush oss-screenshot lint-dashboard intent test-intent docs-serve docs-build docs-mod-update
+.PHONY: build install uninstall grafana-up grafana-down grafana-flush grafana-screenshot lint-dashboard intent test-intent docs-serve docs-build docs-mod-update
 
 PREFIX ?= $(HOME)/.local
 BIN_DIR := $(PREFIX)/bin
 BIN_NAME := agent-telemetry
 
-# 実データ表示用 DB パス（grafana-up が参照）。上書き可。
-AGENT_TELEMETRY_DB ?= $(HOME)/.claude/agent-telemetry.db
-
-# grafana-up（実データ）と grafana-up-e2e（fixture）を並行起動できるよう、
-# compose project とポートを分離する。互いに独立したスタックとして扱われ、
-# 片方を立ち上げてももう片方のコンテナを巻き込まない。
-# 既定ポートは ssh トンネル等でよく使われる 13000 / 13001 を避けて 13010+ に置く。
-GRAFANA_PORT         ?= 13010
-GRAFANA_E2E_PORT     ?= 13011
-COMPOSE_PROJECT_REAL ?= agent-telemetry-real
-COMPOSE_PROJECT_E2E  ?= agent-telemetry-e2e
-
-# OSS observability スタック（otel ローカル可視化: Collector -> Mimir/Loki -> Grafana）。
-# SQLite + Grafana（上の grafana-up）とは別 port / 別 project にして共存させる。
-OSS_COMPOSE          ?= deploy/oss-observability/docker-compose.yaml
-OSS_GRAFANA_PORT     ?= 13001
-COMPOSE_PROJECT_OSS  ?= agent-telemetry-oss
+# ローカル可視化スタック（otel: Collector -> Mimir/Loki -> Grafana）。
+# ローカル可視化はこの otel 経路に一本化済み（issue 0057）。SQLite を Grafana
+# datasource として直接 mount する旧構成（旧 root docker-compose.yaml +
+# frser-sqlite-datasource）は撤去し、`grafana-*` ターゲットは otel スタックを指す。
+# サーバ k8s 経路の SQLite sidecar は別系統で残置する（site/content/setup/server,
+# issues/closed/0029・0030）。
+GRAFANA_COMPOSE         ?= deploy/oss-observability/docker-compose.yaml
+GRAFANA_PORT            ?= 13001
+COMPOSE_PROJECT_GRAFANA ?= agent-telemetry-oss
 
 build:
 	CGO_ENABLED=0 go build -o bin/$(BIN_NAME) ./cmd/agent-telemetry/
@@ -35,76 +27,34 @@ uninstall:
 	rm -f "$(BIN_DIR)/$(BIN_NAME)"
 	@echo "Removed: $(BIN_DIR)/$(BIN_NAME)"
 
-grafana-fixtures:
-	CGO_ENABLED=0 GOTOOLCHAIN=local go test -run TestGenTestDB -v ./e2e/
-
-grafana-up:
-	@if [ ! -f "$(AGENT_TELEMETRY_DB)" ]; then \
-		echo "DB not found: $(AGENT_TELEMETRY_DB)"; \
-		echo "Run 'agent-telemetry sync-db' first, or override: make grafana-up AGENT_TELEMETRY_DB=/path/to/db"; \
-		exit 1; \
-	fi
-	AGENT_TELEMETRY_DB=$(AGENT_TELEMETRY_DB) GRAFANA_PORT=$(GRAFANA_PORT) \
-	    docker compose -p $(COMPOSE_PROJECT_REAL) up -d
-	@echo "Waiting for Grafana to be ready..."
-	@for i in $$(seq 1 60); do \
-		if curl -sf http://localhost:$(GRAFANA_PORT)/api/health > /dev/null 2>&1; then \
-			echo "Grafana is ready at http://localhost:$(GRAFANA_PORT)"; \
-			echo "Showing data from: $(AGENT_TELEMETRY_DB)"; \
-			exit 0; \
-		fi; \
-		sleep 1; \
-	done; \
-	echo "Grafana failed to start within 60s"; exit 1
-
-grafana-up-e2e: grafana-fixtures
-	AGENT_TELEMETRY_DB=$(CURDIR)/e2e/testdata/agent-telemetry.db GRAFANA_PORT=$(GRAFANA_E2E_PORT) \
-	    docker compose -p $(COMPOSE_PROJECT_E2E) up -d
-	@echo "Waiting for Grafana to be ready..."
-	@for i in $$(seq 1 60); do \
-		if curl -sf http://localhost:$(GRAFANA_E2E_PORT)/api/health > /dev/null 2>&1; then \
-			echo "Grafana is ready at http://localhost:$(GRAFANA_E2E_PORT) (e2e fixtures)"; \
-			exit 0; \
-		fi; \
-		sleep 1; \
-	done; \
-	echo "Grafana failed to start within 60s"; exit 1
-
-grafana-down:
-	-docker compose -p $(COMPOSE_PROJECT_REAL) down
-	-docker compose -p $(COMPOSE_PROJECT_E2E) down
-
 # otel ローカル可視化スタックを 1 コマンドで起動する。
-#   Collector(:4318) -> Mimir/Loki -> Grafana(:$(OSS_GRAFANA_PORT))
-# SQLite + Grafana に代わるローカル第一級の可視化選択肢（issue 0055 ①）。
-oss-up:
-	GRAFANA_PORT=$(OSS_GRAFANA_PORT) \
-	    docker compose -f $(OSS_COMPOSE) -p $(COMPOSE_PROJECT_OSS) up -d
-	@echo "Grafana (otel): http://localhost:$(OSS_GRAFANA_PORT)  (anonymous admin)"
+#   Collector(:4318) -> Mimir/Loki -> Grafana(:$(GRAFANA_PORT))
+# ローカル可視化の第一級導線（issue 0055 ① / 0057 cutover）。
+grafana-up:
+	GRAFANA_PORT=$(GRAFANA_PORT) \
+	    docker compose -f $(GRAFANA_COMPOSE) -p $(COMPOSE_PROJECT_GRAFANA) up -d
+	@echo "Grafana (otel): http://localhost:$(GRAFANA_PORT)  (anonymous admin)"
 	@echo "Collector OTLP/HTTP: http://localhost:4318"
-	@echo "Export hook data: make oss-flush"
+	@echo "Export hook data: make grafana-flush"
 	@echo "First time: cp deploy/oss-observability/config.toml.example ~/.config/agent-telemetry/config.toml"
 
-oss-down:
-	-docker compose -f $(OSS_COMPOSE) -p $(COMPOSE_PROJECT_OSS) down
+grafana-down:
+	-docker compose -f $(GRAFANA_COMPOSE) -p $(COMPOSE_PROJECT_GRAFANA) down
 
 # 現在のツリーをビルド（古い導入済みバイナリに引っ張られない）してから
 # hook データをスタックへ流す。flush は VIEW を作らないので sync-db を先に
 # 走らせて pr_metrics VIEW と PR 集約を最新化する。
-oss-flush: build
+grafana-flush: build
 	bin/$(BIN_NAME) sync-db
 	bin/$(BIN_NAME) flush
 
-# OSS otel dashboard の決定的スクショ (issue 0055 ⑤)。fixture を HOME サンドボックス
+# otel dashboard の決定的スクショ (issue 0055 ⑤)。fixture を HOME サンドボックス
 # flush で Collector→Mimir/Loki に投入し、Grafana /render で撮る。README ヒーロー
 # (docs/assets/dashboard-full.png) はこのターゲットが owner。スクショ専用 stack を
-# `make oss-up` と別 port・別 project で立てるので並走を壊さない。スクリプトが
+# `make grafana-up` と別 port・別 project で立てるので並走を壊さない。スクリプトが
 # build / fixture 生成 / compose 起動 / flush / render / down -v まで一括で行う。
-oss-screenshot:
+grafana-screenshot:
 	bash e2e/oss-screenshot.sh
-
-grafana-screenshot: grafana-up-e2e
-	GRAFANA_PORT=$(GRAFANA_E2E_PORT) bash e2e/screenshot.sh .outputs/grafana-screenshots
 
 DASHBOARD_LINTER_VERSION ?= v0.1.0
 DASHBOARD_LINTER_DIR     := .cache/dashboard-linter

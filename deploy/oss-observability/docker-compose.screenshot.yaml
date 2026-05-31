@@ -6,7 +6,7 @@
 # 足し、Grafana の /render エンドポイントを有効化する。renderer は SQLite e2e の
 # top-level docker-compose.yaml と同じ image / 同じ配線。
 #
-# 本番の `make oss-up` には renderer を積まない（スクショ時だけ overlay で足す）。
+# 本番の `make grafana-up` には renderer を積まない（スクショ時だけ overlay で足す）。
 # compose は environment / depends_on を base とマージするので、ここでは Grafana に
 # render 設定を追記し renderer service を追加するだけでよい。
 services:

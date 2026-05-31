@@ -18,8 +18,8 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # --- knobs (overridable) ---------------------------------------------------
-# Host ports default away from `make oss-up` (4318/9009/3100/13001) so the
-# screenshot stack can run alongside a live oss-up stack.
+# Host ports default away from `make grafana-up` (4318/9009/3100/13001) so the
+# screenshot stack can run alongside a live grafana-up stack.
 export OSS_COLLECTOR_PORT="${OSS_COLLECTOR_PORT:-4328}"
 export OSS_MIMIR_PORT="${OSS_MIMIR_PORT:-9019}"
 export OSS_LOKI_PORT="${OSS_LOKI_PORT:-3110}"

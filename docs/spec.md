@@ -11,7 +11,7 @@
 agent-telemetry は **Claude Code および Codex CLI** の **PR 単位のトークン消費効率** を計測するデータ収集ツールである。
 各エージェントの hook が記録したセッションイベントとトランスクリプトを SQLite に変換し、収集したメトリクスを SQL から参照可能にする。可視化はユーザの任意とし、リポジトリ同梱の Grafana ダッシュボードはあくまで参考実装である。
 
-ローカル可視化は **otel+grafana に一本化** した（[0055]）。SQLite (`~/.claude/agent-telemetry.db`) は **client 側の SoR（source of record）** ——append-only な `events` テーブルと、そこから導出する集約 VIEW (`sessions` / `transcript_stats` / `pr_metrics` / `weekly_session_metrics` ほか) を保持する単一の真実——に位置づけ、第一級のローカル可視化は SQLite を直接 Grafana datasource にする経路ではなく、`flush` → OTel Collector → Mimir/Loki → Grafana（`make oss-up`、後述「サーバ送信」と `deploy/oss-observability/`）に置く。SQLite を frser-sqlite-datasource で直接読む旧経路は **legacy / 低レベル**として残置するが（VIEW も DDL も削除しない）、otel 一本化後のメイン dashboard は SQLite を読まない。降格の経緯と設計判断は [docs/design.md ## 可視化層](design.md) を参照。
+ローカル可視化は **otel+grafana に一本化** した（[0055]）。SQLite (`~/.claude/agent-telemetry.db`) は **client 側の SoR（source of record）** ——append-only な `events` テーブルと、そこから導出する集約 VIEW (`sessions` / `transcript_stats` / `pr_metrics` / `weekly_session_metrics` ほか) を保持する単一の真実——に位置づけ、第一級のローカル可視化は SQLite を直接 Grafana datasource にする経路ではなく、`flush` → OTel Collector → Mimir/Loki → Grafana（`make grafana-up`、後述「サーバ送信」と `deploy/oss-observability/`）に置く。SQLite を frser-sqlite-datasource で直接読むローカル経路は [0057] で撤去した（VIEW も DDL も削除しない）。同 datasource はサーバ k8s 経路でのみ使い、otel 一本化後のローカルメイン dashboard は SQLite を読まない。降格・撤去の経緯と設計判断は [docs/design.md ## 可視化層](design.md) を参照。
 
 データフロー:
 
@@ -290,7 +290,7 @@ GROUP BY は (`pr_url`, `coding_agent`, `user_id`)。同一 PR が複数 agent /
 
 サーバ送信（export）は **オプトイン** 機能。`~/.config/agent-telemetry/config.toml` に `[server]` または `[[export]]` が設定された場合のみ有効になる。設定なしの場合、データ収集と SQLite への集約（client 側 SoR）は従来通り動作し、外部・ローカルいずれの backend へも送信しない（旧パス `~/.claude/agent-telemetry.toml` も fallback として読まれる）。
 
-> **ローカル otel 可視化も export 経路の上に乗る**: otel 一本化後の第一級ローカル可視化（`make oss-up` → Mimir/Loki/Grafana）は、**localhost の OTel Collector を指す credential 不要の `[[export]]` target**（`endpoint = "http://localhost:4318"`, `signals = ["logs", "metrics"]`）を 1 つ設定して `flush` で流す構成である。つまり「ローカル単独可視化」も技術的には export のオプトイン（ただし認証なし・全ローカル完結）であり、SQLite を Grafana datasource に直結する旧経路を置き換える。SQLite は引き続き client 側 SoR として `flush` の下流データ源（`events` ＋ `pr_metrics` / `weekly_session_metrics` VIEW）を供給する。手順は site の [setup/local](https://ishii1648.github.io/agent-telemetry/setup/local/)、レシピは [`deploy/oss-observability/`](https://github.com/ishii1648/agent-telemetry/tree/main/deploy/oss-observability) を参照。
+> **ローカル otel 可視化も export 経路の上に乗る**: otel 一本化後の第一級ローカル可視化（`make grafana-up` → Mimir/Loki/Grafana）は、**localhost の OTel Collector を指す credential 不要の `[[export]]` target**（`endpoint = "http://localhost:4318"`, `signals = ["logs", "metrics"]`）を 1 つ設定して `flush` で流す構成である。つまり「ローカル単独可視化」も技術的には export のオプトイン（ただし認証なし・全ローカル完結）であり、SQLite を Grafana datasource に直結する旧経路を置き換える。SQLite は引き続き client 側 SoR として `flush` の下流データ源（`events` ＋ `pr_metrics` / `weekly_session_metrics` VIEW）を供給する。手順は site の [setup/local](https://ishii1648.github.io/agent-telemetry/setup/local/)、レシピは [`deploy/oss-observability/`](https://github.com/ishii1648/agent-telemetry/tree/main/deploy/oss-observability) を参照。
 
 転送モデルは **append-only イベント列の OTLP/HTTP flush**。クライアントはローカル `events` テーブルから未送信行を抽出し、OTel Logs 形式で **1 つ以上の export target**（中央サーバ / OTel Collector / backend の OTLP intake）に送る。中央サーバ（`agent-telemetry-server`）は受信した events を冪等に追記し、`sessions` / `transcript_stats` / `pr_metrics` などは VIEW として組み立てる。実装方針・差分検知・配布形態の詳細は `docs/design.md ## サーバ側集約パイプライン` を参照。本節はクライアント・サーバの外部契約のみ記述する。
 
@@ -361,7 +361,7 @@ Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metri
 | レシピ | client encoding | credential の所在 | 補足 |
 |---|---|---|---|
 | **direct** | backend に依存（Datadog logs は `protobuf`） | client（submit-only key） | 個人 / 小チーム向け。追加プロセス無し。Datadog direct は protobuf + `dd-api-key` |
-| **collector** | `json`（変更不要） | Collector が 1 箇所集約（client は秘密なし） | team / 多 client 向け。Collector が protobuf + `dd-api-key` 変換と fanout を担う。レシピは `deploy/otel-collector/`。credential 不要で同じ collector push 構成をローカル再現する OSS ローカルスタックは [`deploy/oss-observability/`](../deploy/oss-observability/)（Mimir/Loki/Grafana。`make oss-up` で 1 コマンド起動でき、ローカル単独利用での第一級の可視化選択肢。issue 0055 ①） |
+| **collector** | `json`（変更不要） | Collector が 1 箇所集約（client は秘密なし） | team / 多 client 向け。Collector が protobuf + `dd-api-key` 変換と fanout を担う。レシピは `deploy/otel-collector/`。credential 不要で同じ collector push 構成をローカル再現する OSS ローカルスタックは [`deploy/oss-observability/`](../deploy/oss-observability/)（Mimir/Loki/Grafana。`make grafana-up` で 1 コマンド起動でき、ローカル単独利用での第一級の可視化選択肢。issue 0055 ①） |
 
 ### `agent-telemetry flush` のフラグ
 

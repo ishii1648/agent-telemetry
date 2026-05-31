@@ -135,14 +135,15 @@ Created: YYYY-MM-DD
 
 ```fish
 go test ./...                          # 全テスト
-make grafana-screenshot                # E2E: Grafana スクリーンショット検証
+make grafana-screenshot                    # E2E: OSS otel dashboard スクリーンショット検証
 ```
 
 ### ダッシュボード変更時の必須作業
 
-- `grafana/dashboards/agent-telemetry.json` の表示を変更した場合は、必ず `make grafana-screenshot` を実行して README 用スクリーンショット（`docs/assets/dashboard-*.png`）も同じ変更に合わせて更新する（`grafana-screenshot` は `grafana-up-e2e` 経由で fixture データを使うので、画像が決定的に再現される）。
-- スクリーンショット生成でポート競合が起きる場合は `GRAFANA_PORT=<unused-port> make grafana-screenshot` を使う。
-- 実データで動作確認したい場合は `make grafana-up`（`~/.claude/agent-telemetry.db` を mount）。E2E と同じコンテナを使うので、切替時は片方が再作成される。
+- ローカル可視化は otel（OSS）一本化済み（[0057]）。`deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json` を変更したら、必ず `make grafana-screenshot` を実行して README ヒーロー（`docs/assets/dashboard-full.png`）を更新する（fixture データで決定的に再現される）。
+- スクリーンショット生成でポート競合が起きる場合は `GRAFANA_PORT=<port> OSS_MIMIR_PORT=<port> ... make grafana-screenshot` のように host port を上書きする。
+- 実データで動作確認したい場合は `make grafana-up` → `make grafana-flush`（`:13001`）。
+- サーバ k8s 経路が配る `grafana/dashboards/agent-telemetry.json`（SQLite datasource）を変更したら `make lint-dashboard` で JSON を検証する（ローカルの SQLite datasource render 経路〔旧 root `docker-compose.yaml` + frser-sqlite-datasource / `e2e/screenshot.sh`〕は [0057] で撤去）。
 
 ### docs site（`site/`）
 
