@@ -32,7 +32,7 @@ Codex は `SessionEnd` を持たないため、`Stop` hook で `ended_at` を毎
 |---|---|---|
 | `SessionStart` | `hook session-start --agent claude` | セッション開始メタデータ（`session_id` / `cwd` / `repo` / `branch` / `user_id`）を `~/.claude/session-index.jsonl` に追記 |
 | `SessionEnd` | `hook session-end --agent claude` | `ended_at` / `end_reason` を確定し `sync-db` を実行 |
-| `Stop` | `hook stop --agent claude` | branch から PR を解決して `pr_pinned: true` で確定 → `backfill` → `sync-db`（ブロッキング） |
+| `Stop` | `hook stop --agent claude` | `backfill --detach` worker を spawn して即 return。PR 解決（`pr_pinned: true` 確定）→ `backfill` → `sync-db` は worker 側で実行。応答ターンごとに発火するため `"async": true` で登録し、hook プロセスの exit もユーザ応答サイクルから外す（Claude Code v2.1.0+） |
 
 ### Codex CLI
 
@@ -40,11 +40,11 @@ Codex は `SessionEnd` を持たないため、`Stop` hook で `ended_at` を毎
 |---|---|---|
 | `SessionStart` (`startup` / `resume`) | `hook session-start --agent codex` | セッション開始メタデータを `~/.codex/session-index.jsonl` に追記 |
 | `PostToolUse` | `hook post-tool-use --agent codex` | `tool_input.command` が `gh pr create` のときだけ `tool_response` 文字列から PR URL を抽出して `pr_urls` に追記（`pr_pinned: true` のセッションでは no-op） |
-| `Stop` | `hook stop --agent codex` | branch から PR を解決して `pr_pinned: true` で確定し `ended_at` を更新 → `backfill` → `sync-db`（ブロッキング） |
+| `Stop` | `hook stop --agent codex` | `ended_at` を同期更新（Codex の de-facto SessionEnd）し `backfill --detach` worker を spawn して即 return。PR 解決（`pr_pinned: true` 確定）→ `backfill` → `sync-db` は worker 側で実行。`async` は Claude Code 固有フィールドのため Codex には付けない |
 
 ## `Stop` hook の処理時間
 
-`Stop` hook は応答完了ごとに `backfill` → `sync-db` をブロッキングで走らせます。応答が長引かないよう **3 つの抑制策**が入っています。
+`Stop` hook は応答完了ごとに発火しますが、同期パスは**ローカル書き込みと worker spawn だけ**で数 ms で return します。`gh` を伴う PR 解決 / `backfill` / `sync-db` はすべて `backfill --detach` の detached worker に退避し、さらに Claude Code 側は `"async": true` 登録で hook プロセスの exit 待ちもユーザ応答サイクルから外します。worker 側には応答や API を長引かせないための **3 つの抑制策**が入っています（以下は worker 内の処理）。
 
 <div class="diagram-sm">
 
@@ -69,7 +69,7 @@ flowchart TB
 | goroutine 並列 | 複数セッションの `gh pr view` 等を並列発行 |
 | 8 秒タイムアウト | 全体で 8 秒以上かかったら強制打ち切り（hook 完了を優先） |
 
-それでも長引く環境では `Stop` を非同期化するアイデアもあるが、**「応答が返る頃には DB が最新」**という整合性を優先して同期実行に振っています。
+かつては「応答が返る頃には DB が最新」という整合性を優先して同期実行に振っていましたが、`Stop` が応答ターンごとに発火する以上、毎ターンの待ちがユーザ体験を損なうため、現在は worker 退避＋`async` 登録で**非ブロッキングを優先**しています。DB 反映は worker 完了まで数秒遅れますが、Grafana は後追いで最新化されます。
 
 ## PR と session の紐づけ
 

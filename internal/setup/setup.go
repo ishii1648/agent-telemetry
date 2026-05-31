@@ -125,10 +125,13 @@ func printClaude(w io.Writer) {
 	fmt.Fprintln(w, "        {\"matcher\": \"\", \"hooks\": [{\"type\": \"command\", \"command\": \"agent-telemetry hook session-end --agent claude\", \"timeout\": 10}]}")
 	fmt.Fprintln(w, "      ],")
 	fmt.Fprintln(w, "      \"Stop\": [")
-	fmt.Fprintln(w, "        {\"matcher\": \"\", \"hooks\": [{\"type\": \"command\", \"command\": \"agent-telemetry hook stop --agent claude\"}]}")
+	fmt.Fprintln(w, "        {\"matcher\": \"\", \"hooks\": [{\"type\": \"command\", \"command\": \"agent-telemetry hook stop --agent claude\", \"async\": true}]}")
 	fmt.Fprintln(w, "      ]")
 	fmt.Fprintln(w, "    }")
 	fmt.Fprintln(w, "  }")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  Stop は応答ターンごとに発火するため \"async\": true で登録します")
+	fmt.Fprintln(w, "  （Claude Code v2.1.0+。hook プロセスの終了をユーザ応答サイクルが待たない）。")
 }
 
 func printCodex(w io.Writer) {

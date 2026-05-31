@@ -38,7 +38,7 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 |---|---|---|
 | `SessionStart` | `agent-telemetry hook session-start --agent claude` | セッション開始メタデータを `~/.claude/session-index.jsonl` に追記 |
 | `SessionEnd` | `agent-telemetry hook session-end --agent claude` | 終了時刻と終了理由を `~/.claude/session-index.jsonl` に追記し、SQLite を同期 |
-| `Stop` | `agent-telemetry hook stop --agent claude` | 応答完了時に `backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側で実行 |
+| `Stop` | `agent-telemetry hook stop --agent claude` | 応答完了時に `backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側で実行。応答ターンごとに発火するため `"async": true` で登録し、Claude Code が hook プロセスの exit を待たないようにする（v2.1.0+） |
 
 ### Codex CLI
 
@@ -50,7 +50,7 @@ hook は `agent-telemetry hook <event> --agent <claude|codex>` のサブコマ�
 | `Stop` | `agent-telemetry hook stop --agent codex` | 応答完了時に `ended_at` を同期更新し（Codex の de-facto SessionEnd）、`backfill --detach` を spawn して即 return（非同期）。PR の pin / backfill / sync-db は detached worker 側 |
 | `PostToolUse` | `agent-telemetry hook post-tool-use --agent codex` | `tool_input.command` が `gh pr create` のときだけ `tool_response` から PR URL を抽出し `pr_urls` に追記（`pr_pinned: true` のセッションでは無視される） |
 
-`Stop` hook の同期パスはローカル書き込み（Codex の `ended_at` のみ）と worker spawn だけで、`gh` を 1 回も呼ばず数 ms で return する。`gh` を伴う処理は detached worker に退避し、worker 側で global single-flight（同時実行抑制）・cooldown（頻度抑制）・gh cap（1 起動の件数上限）でレート制御する。両 agent とも worker トリガは Stop のみで、hook 登録構成は従来から変更しない。詳細は `docs/design.md ## Stop hook の非同期 worker 起動`。
+`Stop` hook の同期パスはローカル書き込み（Codex の `ended_at` のみ）と worker spawn だけで、`gh` を 1 回も呼ばず数 ms で return する。`gh` を伴う処理は detached worker に退避し、worker 側で global single-flight（同時実行抑制）・cooldown（頻度抑制）・gh cap（1 起動の件数上限）でレート制御する。両 agent とも worker トリガは Stop のみ。Claude Code 側はさらに `Stop` hook を `"async": true` で登録し、hook プロセスの exit 待ちもユーザ応答サイクルから外す（`async` は Claude Code 固有フィールドのため Codex には適用しない。`asyncRewake` は使わない）。詳細は `docs/design.md ## Stop hook の非同期 worker 起動`。
 
 ---
 
