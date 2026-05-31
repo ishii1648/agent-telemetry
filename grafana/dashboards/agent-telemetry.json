@@ -19,7 +19,7 @@
       "title": "sessions",
       "description": "期間内のトップレベル Claude Code セッション数（subagent / ghost / dotfiles repo を除く）",
       "type": "stat",
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 1 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "agent-telemetry" },
       "targets": [
         {
@@ -53,7 +53,7 @@
       "title": "merged PRs",
       "description": "期間内に merge された PR 数（merge 時刻は session 群の最終 timestamp で近似）",
       "type": "stat",
-      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 1 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "agent-telemetry" },
       "targets": [
         {
@@ -87,7 +87,7 @@
       "title": "total tokens",
       "description": "期間内の総 token 消費（input + output + cache write + cache read）。単位: K=千、Mil=100万、Bil=10億",
       "type": "stat",
-      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 1 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "agent-telemetry" },
       "targets": [
         {
@@ -103,40 +103,6 @@
             "mode": "absolute",
             "steps": [
               { "color": "purple", "value": null }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "orientation": "auto",
-        "textMode": "value",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center"
-      }
-    },
-    {
-      "id": 26,
-      "title": "peak concurrent",
-      "description": "期間内の最大同時実行セッション数（並列度のピーク）",
-      "type": "stat",
-      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "agent-telemetry" },
-      "targets": [
-        {
-          "rawQueryText": "SELECT COALESCE(MAX(peak_concurrent_sessions), 0) AS 'peak concurrent' FROM session_concurrency_daily WHERE coding_agent IN (${coding_agent:singlequote}) AND day BETWEEN date('${__from:date:iso}') AND date('${__to:date:iso}')",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "orange", "value": null }
             ]
           }
         },

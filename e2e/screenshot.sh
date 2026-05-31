@@ -19,7 +19,6 @@ declare -a PANELS=(
   "1:headline-sessions:${WIDTH}:${HEIGHT}"
   "24:headline-merged-prs:${WIDTH}:${HEIGHT}"
   "25:headline-total-tokens:${WIDTH}:${HEIGHT}"
-  "26:headline-peak-concurrent:${WIDTH}:${HEIGHT}"
   "9:weekly-token-consumption:${WIDTH}:${HEIGHT}"
   "20:weekly-merged-prs:${WIDTH}:${HEIGHT}"
   "12:weekly-pr-per-million-tokens:${WIDTH}:${HEIGHT}"

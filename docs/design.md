@@ -379,6 +379,8 @@ ADR-024 で task_type を集計軸から廃止したため、`pr_metrics` の集
 
 `sessions.timestamp` と `sessions.ended_at` の区間重なりから同時実行数を算出する。`ended_at` が空のセッションは現在時刻で打ち切る。subagent / ghost / 運用ノイズリポジトリを除外する。
 
+**並列度の観察軸（`agent_concurrent_sessions_{avg,peak}`）は SQLite + ローカル分析でのみ参照可能**で、otel+grafana 一本化後のメイン dashboard には持ち込まない（[0054]）。`session_concurrency_daily` / `session_concurrency_weekly` / `session_intervals` の各 VIEW は client 側 SoR / ローカル分析の一部として残すが、Grafana 表示からは落とす。理由は「区間（interval）の重なり」が OTLP Metrics gauge の flush 時点スナップショットから原理的に再構成できないため（任意レンジ性・peak の非分解性。`max_over_time` で出せるのは「日次 peak の最大」であり、レンジ全体の真の peak とは意味が異なる）。pre-bucket gauge での近似は誤読を招くため明示的に abandon する。詳細は [issues/closed/0054-design-abandon-concurrency-metrics-otel.md](../issues/closed/0054-design-abandon-concurrency-metrics-otel.md) を参照。
+
 ---
 
 ## 可視化層
