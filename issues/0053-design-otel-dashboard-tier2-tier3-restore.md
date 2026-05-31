@@ -28,6 +28,8 @@ SQLite を Grafana datasource として参照する経路（server/team ③・�
 
 ### Tier 2 — 既存 gauge の PromQL 集約で近似（新規 export 不要）
 
+> **進捗（実装済み）**: OSS dashboard（`deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json`）に「状態評価」row を追加し、total tokens / merged PRs / PR per 1M tokens の stat ＋ 週別 merged PR 数 trend を `last_over_time` 集約で復元。semantic drift を各パネル description に明記。実 Mimir に対し 4 式の PromQL を検証済み。Tier 3（session-grain export）は本 PR 対象外で issue は open のまま。
+
 `agent_pr_*` gauge を `last_over_time(...[$__range])` で集約してヘッドライン stat / trend を出す。**ただし `pr_metrics` は `is_merged = 1` 限定**なので、「全 session の総量」ではなく「merged-PR に寄与した分」になる意味のズレを description に明示する（非 PR・未マージ・放棄 session を取りこぼす）。
 
 - total tokens stat: `sum(last_over_time(agent_pr_total_tokens[$__range]))`

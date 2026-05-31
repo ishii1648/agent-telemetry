@@ -48,14 +48,22 @@ hooks
    agent-telemetry flush
    ```
 
-4. Grafana（<http://localhost:13001>）の **agent-telemetry (OSS)** フォルダの `agent-telemetry (OSS backend)` dashboard を開く。
+4. Grafana（<http://localhost:13001>）の **agent-telemetry (OSS)** フォルダの `agent-telemetry (OSS backend)` dashboard を開く。dashboard は次で構成される:
+   - **状態評価（Tier 2）** — merged PRs / total tokens / PR per 1M tokens の stat と週別 merged PR 数 trend。既存 `agent_pr_*` gauge を `last_over_time` で集約した近似。⚠ `pr_metrics`（`is_merged = 1` 限定）由来なので「merged-PR に寄与した分」であり全 session 総量ではない（各パネル description に明記）。
+   - **PR 単位の外れ値検出（Tier 1）** — PR 別 token スコアカード / session_count / tokens per tool_use。
+   - **Raw events（Tier 1）** — Loki の OTLP Logs。
+
+   session-grain（top-level sessions 数・週別 tokens/session 等の Tier 3）は新規 export が要るため未表示（[issues/0053](../../issues/0053-design-otel-dashboard-tier2-tier3-restore.md)）。並列度（Tier 4）は [issues/0054](../../issues/closed/0054-design-abandon-concurrency-metrics-otel.md) で abandon。
 
 ## 確認クエリ
 
+`agent_pr_*` は flush した瞬間だけ push される **sparse gauge** なので、素の instant クエリ（`sum(agent_pr_total_tokens)` 等）は最後の flush から Prometheus lookback delta（既定 5 分）を超えると空になる。range 集計は必ず `last_over_time(metric[<range>])` で最終値を拾う（[docs/metrics.md](../../docs/metrics.md) の gauge range 集計の前提と整合）:
+
 | backend | データソース | クエリ例 |
 |---|---|---|
-| Mimir | PromQL | `sum by (coding_agent) (agent_pr_total_tokens)` |
-| Mimir | PromQL | `topk(10, agent_pr_total_tokens)` |
+| Mimir | PromQL | `sum by (coding_agent) (last_over_time(agent_pr_total_tokens[$__range]))` |
+| Mimir | PromQL | `topk(10, last_over_time(agent_pr_total_tokens[$__range]))` |
+| Mimir | PromQL | `count(group by (pr_url) (last_over_time(agent_pr_total_tokens[$__range])))`（merged PR 数） |
 | Loki | LogQL | `{service_name="agent-telemetry"}` |
 
 `pr_metrics` gauge の metric 名は `agent_pr_*`（`agent_pr_total_tokens` / `agent_pr_fresh_tokens` / `agent_pr_session_count` / `agent_pr_tokens_per_session` ほか）。dimension（label）は `pr_url` / `coding_agent` / `user_id` / `task_type` / `model`（[docs/spec.md](../../docs/spec.md#pr_metrics-gauge-representationotlp-metrics)）。

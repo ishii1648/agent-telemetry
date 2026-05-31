@@ -405,7 +405,20 @@ ClickHouse / Loki も候補だが、個人利用規模では SQLite で十分。
 
 `make grafana-screenshot` が Docker Compose で Grafana + Image Renderer を起動し、Render API でパネルごとに PNG を取得する。Playwright 等のブラウザ自動操作は採用しない（Go プロジェクトに異質な依存を持ち込まないため、また Image Renderer で十分なため）。
 
-ダッシュボードを変更したら必ず `make grafana-screenshot` を実行し、`docs/assets/dashboard-*.png` も合わせて更新する（CLAUDE.md の必須作業）。
+ダッシュボードを変更したら必ず `make grafana-screenshot` を実行し、`docs/assets/dashboard-*.png` も合わせて更新する（CLAUDE.md の必須作業）。ただしこの E2E は SQLite dashboard（`grafana/dashboards/agent-telemetry.json`）専用で、OSS otel dashboard（`deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json`、Mimir/Loki backend）はカバーしない。後者には fixture→Mimir を流す決定的 screenshot パイプラインがまだ無く、検証は OSS compose を立てて手動 flush で行う（手順と落とし穴は issues/closed/0050）。
+
+### otel+grafana dashboard の Tier 2（merged-PR gauge 集約でヘッドラインを復元）
+
+SQLite を Grafana datasource から外し otel+grafana に一本化する移行（[0054]）で、メイン dashboard を一旦 Tier 1（PR 単位 gauge ＋ raw logs）のみに絞った。ヘッドライン stat / trend のうち、既存の `agent_pr_*` gauge だけで近似できるものを Tier 2 として OSS dashboard に復元する（新規 export 不要。session-grain が要る Tier 3 は別 PR）。詳細・ティア整理は [issues/0053-design-otel-dashboard-tier2-tier3-restore.md](../issues/0053-design-otel-dashboard-tier2-tier3-restore.md)。
+
+採用した式（`agent_pr_total_tokens` を代表に、いずれも sparse gauge なので `last_over_time([$__range])` で range 内最終値を拾う。naive な `sum`/instant では flush 直後 5 分しか出ない・二重計上になる、は metrics.md の gauge range 集計の前提と整合）:
+
+- total tokens stat: `sum(last_over_time(agent_pr_total_tokens[$__range]))`
+- merged PRs stat: `count(group by (pr_url) (last_over_time(agent_pr_total_tokens[$__range])))`
+- PR / 1M tokens stat: `count(group by (pr_url)(...)) * 1e6 / sum(...)`
+- 週別 merged PR 数 trend: `count by (coding_agent)(group by (pr_url, coding_agent)(last_over_time(...[$__interval])))` を 1w step の range クエリで評価
+
+**semantic drift を各パネル description に明示する**のが Tier 2 採用の条件。`agent_pr_*` は `pr_metrics`（`is_merged = 1` 限定）の集約なので、これらは「全 session の総量」ではなく「merged-PR に寄与した分」になり、非 PR・未マージ・放棄 session を取りこぼす。曖昧なまま出すと「全活動の総量」と誤読されるため、誤読を防ぐ description を必須とした（merged PRs stat だけは merged 限定の母集団そのものを数えるので近似ではなく一致）。週別 trend は SQLite 版の weekday-0（JST 月曜）起点カレンダー週と境界がずれる rolling/step バケットになる近似で、これも description に記す。
 
 ---
 
