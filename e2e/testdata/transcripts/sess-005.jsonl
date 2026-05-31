@@ -1,8 +1,0 @@
-{"type":"user","timestamp":"2026-03-10T16:00:00Z","message":{"content":"bug-42 の追加修正"}}
-{"type":"assistant","timestamp":"2026-03-10T16:01:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"content":[{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"ask-user-question"}]}}
-{"type":"user","timestamp":"2026-03-10T16:05:00Z","message":{"content":"エラーハンドリングを追加する方向で"}}
-{"type":"assistant","timestamp":"2026-03-10T16:06:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"content":[{"type":"tool_use","name":"Edit"},{"type":"tool_use","name":"Grep"}]}}
-{"type":"user","timestamp":"2026-03-10T16:15:00Z","message":{"content":"ログ出力もつけて"}}
-{"type":"assistant","timestamp":"2026-03-10T16:16:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"content":[{"type":"tool_use","name":"Read"}]}}
-{"type":"user","timestamp":"2026-03-10T16:25:00Z","message":{"content":"それでOK、コミットして"}}
-{"type":"assistant","timestamp":"2026-03-10T16:26:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"content":[{"type":"tool_use","name":"Write"}]}}

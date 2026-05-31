@@ -1,8 +1,6 @@
 # agent-telemetry
 
-Claude Code および Codex CLI を使った開発で、**PR 単位のトークン消費効率**を追跡・可視化する計測ツール。
-
-![Claude token 効率ダッシュボード](docs/assets/dashboard-full.png)
+Claude Code および Codex CLI を使った開発で、**PR 単位のトークン消費効率**を追跡・可視化する計測ツール。可視化は otel+grafana（Mimir/Loki）に一本化している（[issues/0055](issues/0055-design-sqlite-grafana-datasource-removal.md)）。
 
 ## ドキュメント
 

@@ -81,7 +81,7 @@ token と違い「人間との対話量」が混ざるので、レビュア・PR
 
 両軸を交差させる典型的な観察は **並列稼働の評価**: `concurrent_sessions_peak` が高い期間に `fresh_tokens / PR` も悪化していれば「並列詰め込み過ぎ」のサインです。
 
-具体的なクエリとパネル定義は [grafana/dashboards/agent-telemetry.json](https://github.com/ishii1648/agent-telemetry/blob/main/grafana/dashboards/agent-telemetry.json) を参照してください。
+具体的なクエリとパネル定義は [deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json](https://github.com/ishii1648/agent-telemetry/blob/main/deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json)（otel+grafana 版、PromQL/LogQL）を参照してください。
 
 ## 3 収集カテゴリ
 

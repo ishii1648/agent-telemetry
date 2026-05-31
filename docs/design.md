@@ -378,27 +378,21 @@ ADR-024 で task_type を集計軸から廃止したため、`pr_metrics` の集
 
 ## 可視化層
 
-### SQLite + Grafana の選定
+可視化は **otel+grafana（Mimir/Loki）に一本化** する（[0055]）。client がローカル `pr_metrics` VIEW を評価して PR 単位の pre-aggregated gauge（`agent_pr_*`）を OTLP Metrics で、raw events を OTLP Logs で送り、Grafana は Mimir(PromQL) / Loki(LogQL) を読む。dashboard は `deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json`（Tier 1: PR 単位 gauge + raw logs）。
 
-Prometheus + Grafana ではなく SQLite + Grafana を採用している。理由は「任意の日付範囲で PR 別に集計する」という用途が SQL の典型ユースケースであり、Prometheus の「現在状態のスクレイプ」モデルとは合わないため。
+### SQLite は client SoR / 集約エンジンに固定（Grafana datasource は撤去）
 
-ClickHouse / Loki も候補だが、個人利用規模では SQLite で十分。
+旧構成は SQLite を `frser-sqlite-datasource` で Grafana が直読みしていたが、この経路は撤去した。SQLite は **client 側の events SoR ＋ 集約エンジン**（gauge 算出の前提）としてのみ残す。「server/team の Grafana datasource（③）」「個人ローカルの `.db` 直読み（④）」を両方やめ、`grafana/`・root `docker-compose.yaml`・`make grafana-*`・E2E スクリーンショット harness・`lint-dashboard` CI を削除した（責務分解と判断根拠は [0055]）。
 
-### datasource uid の固定化
+採用判断: 「任意の日付範囲で PR 別に集計する」用途は SQL の典型で、Prometheus の「現在状態のスクレイプ」モデルとは合わない（旧 SQLite 採用理由）。一本化はこの fidelity を一部諦める代わりに、viz の二系統保守（SQL 方言 dashboard と PromQL/LogQL dashboard）を解消する判断（トレードオフは [0055]）。
 
-ダッシュボード JSON の datasource は `uid: agent-telemetry` で固定し、Grafana provisioning が解決しない `${DS_*}` テンプレート変数は使わない。`__inputs` セクションも持たない。
+### gauge は push 型ゆえ last_over_time で読む
 
-### 週別 time series のプロット位置
+`agent_pr_*` は flush 時点にだけ push される sparse 系列で scrape され続けない。stat/table/barchart は `last_over_time(metric[$__range])` で評価する（素の instant クエリは lookback delta（5 分）外で空になる。`docs/metrics.md`「gauge の range 集計は last」と整合）。
 
-週別パネルの SQL では `time = strftime('%s', week_start, '+3 days', '+12 hours')` を返し、データポイントを **週の中央（木曜 12:00 UTC = JST 木曜 21:00）** にプロットする。`week_start` 自身（月曜 00:00 UTC = JST 月曜 09:00）をそのまま `time` に使うと、Grafana の time range（例: Last 7 days）の `__from` に対して JST 月曜の朝が境界より前に位置し、X 軸範囲外で描画されない週が出てしまう。中央プロットなら通常の time range で確実に範囲内に入り、また「週の代表値」としても直感的。
+### fidelity の段階対応
 
-合わせて WHERE 句は `week_start BETWEEN date('${__from:date:iso}', '-7 days') AND date('${__to:date:iso}')` と `__from` を 7 日緩める。データポイント時刻が `__from` ～ `__to` に入る週でも `week_start` は最大 6 日前になりうるため。
-
-### E2E スクリーンショット
-
-`make grafana-screenshot` が Docker Compose で Grafana + Image Renderer を起動し、Render API でパネルごとに PNG を取得する。Playwright 等のブラウザ自動操作は採用しない（Go プロジェクトに異質な依存を持ち込まないため、また Image Renderer で十分なため）。
-
-ダッシュボードを変更したら必ず `make grafana-screenshot` を実行し、`docs/assets/dashboard-*.png` も合わせて更新する（CLAUDE.md の必須作業）。
+prom/loki で残せる範囲を整理し、**Tier 1（PR 単位 gauge + raw logs）のみ即表示**。Tier 2/3（session-grain・週次集計の export）は [0053]、Tier 4（並列度 = 区間重なりで gauge から原理的に再構成不能）は [0054] で abandon。
 
 ---
 
@@ -446,7 +440,7 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 
 ### 外部 backend 経路の責務分担（client / server / Collector / backend）
 
-外部 observability backend（Datadog 等）への export 経路（[0040] / [0042] / [0043]）が加わり、集約・整形をどの主体が担うかが増えた。混線を避けるため責務を 4 主体に固定する。内部転送（client → server → Grafana/SQLite）は従来どおりで、本節は **外部 backend 向けに増えた経路**の責務を明文化する。
+外部 observability backend（Datadog 等）への export 経路（[0040] / [0042] / [0043]）が加わり、集約・整形をどの主体が担うかが増えた。混線を避けるため責務を 4 主体に固定する。内部転送（client → server → SQLite ingest）は events 集約ストアとして残るが、Grafana が SQLite を直読みする経路は撤去した（[0055]）。本節は **外部 backend 向けに増えた経路**の責務を明文化する。
 
 | 主体 | 担うこと | 担わないこと |
 |---|---|---|
@@ -575,7 +569,9 @@ ingest ハンドラの責務:
 
 `internal/syncdb/schema.sql`（events DDL + 派生 VIEW 定義）をサーバ binary にも埋め込み、起動時に `schema_meta` ハッシュ比較で DDL 再構築する仕組みはクライアントと同じ。`schema_hash` 不一致でクライアント送信を全停止させるロジックは持たない（events table の DDL は安定で、新メトリクスは新属性の追加で表現できるため）。
 
-サーバの SQLite は Grafana datasource として読み込まれる。本番形態は k8s pod を想定し、Grafana の **設定資産**（`grafana/dashboards/agent-telemetry.json` と `grafana/provisioning/datasources/*.yaml`）はローカル `docker-compose.yaml` の volume mount と k8s ConfigMap mount の **両方から同じファイルを参照** する。これによりダッシュボード変更が両環境に同時反映され、二重メンテナンスを避ける。datasource の `uid: agent-telemetry` を踏襲し、VIEW の出力スキーマも旧設計と同じなのでクエリ JSON は無変更で動く。
+サーバの SQLite は events の集約ストア（cross-event join 用 VIEW の評価基盤）として残るが、**Grafana datasource として直読みする経路は撤去した**（[0055]、③ の撤去）。team 可視化は client → 外部 backend（Mimir/Loki）→ Grafana に寄せる前提で、サーバ SQLite を直接 Grafana に出す `grafana/` 設定資産・`docker-compose.yaml` mount は削除済み。
+
+> **要フォローアップ**: ③ 撤去により、サーバが OTLP Logs を SQLite に ingest しても **Grafana 読者が居なくなった**。サーバ pipeline（`internal/serverpipe/`）自体の処遇（撤去するか、events を外部 backend へ forward する receiver に作り替えるか）は別 issue で判断する。
 
 ### 新メトリクス追加の運用
 

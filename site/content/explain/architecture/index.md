@@ -79,9 +79,9 @@ CLI は state を読んで SQLite に変換します。**通常は `Stop` hook �
 
 ### 4. 可視化層
 
-DB は `~/.claude/agent-telemetry.db` 1 ファイルに集約されます（agent は `coding_agent` カラムで区別）。`pr_metrics` VIEW が PR 単位の集約を提供するので、Grafana / DBeaver / `sqlite3` CLI など SQLite を読める任意のクライアントで参照可能です。
+DB は `~/.claude/agent-telemetry.db` 1 ファイルに集約されます（agent は `coding_agent` カラムで区別）。これは **client 側の events SoR ＋ 集約エンジン**で、`pr_metrics` VIEW が PR 単位の集約（gauge 算出の前提）を提供します。`sqlite3` CLI / DBeaver 等での直接参照は可能ですが、**可視化は otel+grafana（Mimir/Loki）に一本化**しており、SQLite を Grafana datasource として直読みする経路は撤去しました（[issues/0055](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0055-design-sqlite-grafana-datasource-removal.md)）。
 
-リポジトリ同梱の Grafana dashboard はあくまで**参考実装**です。panel 構成は `grafana/dashboards/agent-telemetry.json` を直接参照してください。
+client は `pr_metrics` の PR 単位 gauge（`agent_pr_*`）を OTLP Metrics で、raw events を OTLP Logs で送り、Grafana は Mimir(PromQL) / Loki(LogQL) を読みます。dashboard は [deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json](https://github.com/ishii1648/agent-telemetry/blob/main/deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json)（Tier 1: PR 単位 gauge + raw logs）。
 
 ## なぜこの構成か
 

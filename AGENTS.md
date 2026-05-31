@@ -135,14 +135,14 @@ Created: YYYY-MM-DD
 
 ```fish
 go test ./...                          # 全テスト
-make grafana-screenshot                # E2E: Grafana スクリーンショット検証
 ```
 
-### ダッシュボード変更時の必須作業
+### ダッシュボード変更時
 
-- `grafana/dashboards/agent-telemetry.json` の表示を変更した場合は、必ず `make grafana-screenshot` を実行して README 用スクリーンショット（`docs/assets/dashboard-*.png`）も同じ変更に合わせて更新する（`grafana-screenshot` は `grafana-up-e2e` 経由で fixture データを使うので、画像が決定的に再現される）。
-- スクリーンショット生成でポート競合が起きる場合は `GRAFANA_PORT=<unused-port> make grafana-screenshot` を使う。
-- 実データで動作確認したい場合は `make grafana-up`（`~/.claude/agent-telemetry.db` を mount）。E2E と同じコンテナを使うので、切替時は片方が再作成される。
+可視化は otel+grafana(Mimir/Loki) に一本化した（[issues/0055](issues/0055-design-sqlite-grafana-datasource-removal.md)）。dashboard は `deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json`（PromQL/LogQL、Tier 1）。
+
+- 表示確認は OSS compose（`deploy/oss-observability/`）で行う。Grafana が provisioning でファイルを reload するので、JSON を編集して reload を待てばよい（旧 `make grafana-screenshot` のような renderer スクショ自動取得は廃止）。
+- `agent_pr_*` は flush 時点にだけ push される sparse 系列。stat/table/barchart は `last_over_time(metric[$__range])` で書く（素の instant クエリは lookback delta（5 分）外で空になる）。
 
 ### docs site（`site/`）
 

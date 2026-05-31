@@ -5,6 +5,8 @@ weight: 20
 
 複数マシンやチームメンバーでメトリクスを集約したい場合、`agent-telemetry-server` を立てて `agent-telemetry flush` でイベントを送信する経路を有効化できます。送信は append-only なイベント列を OTLP/HTTP Logs（`POST /v1/logs`）で転送する方式です。サーバ送信は **オプトイン** で、設定しなければローカル単独利用は従来どおり動きます。基本のローカルセットアップは [local]({{< relref "/setup/local" >}}) を参照してください。
 
+> **⚠️ 改訂中（[issues/0055](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0055-design-sqlite-grafana-datasource-removal.md)）**: server を Grafana の SQLite datasource として直読みさせる sidecar 構成（`frser-sqlite-datasource` + k8s sidecar）は撤去方針です。team 可視化は client → 外部 backend（Mimir/Loki）→ Grafana に寄せます。本ページ後半の **k8s sidecar + SQLite datasource の手順は旧構成**で、server pipeline（`internal/serverpipe/`）自体の処遇含め書き換えは未了です（追跡: [issues/0056](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0056-design-server-pipeline-otel-setup-docs.md)）。
+
 仕様の外部契約は [docs/spec.md ## サーバ送信](https://github.com/ishii1648/agent-telemetry/blob/main/docs/spec.md#サーバ送信)、設計判断は [docs/design.md ## サーバ側集約パイプライン](https://github.com/ishii1648/agent-telemetry/blob/main/docs/design.md#サーバ側集約パイプライン) を参照。
 
 > **OSS バックエンドでローカル検証する**: Datadog などの credential を用意せず、Collector が backend へ push する構成を手元で試したい場合は、OSS 検証用レシピ [`deploy/oss-observability/`](https://github.com/ishii1648/agent-telemetry/tree/main/deploy/oss-observability)（Mimir / Loki / Grafana）を使えます。`cd deploy/oss-observability && docker compose up` で起動し、Grafana は `http://localhost:13001` で開きます。クライアントは `[server]`（または export target）の `endpoint = "http://localhost:4318"`・`encoding = "json"`・`signals = ["logs", "metrics"]` で OTel Collector に向け、token は不要です。詳細は同ディレクトリの [README](https://github.com/ishii1648/agent-telemetry/tree/main/deploy/oss-observability) を参照してください。

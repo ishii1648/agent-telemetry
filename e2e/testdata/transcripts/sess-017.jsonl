@@ -1,2 +1,0 @@
-{"type":"user","timestamp":"2026-03-13T16:00:00Z","message":{"content":"session 重複排除のバグを修正して"}}
-{"type":"assistant","timestamp":"2026-03-13T16:01:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"content":[{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"Edit"},{"type":"tool_use","name":"Bash"}]}}

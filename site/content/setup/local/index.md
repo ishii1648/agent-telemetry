@@ -5,7 +5,9 @@ weight: 10
 
 ローカルマシンに agent-telemetry を導入する手順です。
 
-agent-telemetry は **ローカル単独で完結** します。本ページの手順を実施すると、`~/.claude/agent-telemetry.db` に集計結果が蓄積され、Grafana ダッシュボードで PR 単位の token 効率や開発生産性を可視化できます。
+> **⚠️ 改訂中（[issues/0055](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0055-design-sqlite-grafana-datasource-removal.md)）**: 可視化を otel+grafana（Mimir/Loki）に一本化し、SQLite を Grafana datasource として直読みする経路（`frser-sqlite-datasource` プラグイン / `make grafana-up` / dashboard import）は撤去しました。本ページの **「Grafana で可視化」以降は旧 SQLite 版の手順**で、otel 版への書き換えは未了です（追跡: [issues/0056](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0056-design-server-pipeline-otel-setup-docs.md)）。当面、otel backend のローカル可視化は [`deploy/oss-observability/`](https://github.com/ishii1648/agent-telemetry/tree/main/deploy/oss-observability) の compose を参照してください。hook 導入と `~/.claude/agent-telemetry.db` への蓄積（client SoR）は従来どおり有効です。
+
+agent-telemetry は **ローカル単独で完結** します。本ページの手順を実施すると、`~/.claude/agent-telemetry.db` に集計結果が蓄積され、PR 単位の token 効率や開発生産性を otel+grafana（Mimir/Loki）で可視化できます。
 
 複数マシンやチームメンバーで集計値を集約したい場合は、**オプトイン** で `agent-telemetry-server` に送信する経路を有効化できます（[server]({{< relref "/setup/server" >}})）。サーバ送信を設定しなくてもローカル利用は従来どおり動きます。
 
