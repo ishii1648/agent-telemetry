@@ -24,9 +24,9 @@ Claude Code および Codex CLI の PR 単位のトークン消費効率を追�
 
 ### 意思決定の記録方針
 
-意思決定の primary store は `issues/`。frontmatter の `decision_type` / `affected_paths` で構造化される。`make intent P=<p>` はコードから関連 issue / コミットへの **逆引き索引** として使う（意図そのものは issue 本文・docs・commit body 側にあり、`--full` で本文を取得できる）。
+意思決定の primary store は `issues/`。frontmatter の `decision_type` で層を構造化する。`make intent P=<p>` はコードから関連 issue / コミットへの **逆引き索引**（issue 本文の grep ＋ commit action 行。手書きの path インデックスは持たない）として使う（意図そのものは issue 本文・docs・commit body 側にあり、`--full` で本文を取得できる）。why の鎖は git blame → commit → PR → PR description の issue リンク → issue 本文で辿る。
 
-- **複数コミット or 後続が参照しそうな決定** → `issues/<NNNN>-...` に書く（frontmatter で `decision_type` と `affected_paths` を埋める）
+- **複数コミット or 後続が参照しそうな決定** → `issues/<NNNN>-...` に書く（frontmatter で `decision_type` を埋め、影響する path は本文で言及する）
 - 仕様の変更 → `docs/spec.md` を更新（issue にも `decision_type: spec` で記録）
 - 実装方針の変更 → `docs/design.md` を更新（issue にも `decision_type: design` で記録）
 - 1 コミット内で完結する判断 → Contextual Commits のアクション行で記録（issue 化不要）

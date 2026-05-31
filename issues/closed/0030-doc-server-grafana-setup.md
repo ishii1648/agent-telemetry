@@ -1,9 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - site/content/setup/local/index.md
-  - site/content/setup/server/index.md
-  - README.md
 tags: [server, docs, grafana, k8s, operations]
 closed_at: 2026-05-10
 ---

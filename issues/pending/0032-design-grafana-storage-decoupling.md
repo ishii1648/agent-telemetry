@@ -1,12 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - site/content/setup/server/index.md
-  - docs/design.md
-  - internal/syncdb/
-  - internal/serverpipe/
-  - grafana/dashboards/agent-telemetry.json
-  - grafana/provisioning/datasources/
 tags: [grafana, sqlite, storage, deployment, architecture]
 ---
 

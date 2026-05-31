@@ -12,6 +12,8 @@ PR description はこのテンプレに沿って薄く保ち、「なぜ」「�
 必須。実装対象の issue ファイルへのリンクを貼る。
 複数 issue を解決する場合はすべて列挙する。
 新規 issue を伴わない軽微な変更（typo / chore）の場合は "(N/A — chore)" でも可。
+CI (.github/workflows/intent.yml) が issue リンク（issues/NNNN-...）または "(N/A" の
+記載を必須化し、欠落した PR は merge をブロックする。
 -->
 
 - `issues/<id>-<cat>-<slug>.md`

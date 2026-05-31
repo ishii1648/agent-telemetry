@@ -1,9 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/hook/
-  - cmd/agent-telemetry/main.go
-  - internal/hook/annotate.go
 tags: [retro, hooks, packaging, distribution]
 closed_at: 2026-04-15
 ---

@@ -1,9 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - cmd/agent-telemetry/main.go
-  - go.mod
-  - README.md
 tags: [retro, packaging, dotfiles, repository-structure]
 closed_at: 2026-03-09
 ---

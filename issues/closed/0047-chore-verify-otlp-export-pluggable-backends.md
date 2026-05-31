@@ -1,10 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - internal/serverclient/
-  - internal/serverpipe/
-  - deploy/otel-collector/
-  - deploy/datadog/
 depends_on: [0040, 0042, 0043, 0044, 0045, 0046]
 tags: [otel, export, pluggable-backend, verification, e2e, datadog]
 closed_at: 2026-05-30

@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """intent-lookup — code path から構造化された意図記録を逆引きする索引。
 
-issues/<id>-*.md / issues/closed/*.md / issues/pending/*.md の frontmatter から
-affected_paths が overlap する issue を一覧し、issue 本文の「概要 / 根拠 / 問題 /
-対応方針 / 解決方法」セクションの先頭段落を抜粋し、併せて `git log --follow` の
-Contextual Commits 行（intent: / decision: / rejected: / constraint: / learned:）
-を抽出してマージ表示する。
+issues/<id>-*.md / issues/closed/*.md / issues/pending/*.md の本文に query path
+（rename 解決した旧 path 候補を含む）が言及されている issue を grep で拾い、
+本文の「概要 / 根拠 / 問題 / 対応方針 / 解決方法」セクションの先頭段落を抜粋し、
+併せて `git log --follow` の Contextual Commits 行（intent: / decision: /
+rejected: / constraint: / learned:）を抽出してマージ表示する。
 
 位置づけ: これは **逆引き索引** であって意図そのものではない。意図は issue 本文
 と commit body 側にある。本ツールはそこへの入口を提供して見落としを減らす。
 
-Modes:
-  lookup (default): scripts/intent-lookup <path> [--format=markdown|json] [--full]
-  lint:             scripts/intent-lookup --lint [--format=markdown|json] [--strict]
+手書きの path インデックス（issue frontmatter の affected_paths）には依存しない。
+path → issue の対応は issue 本文の grep と git 履歴だけから動的に求めるため、
+インデックスの保守は不要（ゼロメンテ）。precision より recall に振っており、
+無関係寄りの候補が混じり得る前提で「見落とさない入口」を提供する。
 
-Lint exit codes: 2 = errors present; 1 = warnings present (only when --strict);
-otherwise 0.
+Mode:
+  lookup: scripts/intent-lookup <path> [--format=markdown|json] [--full]
 
 外部依存: git のみ。Python 3.9+ 標準ライブラリで完結。
 """
@@ -24,13 +25,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 # --------------------------------------------------------------------------
@@ -152,10 +151,7 @@ class Issue:
     path: str  # repo-relative
     frontmatter: dict
     body: str = ""
-
-    def affected_paths(self) -> list[str]:
-        ap = self.frontmatter.get("affected_paths") or []
-        return [str(p) for p in ap if p is not None]
+    text: str = ""  # full file text (frontmatter + body), used for grep
 
 
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
@@ -196,7 +192,7 @@ def load_issue(path: Path, repo_root: Path) -> Issue | None:
     stem = path.stem  # e.g. "0011-feat-..."
     issue_id = stem.split("-", 1)[0]
     return Issue(id=issue_id, status=status, title=title, path=rel,
-                 frontmatter=fm, body=body)
+                 frontmatter=fm, body=body, text=text)
 
 
 def collect_issues(repo_root: Path) -> list[Issue]:
@@ -211,17 +207,6 @@ def collect_issues(repo_root: Path) -> list[Issue]:
             if issue is not None:
                 out.append(issue)
     out.sort(key=lambda x: x.id)
-    return out
-
-
-def list_issue_files(repo_root: Path) -> list[Path]:
-    """Walk issues/ regardless of frontmatter validity (used by lint)."""
-    out: list[Path] = []
-    for sub in ("issues", "issues/closed", "issues/pending"):
-        d = repo_root / sub
-        if not d.is_dir():
-            continue
-        out.extend(sorted(d.glob("*.md")))
     return out
 
 
@@ -291,49 +276,48 @@ def collect_sections(issue: Issue, *, mode: str) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------
-# path matching
+# path matching (grep)
 # --------------------------------------------------------------------------
 
 def normalise(p: str) -> str:
-    """Strip leading './' and trailing '/' for prefix comparison."""
+    """Strip leading './' and trailing '/' for substring comparison."""
     if p.startswith("./"):
         p = p[2:]
     return p.rstrip("/")
-
-
-def paths_overlap(entry: str, query: str) -> bool:
-    """bidirectional prefix overlap (entry ⊆ query OR query ⊆ entry)."""
-    e = normalise(entry)
-    q = normalise(query)
-    if e == q:
-        return True
-    if q.startswith(e + "/"):
-        return True
-    if e.startswith(q + "/"):
-        return True
-    return False
 
 
 def is_dir_query(raw: str) -> bool:
     return raw.endswith("/")
 
 
-def is_broad_path(p: str, root: Path | None = None) -> bool:
-    """top-level dir 単独 (e.g. `docs/`, `internal/`) を broad とみなす。
+def grep_keys(resolved: list[str]) -> list[str]:
+    """Build the substring keys used to grep issue bodies.
 
-    top-level の単独ファイル (`AGENTS.md`, `Makefile` 等) は逆引きノイズが
-    限定的なので broad ではない。
+    Each resolved path itself is always a key (the user asked for it
+    explicitly). For multi-component paths we additionally add ancestor
+    directories down to 2 components — issues usually reference a path region
+    by directory (`internal/hook/`), not by exact file, so this raises recall.
+    Single top-level components (`internal`, `docs`) are NOT added as ancestors
+    because they match almost everything; they are only a key when the query
+    itself is that top-level path.
     """
-    s = normalise(p)
-    if s == "":
-        return False
-    if "/" in s:
-        return False
-    if p.endswith("/"):
-        return True
-    if root is not None:
-        return (root / s).is_dir()
-    return False
+    keys: set[str] = set()
+    for p in resolved:
+        n = normalise(p)
+        if not n:
+            continue
+        keys.add(n)
+        parts = n.split("/")
+        # ancestors with >= 2 components (exclude the bare top-level dir)
+        for i in range(len(parts) - 1, 1, -1):
+            keys.add("/".join(parts[:i]))
+    return sorted(keys)
+
+
+def issue_mentions(issue: Issue, keys: list[str]) -> bool:
+    """True if any grep key appears as a substring of the issue text."""
+    hay = issue.text
+    return any(k in hay for k in keys)
 
 
 # --------------------------------------------------------------------------
@@ -366,8 +350,7 @@ def resolve_query_paths(query: str, root: Path) -> list[str]:
     For directory queries, --follow doesn't apply (git tracks file rename).
     Always returns the original query first, then any historical aliases (deduped, sorted).
     """
-    primary = query if is_dir_query(query) else normalise(query)
-    out = [primary if is_dir_query(query) else normalise(query)]
+    out = [query if is_dir_query(query) else normalise(query)]
     if is_dir_query(query):
         return out
     # query a file; git log --follow only meaningful on files
@@ -409,7 +392,7 @@ def collect_commits(query_paths: list[str], root: Path) -> list[Commit]:
     for q in query_paths:
         path = q.rstrip("/") if q.endswith("/") else q
         # use --follow when targeting a file, plain log for dirs
-        log_args = ["log", "--format=%H", "--"] + [path]
+        log_args = ["log", "--format=%H", "--", path]
         if not q.endswith("/"):
             log_args = ["log", "--follow", "--format=%H", "--", path]
         raw = run_git(log_args, cwd=root)
@@ -434,97 +417,6 @@ def collect_commits(query_paths: list[str], root: Path) -> list[Commit]:
                                   subject=subject, actions=actions))
     commits.sort(key=lambda c: c.date, reverse=True)
     return commits
-
-
-# --------------------------------------------------------------------------
-# lint
-# --------------------------------------------------------------------------
-
-@dataclass
-class Finding:
-    level: str  # "warning" | "error"
-    code: str
-    path: str
-    message: str
-    id: str | None = None
-    target: str | None = None
-
-
-_VALID_DECISION_TYPES = {"spec", "design", "implementation", "process"}
-
-
-def lint_issues(root: Path) -> list[Finding]:
-    findings: list[Finding] = []
-    for f in list_issue_files(root):
-        rel = f.relative_to(root).as_posix()
-        text = f.read_text(encoding="utf-8")
-        fm_text, _body = split_frontmatter(text)
-        if not fm_text.strip():
-            findings.append(Finding(
-                level="warning", code="frontmatter_missing",
-                path=rel,
-                message="frontmatter (--- ... ---) が見つからない",
-            ))
-            continue
-        try:
-            fm = parse_frontmatter(fm_text)
-        except ValueError as e:
-            findings.append(Finding(
-                level="error", code="frontmatter_invalid",
-                path=rel,
-                message=f"frontmatter のパースに失敗: {e}",
-            ))
-            continue
-
-        issue_id = f.stem.split("-", 1)[0]
-        dt = fm.get("decision_type")
-        if dt is not None and dt not in _VALID_DECISION_TYPES:
-            findings.append(Finding(
-                level="error", code="decision_type_invalid",
-                path=rel, id=issue_id,
-                message=f"decision_type が enum 外: {dt} ({'|'.join(sorted(_VALID_DECISION_TYPES))})",
-            ))
-
-        ap = fm.get("affected_paths") or []
-        if not ap:
-            findings.append(Finding(
-                level="warning", code="affected_paths_empty",
-                path=rel, id=issue_id,
-                message="affected_paths が空（逆引きでヒットしない）",
-            ))
-            continue
-
-        # legitimate な broad / missing を明示的に suppress するための per-issue
-        # opt-out。frontmatter:
-        #   lint_ignore_broad: [issues/]      # legitimate-broad: meta issue
-        #   lint_ignore_missing: [site/]      # 0012 で生成予定
-        # 抑制理由は frontmatter の YAML コメントに書く（パース不要）。
-        broad_ignores = {str(x) for x in (fm.get("lint_ignore_broad") or [])}
-        missing_ignores = {str(x) for x in (fm.get("lint_ignore_missing") or [])}
-
-        for p in ap:
-            p_str = str(p)
-            check = p_str.rstrip("/")
-            target_path = root / check
-            tracked = False
-            ls = run_git(["ls-files", "--error-unmatch", "--", check], cwd=root)
-            ls_dir = run_git(["ls-files", "--error-unmatch", "--", check + "/"], cwd=root) if check else ""
-            if ls.strip() or ls_dir.strip():
-                tracked = True
-            if (not target_path.exists() and not tracked
-                    and p_str not in missing_ignores):
-                findings.append(Finding(
-                    level="warning", code="affected_path_missing",
-                    path=rel, id=issue_id, target=p_str,
-                    message=f"affected_paths の entry が repo に存在しない: {p_str}",
-                ))
-            if is_broad_path(p_str, root) and p_str not in broad_ignores:
-                findings.append(Finding(
-                    level="warning", code="affected_path_broad",
-                    path=rel, id=issue_id, target=p_str,
-                    message=f"affected_paths の entry が broad すぎる（top-level dir 単独）: {p_str}",
-                ))
-    return findings
 
 
 # --------------------------------------------------------------------------
@@ -573,7 +465,7 @@ def render_lookup_markdown(query: str, resolved: list[str],
         for p in resolved[1:]:
             lines.append(f"- `{p}`")
     lines.append("")
-    lines.append("> This is a **lookup index**, not the intent itself. Read linked issues and commit bodies for the full reasoning.")
+    lines.append("> This is a **lookup index**, not the intent itself. Issues are matched by mentioning the path in their body — read the linked issues and commit bodies for the full reasoning.")
     lines.append("")
 
     if issues:
@@ -584,11 +476,6 @@ def render_lookup_markdown(query: str, resolved: list[str],
             lines.append(f"### #{issue.id} [{issue.status}] — {issue.title}")
             lines.append(f"- file: `{issue.path}`")
             lines.append(f"- decision_type: `{fm.get('decision_type', '—')}`")
-            ap = fm.get("affected_paths") or []
-            if ap:
-                lines.append("- affected_paths:")
-                for p in ap:
-                    lines.append(f"    - `{p}`")
             tags = fm.get("tags") or []
             if tags:
                 lines.append("- tags: " + ", ".join(f"`{t}`" for t in tags))
@@ -625,46 +512,6 @@ def render_lookup_markdown(query: str, resolved: list[str],
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_lint_json(findings: list[Finding]) -> str:
-    errs = sum(1 for f in findings if f.level == "error")
-    warns = sum(1 for f in findings if f.level == "warning")
-    payload = {
-        "errors": errs, "warnings": warns,
-        "findings": [
-            {k: v for k, v in {
-                "level": f.level, "code": f.code, "path": f.path,
-                "id": f.id, "target": f.target, "message": f.message,
-            }.items() if v is not None}
-            for f in findings
-        ],
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-def render_lint_markdown(findings: list[Finding]) -> str:
-    errs = sum(1 for f in findings if f.level == "error")
-    warns = sum(1 for f in findings if f.level == "warning")
-    lines: list[str] = []
-    lines.append("# intent-lookup lint")
-    lines.append("")
-    lines.append(f"_{errs} error(s), {warns} warning(s)._")
-    lines.append("")
-    if not findings:
-        lines.append("_All issues clean._")
-        return "\n".join(lines) + "\n"
-
-    by_path: dict[str, list[Finding]] = {}
-    for f in findings:
-        by_path.setdefault(f.path, []).append(f)
-    for p in sorted(by_path):
-        lines.append(f"## `{p}`")
-        for f in by_path[p]:
-            tag = f" — `{f.target}`" if f.target else ""
-            lines.append(f"- [{f.level}] {f.code}{tag}: {f.message}")
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
-
-
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -672,7 +519,7 @@ def render_lint_markdown(findings: list[Finding]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="intent-lookup",
-        description="Reverse-lookup index over issues/ frontmatter and Contextual Commits.",
+        description="Reverse-lookup index over issues/ bodies (grep) and Contextual Commits.",
     )
     ap.add_argument("path", nargs="?",
                     help="path to look up (file or trailing-slash dir)")
@@ -680,26 +527,19 @@ def build_parser() -> argparse.ArgumentParser:
                     default="markdown")
     ap.add_argument("--full", action="store_true",
                     help="include full section bodies (default: first paragraph)")
-    ap.add_argument("--lint", action="store_true",
-                    help="lint mode: walk issues/ and report frontmatter issues")
-    ap.add_argument("--strict", action="store_true",
-                    help="(--lint only) treat warnings as gating: exit 1 when any "
-                         "warning is present. without --strict, lint exits 0 on "
-                         "warnings (errors still exit 2)")
     return ap
 
 
 def cmd_lookup(args, root: Path) -> int:
     query = args.path
     resolved = resolve_query_paths(query, root)
+    keys = grep_keys(resolved)
     issues = collect_issues(root)
     matched: list[tuple[Issue, dict]] = []
     section_mode = "full" if args.full else "excerpt"
     for issue in issues:
-        for entry in issue.affected_paths():
-            if any(paths_overlap(entry, q) for q in resolved):
-                matched.append((issue, collect_sections(issue, mode=section_mode)))
-                break
+        if issue_mentions(issue, keys):
+            matched.append((issue, collect_sections(issue, mode=section_mode)))
     commits = collect_commits(resolved, root)
 
     if args.format == "json":
@@ -710,27 +550,8 @@ def cmd_lookup(args, root: Path) -> int:
     return 0
 
 
-def cmd_lint(args, root: Path) -> int:
-    findings = lint_issues(root)
-    if args.format == "json":
-        sys.stdout.write(render_lint_json(findings))
-        sys.stdout.write("\n")
-    else:
-        sys.stdout.write(render_lint_markdown(findings))
-    if any(f.level == "error" for f in findings):
-        return 2
-    if args.strict and any(f.level == "warning" for f in findings):
-        return 1
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.lint:
-        if args.path is not None:
-            sys.stderr.write("--lint takes no path argument\n")
-            return 2
-        return cmd_lint(args, repo_root())
     if not args.path:
         build_parser().print_help(sys.stderr)
         return 2

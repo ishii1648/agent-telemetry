@@ -1,8 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - .github/workflows/docker-image.yml
-  - Dockerfile.server
 tags: [server, ci, container-registry, ghcr, k8s]
 closed_at: 2026-05-10
 ---

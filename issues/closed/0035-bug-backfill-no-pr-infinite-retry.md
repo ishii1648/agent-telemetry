@@ -1,11 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/backfill/backfill.go
-  - internal/sessionindex/update.go
-  - internal/hook/stop.go
-  - docs/design.md
-  - docs/spec.md
 tags: [backfill, hooks, stop-hook-cost, doc-code-drift]
 closed_at: 2026-05-28
 ---

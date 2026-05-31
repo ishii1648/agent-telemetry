@@ -1,8 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - deploy/otel-collector/collector-config.yaml
-  - deploy/otel-collector/docker-compose.yaml
 tags: [otel, collector, recipe, ottl, datadog]
 closed_at: 2026-05-30
 ---

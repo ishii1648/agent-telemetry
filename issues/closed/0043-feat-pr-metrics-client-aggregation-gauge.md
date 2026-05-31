@@ -1,9 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/serverclient/
-  - internal/syncdb/schema/
-  - docs/spec.md
 depends_on: [0040, 0042]
 tags: [otel, export, metrics, gauge, pr-metrics]
 closed_at: 2026-05-30

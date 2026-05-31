@@ -1,9 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/serverclient/config.go
-  - internal/serverclient/flush.go
-  - internal/doctor/doctor.go
 tags: [otel, export, config, validation, datadog]
 closed_at: 2026-05-30
 ---

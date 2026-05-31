@@ -1,8 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/hook/posttooluse.go
-  - internal/sessionindex/update.go
 tags: [hooks, pr-binding, posttooluse, retro-revisit]
 closed_at: 2026-05-28
 ---

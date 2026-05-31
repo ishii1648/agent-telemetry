@@ -1,18 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - issues/
-  - AGENTS.md
-  - CLAUDE.md
-  - scripts/intent-lookup
-  - scripts/test_intent_lookup.py
-  - .claude/skills/intent-lookup/
-  - Makefile
-  - .github/workflows/intent.yml
-  - .github/pull_request_template.md
-# meta issue: 規約そのものを作る issue なので issues/ 全体を対象にするのが
-# legitimate。通常の issue でこのレベルの broad path を入れるのは避ける。
-lint_ignore_broad: [issues/]
 tags: [intent, decision-record, frontmatter, tooling, python]
 closed_at: 2026-05-10
 ---
@@ -255,3 +242,7 @@ issue 本文の例では当初 `make intent PATH=<p>` だったが、`PATH` は 
 ## 後続の発展
 
 - [0027](0027-process-deprecate-history-md.md) で `docs/history.md` 自体を廃止し、本 issue で位置付けた「issue が primary、history.md は事後ナラティブ要約」の二段構えを「issues/closed/ 一本化」に簡素化した。本 issue の「`docs/history.md` の位置付け変更」節と受け入れ条件にある history.md 関連の記述は、その時点で superseded された
+
+## Superseded 2026-05-31 by [0050](0050-design-deprecate-affected-paths-intent-lint.md)
+
+本 issue が導入した `affected_paths`（手書き path インデックス）と `intent-lint`（腐敗検出・`lint_ignore_*` 例外機構）は [0050](0050-design-deprecate-affected-paths-intent-lint.md) で廃止した。path 厳密マッチ（precision 投資）は agent の用途に対して過剰で、lint 一式の保守コストに見合わなかった。`intent-lookup` は「path → issue 全文 grep ＋ commit action 行」のゼロメンテ版に縮退し、why の鎖は git blame → PR → issue リンク（CI で強制）で辿る方式に移行した。frontmatter 規約（`decision_type` / `supersedes` / `tags` / `closed_at`）と issue 駆動・Contextual Commits は維持。

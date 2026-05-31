@@ -1,11 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/syncdb/
-  - internal/syncdb/schema/schema.sql
-  - grafana/dashboards/agent-telemetry.json
-  - grafana/provisioning/dashboards/
-  - grafana/provisioning/datasources/
 tags: [retro, dashboard, sqlite, grafana, visualization]
 closed_at: 2026-03-15
 ---

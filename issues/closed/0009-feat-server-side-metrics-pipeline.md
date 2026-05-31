@@ -1,8 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - docs/spec.md
-  - docs/design.md
 tags: [server, transport, multi-user]
 closed_at: 2026-05-10
 ---

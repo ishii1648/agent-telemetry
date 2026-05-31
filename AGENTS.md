@@ -39,7 +39,7 @@ Contextual Commits を使用。Conventional Commits プレフィックス + 構�
 
 `issues/` は **タスク兼意思決定記録** の primary store。バグ・課題・設計判断はここに Markdown としてライフサイクル管理する。GitHub Issues は使わない（ローカルで完結し、`git log` と同じ粒度で追跡できるため）。
 
-各 issue は frontmatter で「どの層の決定か（spec / design / implementation / process）」「どの code path に effect を持つか（`affected_paths`）」を構造化して持つ。`make intent P=<p>` / `scripts/intent-lookup <p>` は、この frontmatter とコミットの Contextual Commits 行をマージして引く **意図記録への逆引き索引** として機能する（意図そのものは issue 本文・docs・commit body 側にある。逆引きは候補を見落としにくくするための入口）。「複数コミット or 後続が参照しそうな決定」は issue 化する。1 コミットで完結する判断は Contextual Commits の action 行で十分。
+各 issue は frontmatter で「どの層の決定か（`decision_type`: spec / design / implementation / process）」を構造化して持つ。`make intent P=<p>` / `scripts/intent-lookup <p>` は、issue 本文の grep（対象 path への言及）とコミットの Contextual Commits 行をマージして引く **意図記録への逆引き索引** として機能する（意図そのものは issue 本文・docs・commit body 側にある。逆引きは候補を見落としにくくするための入口で、precision より recall に振っている）。手書きの path インデックス（旧 `affected_paths`）には依存しない。「複数コミット or 後続が参照しそうな決定」は issue 化する。1 コミットで完結する判断は Contextual Commits の action 行で十分。
 
 #### ディレクトリ構成
 
@@ -69,9 +69,6 @@ issues/
 ```markdown
 ---
 decision_type: spec | design | implementation | process
-affected_paths:
-  - internal/agent/codex/
-  - cmd/agent-telemetry/setup.go
 supersedes: [0023]
 tags: [hooks, multi-agent, packaging]
 closed_at: YYYY-MM-DD
@@ -97,18 +94,15 @@ Created: YYYY-MM-DD
 | フィールド | 型 | セマンティクス |
 |---|---|---|
 | `decision_type` | enum | `spec`（外部契約）/ `design`（内部設計）/ `implementation`（実装 detail）/ `process`（開発プロセス）。意思決定の層 |
-| `affected_paths` | string[] | path snapshot。issue が effect を持つ code / docs path（`/` 終端でディレクトリを表す）。rename は逆引き側が `git log --follow --name-only` で旧 path 候補を解決して吸収するため、path 自体は更新しなくてよい（更新してもよい） |
-| `supersedes` | int[] | 過去 issue 番号の配列（例: `[0023]`）。supersededBy への双方向参照は索引側で生成 |
+| `supersedes` | int[] | 過去 issue 番号の配列（例: `[0023]`）。supersededBy は superseding 側 issue の本文末尾に手書きで双方向参照を張る |
 | `tags` | string[] | free-form。当面は明示的な語彙統制を置かず、出現頻度から事後に整理する |
 | `closed_at` | date | close 時に確定（`YYYY-MM-DD`）。open / pending では省略可 |
-| `lint_ignore_broad` | string[] | `make intent-lint` の `affected_path_broad` 警告を path 単位で抑制（legitimate な broad path のみ。理由を YAML コメントで併記） |
-| `lint_ignore_missing` | string[] | `make intent-lint` の `affected_path_missing` 警告を path 単位で抑制（rename 予定 / 将来生成される path に使う。理由を YAML コメントで併記） |
 
-`affected_paths` は「`make intent P=<p>` で逆引きしたときに、この issue がヒットして欲しい path」を書く。粒度はファイル単位でもディレクトリ単位でもよい（broad な決定は親ディレクトリを、ピンポイントな決定は具体的なファイルを）。top-level dir 単独（例: `internal/`, `docs/`, `cmd/`）は逆引き時にノイズ massive になるため避ける（`make intent-lint` が警告する）。例外的に legitimate な broad / missing は `lint_ignore_broad` / `lint_ignore_missing` で **理由をコメント併記の上で** 抑制する。lint warning を放置すると索引としての信頼性が落ちるため、warning が出たら抑制 / 修正 / path の具体化のいずれかで対応する。
+逆引き（`make intent P=<p>`）は issue 本文に出てくる path 文字列を grep してヒットさせる（手書きの索引フィールドは持たない・保守しない）。そのため、影響する path（ディレクトリや主要ファイル）は概要 / 対応方針などの本文で自然に言及しておくと逆引きで拾われやすい。grep はクエリ path の祖先ディレクトリ（2 コンポーネント以上）も対象にするため、`internal/hook/` のようなディレクトリ言及で配下ファイルのクエリにもヒットする。precision より recall に振った入口なので、無関係寄りの候補が混じり得る前提で読む。
 
 #### 粒度の目安
 
-- **open 時**: 「なぜ取り組むか（根拠）」と「どの方針で進めるか（対応方針）」を中心に書く。実装手順や具体的なファイル名・関数名は書かない（PR / commit body に任せる）
+- **open 時**: 「なぜ取り組むか（根拠）」と「どの方針で進めるか（対応方針）」を中心に書く。実装手順や関数名・行レベルの詳細は書かない（PR / commit body に任せる）。ただし影響する path（ディレクトリや主要ファイル）への言及は構わない — 逆引きの grep がそれを拾う
 - **close 時**: `## 解決方法` と `## 採用しなかった代替` は **要点だけ**。実装ログ・コード差分の説明・行レベルの判断は commit body と PR description に書く
 - **目安**: open + close 合わせて 200 行を超えそうなら、本当に issue で記録すべき意思決定は何か再考する（実装詳細を切り出して別 issue / PR description に移す）
 - **例外**: 規約そのものを作る meta issue（例: 0011 自身）は、規約と実装例がセットで価値を持つため高密度になることを許容する。通常の issue でこの密度を求めない
@@ -127,7 +121,7 @@ Created: YYYY-MM-DD
 - 番号が小さい open issue から順に対応する
 - issue を新規作成したら同コミットで `issues/SEQUENCE` も `+1` する（失念防止）
 - 1 issue の close ごとに 1 コミットを基本とする
-- 関連 PR の説明冒頭に `issues/<id>-...` へのリンクを貼る（参考: [issues/closed/0022-design-pr-resolve-early-binding.md](issues/closed/0022-design-pr-resolve-early-binding.md) のリンク作法）。`.github/pull_request_template.md` がそのフォームを enforce する — PR description は薄く保ち、「なぜ」「方針」「却下案」は issue 側 / commit body 側に書く
+- 関連 PR の説明冒頭に `issues/<id>-...` へのリンクを貼る（参考: [issues/closed/0022-design-pr-resolve-early-binding.md](issues/closed/0022-design-pr-resolve-early-binding.md) のリンク作法）。`.github/workflows/intent.yml` が PR description の issue リンク（または issue を伴わない chore は `(N/A — chore)` 明記）を必須化し、欠落は merge をブロックする。これが why を必ず辿れる状態を担保する装置（git blame → commit → PR → issue リンク → issue 本文）。`.github/pull_request_template.md` がそのフォームを示す — PR description は薄く保ち、「なぜ」「方針」「却下案」は issue 側 / commit body 側に書く
 
 #### バグ発見時のフロー
 

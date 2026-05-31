@@ -1,12 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - docs/history.md
-  - .claude/skills/git-ship/
-  - internal/hook/
-# 0027 で docs/history.md 自体を廃止したため path 不在
-lint_ignore_missing:
-  - docs/history.md
 tags: [retro, documentation, release-notes, changelog]
 closed_at: 2026-05-02
 ---
