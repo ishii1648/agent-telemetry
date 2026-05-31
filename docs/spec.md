@@ -333,13 +333,13 @@ signals = ["logs"]
 |---|---|---|---|
 | `id` | string | （必須） | target の**安定 ID**。per-target cursor（後述 `flush_cursors`）のキー。URL を変えても cursor を保つため endpoint とは別に持つ。重複は起動エラー |
 | `endpoint` | string | （必須） | **base URL**（signal path を含めない）。クライアントが signal path を補完する（**endpoint モデル**節を参照） |
-| `token` | string | （必須） | 認証用 credential。`${VAR}` のみ環境変数展開する（秘密を config に直書きしない direct レシピ向け） |
+| `token` | string | （認証が必要な backend でのみ必須） | 認証用 credential。認証なしのローカル Collector（OSS observability レシピ）では省略可で、その target も送信対象になる。`${VAR}` のみ環境変数展開する（秘密を config に直書きしない direct レシピ向け） |
 | `auth_header` | string | `Authorization` | credential を載せる HTTP ヘッダ名。Datadog は `dd-api-key` |
 | `auth_scheme` | string | `Authorization` 時は `Bearer`、それ以外は空 | ヘッダ値の prefix。空なら raw token（`dd-api-key: <token>`）、非空なら `<scheme> <token>`（`Authorization: Bearer <token>`） |
 | `encoding` | string | `json` | wire encoding。`json`（自前サーバ / Collector）または `protobuf`（Datadog direct logs は protobuf 必須） |
 | `signals` | array | `["logs"]` | 送る representation。`logs`（raw events / OTLP Logs）と `metrics`（`pr_metrics` gauge / OTLP Metrics、後述「`pr_metrics` gauge representation」節）の 2 種。両方指定可（`["logs", "metrics"]`）で、representation ごとに別 cursor で独立に前進する |
 
-設定された target が 1 つも無い、または全 target の `endpoint`/`token` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。`signals` に `logs` を含む target だけが logs flush の対象、`metrics` を含む target だけが metrics flush の対象になる（両 representation は同一 flush 内で別経路として処理される）。
+設定された target が 1 つも無い、または全 target の `endpoint` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。target が configured とみなされる条件は **`endpoint` が非空**であること（`token` の有無は問わない）。`endpoint` を持つ一部 target だけが誤設定（`endpoint` 空）の場合は、その target の id を stderr に明示してスキップする（黙殺しない）。`signals` に `logs` を含む target だけが logs flush の対象、`metrics` を含む target だけが metrics flush の対象になる（両 representation は同一 flush 内で別経路として処理される）。
 
 #### endpoint モデル（base + signal path 補完）
 

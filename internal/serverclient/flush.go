@@ -48,6 +48,15 @@ type FlushOptions struct {
 
 type FlushResult struct {
 	PerAgent map[string]*FlushAgentResult
+
+	// Misconfigured lists target ids that are present in config but skipped
+	// because they have no endpoint — a genuine misconfiguration (e.g. an
+	// [[export]] with an id but a missing or typo'd endpoint), as opposed to the
+	// intentional opt-out of having no targets at all (NoConfig). Surfaced on
+	// stderr so a silently-dropped target is distinguishable from "not
+	// configured" (issue 0051). A tokenless local collector is NOT listed here:
+	// the token is optional and such a target is Configured().
+	Misconfigured []string
 }
 
 // FlushAgentResult collects the per-target outcomes for one coding agent.
@@ -192,6 +201,14 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 	}
 
 	res := &FlushResult{PerAgent: make(map[string]*FlushAgentResult, len(agents))}
+	// Flag targets that are in config but cannot be sent to because they lack an
+	// endpoint. Without this they would be skipped silently (issue 0051); naming
+	// them lets the user tell a typo'd endpoint apart from an intentional opt-out.
+	for _, t := range targets {
+		if !t.Configured() {
+			res.Misconfigured = append(res.Misconfigured, t.ID)
+		}
+	}
 	var firstErr error
 	for _, a := range agents {
 		ar, err := runFlushForAgent(ctx, db, a, targets, opts)
@@ -684,7 +701,13 @@ func doPost(ctx context.Context, client *http.Client, t ExportTarget, endpoint s
 		return nil, 0, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
+	// Attach the credential header only when a token is configured. A tokenless
+	// local collector (issue 0051) gets no auth header at all — sending an empty
+	// "Bearer " value risks a fronting proxy rejecting it as malformed. An
+	// auth-required backend whose token is missing then 401s visibly instead.
+	if t.Token != "" {
+		req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
+	}
 	if contentEncoding != "" {
 		req.Header.Set("Content-Encoding", contentEncoding)
 	}
@@ -728,6 +751,9 @@ func authValue(scheme, token string) string {
 }
 
 func (r *FlushResult) Summarize(w io.Writer) {
+	if len(r.Misconfigured) > 0 {
+		fmt.Fprintf(w, "flush: export target %s は endpoint が空のためスキップしました（誤設定の可能性。token は認証なし backend では不要ですが endpoint は必須です）\n", strings.Join(r.Misconfigured, ", "))
+	}
 	names := make([]string, 0, len(r.PerAgent))
 	for name := range r.PerAgent {
 		names = append(names, name)

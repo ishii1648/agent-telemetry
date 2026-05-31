@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -315,5 +316,74 @@ func TestFlush_PerTargetCursorIndependence(t *testing.T) {
 	}
 	if st.FlushCursors["bad"] != 0 {
 		t.Errorf("bad cursor: got %d, want 0 (held)", st.FlushCursors["bad"])
+	}
+}
+
+// TestFlush_TokenlessTargetSends pins issue 0051 end to end: a target with an
+// endpoint but no token (the OSS observability recipe) is a real flush
+// destination — it actually POSTs and advances its cursor, instead of being
+// silently skipped with exit 0. The auth header still goes out, but with an
+// empty value (no Bearer prefix on an empty token would be "Bearer ", so we
+// assert the raw empty value only via a successful send + cursor advance).
+func TestFlush_TokenlessTargetSends(t *testing.T) {
+	env := newFlushTestEnv(t)
+	env.seedEvents(2)
+	env.writeConfig("[[export]]\n" +
+		"id = \"oss-collector\"\n" +
+		"endpoint = \"" + env.server.URL + "\"\n" +
+		"signals = [\"logs\"]\n")
+
+	res, err := env.run()
+	if err != nil {
+		t.Fatalf("tokenless flush must not error: %v", err)
+	}
+	ar := res.PerAgent["claude"]
+	if ar.NoConfig {
+		t.Fatal("tokenless target must not be treated as NoConfig")
+	}
+	tr := ar.Targets["oss-collector"]
+	if tr == nil || tr.Sent != 2 {
+		t.Fatalf("tokenless target should have sent 2 events: %+v", tr)
+	}
+	if len(env.requests) == 0 {
+		t.Error("expected a network call for the tokenless target")
+	}
+	// A tokenless target must send no credential header — an empty "Bearer "
+	// value could be rejected by a fronting proxy as malformed (round-1 review).
+	if av := env.lastRequest().authValue; av != "" {
+		t.Errorf("tokenless target should send no auth header, got %q", av)
+	}
+	if got := env.loadState().FlushCursors["oss-collector"]; got != 2 {
+		t.Errorf("cursor: got %d, want 2", got)
+	}
+}
+
+// TestFlush_MisconfiguredTargetSurfaced pins the other half of issue 0051: a
+// target present in config but missing an endpoint is skipped, yet its id is
+// reported in FlushResult.Misconfigured (and on stderr via Summarize) so the
+// user can tell a typo from an intentional opt-out.
+func TestFlush_MisconfiguredTargetSurfaced(t *testing.T) {
+	env := newFlushTestEnv(t)
+	env.seedEvents(1)
+	// One healthy target plus one with no endpoint at all.
+	env.writeConfig("[[export]]\n" +
+		"id = \"healthy\"\n" +
+		"endpoint = \"" + env.server.URL + "\"\n" +
+		"token = \"t\"\n\n" +
+		"[[export]]\n" +
+		"id = \"broken\"\n" +
+		"signals = [\"logs\"]\n")
+
+	res, err := env.run()
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if len(res.Misconfigured) != 1 || res.Misconfigured[0] != "broken" {
+		t.Errorf("Misconfigured: got %v, want [broken]", res.Misconfigured)
+	}
+	var buf strings.Builder
+	res.Summarize(&buf)
+	if !strings.Contains(buf.String(), "broken") {
+		t.Errorf("Summarize should name the misconfigured target: %q", buf.String())
 	}
 }
