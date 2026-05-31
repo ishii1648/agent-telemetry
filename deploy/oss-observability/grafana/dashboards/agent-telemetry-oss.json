@@ -605,36 +605,6 @@
         "text": { "valueSize": 30 },
         "legend": { "showLegend": false }
       }
-    },
-    {
-      "id": 103,
-      "title": "Raw events — Loki / OTLP Logs",
-      "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
-      "collapsed": false,
-      "panels": []
-    },
-    {
-      "id": 6,
-      "title": "Raw events (Loki / OTLP Logs)",
-      "description": "OTel Collector 経由で Loki に流れた raw events（OTLP Logs）。PR 集約 gauge では追えない個々のイベントを LogQL でドリルダウンする",
-      "type": "logs",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 49 },
-      "datasource": { "type": "loki", "uid": "oss-loki" },
-      "options": {
-        "dedupStrategy": "none",
-        "enableLogDetails": true,
-        "showTime": true,
-        "sortOrder": "Descending",
-        "wrapLogMessage": true
-      },
-      "targets": [
-        {
-          "datasource": { "type": "loki", "uid": "oss-loki" },
-          "expr": "{service_name=\"agent-telemetry\"}",
-          "refId": "A"
-        }
-      ]
     }
   ],
   "refresh": "10s",

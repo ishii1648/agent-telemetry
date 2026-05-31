@@ -52,7 +52,6 @@ hooks
    - **状態評価（Tier 2）** — merged PRs / total tokens / PR per 1M tokens の stat と週別 merged PR 数 trend。既存 `agent_pr_*` gauge を `last_over_time` で集約した近似。⚠ `pr_metrics`（`is_merged = 1` 限定）由来なので「merged-PR に寄与した分」であり全 session 総量ではない（各パネル description に明記）。
    - **session-grain（Tier 3）** — top-level sessions 数 stat と週別 token 消費 / 週別 tokens per session / 週別 ask_user_question per session の barchart。`weekly_session_metrics` VIEW を client 評価して送る `agent_weekly_session_*` gauge 由来で、`week_start`（JST 月曜起点）を label に載せて PromQL `[1w]` 窓の境界ずれを回避する。`pr_metrics` と違い非 PR・未マージを含む全 top-level session を session 単位で集計する。
    - **PR 単位の外れ値検出（Tier 1）** — PR 別 token スコアカード / session_count / tokens per tool_use。
-   - **Raw events（Tier 1）** — Loki の OTLP Logs。
 
    session-grain（Tier 3）は [issues/closed/0053](../../issues/closed/0053-design-otel-dashboard-tier2-tier3-restore.md) で実装済み。並列度（Tier 4）は [issues/0054](../../issues/closed/0054-design-abandon-concurrency-metrics-otel.md) で abandon。
 

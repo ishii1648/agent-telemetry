@@ -128,7 +128,7 @@ FROM="now-30d"; TO="now"; SCALE=2; TZ="Asia/Tokyo"
 VAR="var-coding_agent=\$__all"
 W=1600; H=600
 
-# panelId:name (rows 100-103 are headers, skipped)
+# panelId:name (rows 100-102 are headers, skipped)
 declare -a PANELS=(
   "24:tier2-merged-prs"
   "25:tier2-total-tokens"
@@ -141,7 +141,6 @@ declare -a PANELS=(
   "2:tier1-pr-scorecard:${W}:900"
   "14:tier1-session-count"
   "15:tier1-tokens-per-tool-use"
-  "6:tier1-raw-events"
 )
 for entry in "${PANELS[@]}"; do
   IFS=: read -r ID NAME PW PH <<< "$entry"
