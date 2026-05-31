@@ -6,6 +6,7 @@ affected_paths:
   - docs/design.md
   - site/content/setup/server/
 tags: [otel, collector, oss, mimir, loki, grafana]
+closed_at: 2026-05-31
 ---
 
 # OSS observability backend のローカル compose レシピを追加する
@@ -71,3 +72,17 @@ Datadog に近い OSS baseline を作れる。
   Datadog Logs 相当として検証できない。
 - 既存 `deploy/otel-collector/` を直接拡張: Datadog recipe と OSS recipe の目的が
   混ざるため、新規ディレクトリに分ける。
+
+Completed: 2026-05-31
+
+## 解決方法
+
+`deploy/oss-observability/` に Collector push 型のローカル E2E compose レシピを追加した（対応方針 1〜5 を実装）。
+
+- Collector は OTLP/HTTP `:4318` で受け、metrics は Mimir の OTLP ingest（`/otlp/v1/metrics`）、logs は Loki 3.x の native OTLP（`/otlp/v1/logs`）へ `otlphttp` で push（対応方針 2）。
+- Grafana は Mimir(PromQL)/Loki(LogQL) datasource と専用 dashboard `agent-telemetry (OSS backend)` を provisioning。既存 SQLite dashboard とは別系統（Grafana port を `:13001` に分離、対応方針 3）。
+- client `config.toml.example` は `endpoint = "http://localhost:4318"` / `encoding = "json"` / `signals = ["logs", "metrics"]`（対応方針 4）。
+- service / config / volume は Kubernetes（Deployment + ConfigMap + PVC）に移しやすい単位で分割（対応方針 5、README に対応表）。
+- 再現性のため Collector(0.153.0) / Mimir(2.14.2) / Loki(3.3.2) / Grafana(11.5.2) を image pin。`docs/spec.md`・`docs/design.md`・`site/content/setup/server/` も同 PR で同期更新。
+
+E2E では合成 OTLP payload で `agent_pr_total_tokens` gauge が dimension 付きで Mimir に届き、`service.name` が Mimir の `job` ラベル・Loki の `service_name` ラベルへ昇格することを確認済み。
