@@ -413,10 +413,12 @@ SQLite を Grafana datasource から外し otel+grafana に一本化する移行
 
 採用した式（`agent_pr_total_tokens` を代表に、いずれも sparse gauge なので `last_over_time([$__range])` で range 内最終値を拾う。naive な `sum`/instant では flush 直後 5 分しか出ない・二重計上になる、は metrics.md の gauge range 集計の前提と整合）:
 
-- total tokens stat: `sum(last_over_time(agent_pr_total_tokens[$__range]))`
+- total tokens stat: `sum(max by (pr_url, coding_agent, user_id) (last_over_time(agent_pr_total_tokens[$__range])))`
 - merged PRs stat: `count(group by (pr_url) (last_over_time(agent_pr_total_tokens[$__range])))`
-- PR / 1M tokens stat: `count(group by (pr_url)(...)) * 1e6 / sum(...)`
+- PR / 1M tokens stat: `count(group by (pr_url)(...)) * 1e6 / sum(max by (pr_url, coding_agent, user_id)(...))`
 - 週別 merged PR 数 trend: `count by (coding_agent)(group by (pr_url, coding_agent)(last_over_time(...[$__interval])))` を 1w step の range クエリで評価
+
+**volatile label の二重計上対策**: gauge の系列 identity は `(pr_url, coding_agent, user_id, task_type, model)` だが、client の集約 grain は `(pr_url, coding_agent, user_id)`（`task_type`/`model` は代表値ラベル）。range 内で代表 `model`/`task_type` が変わると同一 PR が複数系列として残り、素の `sum` は累積 `total_tokens` を水増しする。そのため sum 系（total tokens / PR per 1M の分母）は `max by (pr_url, coding_agent, user_id)`（= 累積値の最新を表す max）で安定キーに畳んでから合算する。`count`/`group by` 系（merged PRs・週別 trend）は元々畳むため影響を受けない。
 
 **semantic drift を各パネル description に明示する**のが Tier 2 採用の条件。`agent_pr_*` は `pr_metrics`（`is_merged = 1` 限定）の集約なので、これらは「全 session の総量」ではなく「merged-PR に寄与した分」になり、非 PR・未マージ・放棄 session を取りこぼす。曖昧なまま出すと「全活動の総量」と誤読されるため、誤読を防ぐ description を必須とした（merged PRs stat だけは merged 限定の母集団そのものを数えるので近似ではなく一致）。週別 trend は SQLite 版の weekday-0（JST 月曜）起点カレンダー週と境界がずれる rolling/step バケットになる近似で、これも description に記す。
 

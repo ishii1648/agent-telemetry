@@ -61,7 +61,7 @@ hooks
 
 | backend | データソース | クエリ例 |
 |---|---|---|
-| Mimir | PromQL | `sum by (coding_agent) (last_over_time(agent_pr_total_tokens[$__range]))` |
+| Mimir | PromQL | `sum by (coding_agent) (max by (pr_url, coding_agent, user_id) (last_over_time(agent_pr_total_tokens[$__range])))`（total tokens; 安定キー dedup） |
 | Mimir | PromQL | `topk(10, last_over_time(agent_pr_total_tokens[$__range]))` |
 | Mimir | PromQL | `count(group by (pr_url) (last_over_time(agent_pr_total_tokens[$__range])))`（merged PR 数） |
 | Loki | LogQL | `{service_name="agent-telemetry"}` |

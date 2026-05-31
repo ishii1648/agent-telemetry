@@ -54,14 +54,14 @@
     {
       "id": 25,
       "title": "total tokens (merged-PR 寄与分)",
-      "description": "merged-PR に寄与した総 token（input + output + cache_write + cache_read + reasoning）。⚠ semantic drift: `agent_pr_*` gauge は `pr_metrics`（is_merged=1 限定）由来なので、これは「全 session の総量」ではなく merged-PR に紐づいた分だけ。非 PR・未マージ・放棄 session の消費は含まない。`sum(last_over_time([$__range]))` で range 内の各 PR の最終値を合算する。単位: K=千、Mil=100万、Bil=10億。",
+      "description": "merged-PR に寄与した総 token（input + output + cache_write + cache_read + reasoning）。⚠ semantic drift: `agent_pr_*` gauge は `pr_metrics`（is_merged=1 限定）由来なので、これは「全 session の総量」ではなく merged-PR に紐づいた分だけ。非 PR・未マージ・放棄 session の消費は含まない。集計は `sum(max by (pr_url, coding_agent, user_id)(last_over_time([$__range])))`: gauge は `(pr_url, coding_agent, user_id, task_type, model)` 単位の系列だが client の集約 grain は `(pr_url, coding_agent, user_id)` なので、range 内で代表 model/task_type が変わって複数系列が残っても安定キーで `max`（= 累積 total の最新値）に畳んでから合算し二重計上を防ぐ。単位: K=千、Mil=100万、Bil=10億。",
       "type": "stat",
       "gridPos": { "h": 5, "w": 8, "x": 8, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "oss-mimir" },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "oss-mimir" },
-          "expr": "sum(last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "expr": "sum(max by (pr_url, coding_agent, user_id) (last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range])))",
           "instant": true,
           "refId": "A"
         }
@@ -91,14 +91,14 @@
     {
       "id": 12,
       "title": "PR / 1M tokens (merged-PR 寄与分)",
-      "description": "100万 token あたりに完了した merged PR 数（効率の逆数指標）。`count(group by (pr_url)(...)) * 1e6 / sum(...)` で range 全体を一括集計する。⚠ semantic drift: 分子・分母とも `pr_metrics`（is_merged=1 限定）由来の gauge なので、非 PR・未マージ・放棄 session を取りこぼす。「全活動の効率」ではなく「merged-PR に寄与した token あたりの PR 産出効率」。",
+      "description": "100万 token あたりに完了した merged PR 数（効率の逆数指標）。`count(group by (pr_url)(...)) * 1e6 / sum(max by (pr_url, coding_agent, user_id)(...))` で range 全体を一括集計する（分母は total tokens stat と同じ安定キー dedup で二重計上を防ぐ）。⚠ semantic drift: 分子・分母とも `pr_metrics`（is_merged=1 限定）由来の gauge なので、非 PR・未マージ・放棄 session を取りこぼす。「全活動の効率」ではなく「merged-PR に寄与した token あたりの PR 産出効率」。",
       "type": "stat",
       "gridPos": { "h": 5, "w": 8, "x": 16, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "oss-mimir" },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "oss-mimir" },
-          "expr": "count(group by (pr_url) (last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range]))) * 1e6 / sum(last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "expr": "count(group by (pr_url) (last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range]))) * 1e6 / sum(max by (pr_url, coding_agent, user_id) (last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range])))",
           "instant": true,
           "refId": "A"
         }
@@ -482,6 +482,6 @@
   "timezone": "Asia/Tokyo",
   "title": "agent-telemetry (OSS backend)",
   "uid": "agent-telemetry-oss",
-  "version": 4,
+  "version": 5,
   "weekStart": ""
 }
