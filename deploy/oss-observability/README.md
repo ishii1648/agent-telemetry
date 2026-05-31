@@ -22,7 +22,7 @@ hooks
 
 ## 使い方
 
-1. compose を起動。リポジトリルートから `make oss-up`（停止は `make oss-down`）で 1 コマンド起動できる。SQLite + Grafana（`make grafana-up`）に代わるローカル第一級の可視化選択肢（issue [0055](../../issues/0055-design-local-otel-visualization-migration.md) ①）。port / 環境を変えたい・生コマンドで上げたい場合は `DEPLOY_ENV`（Grafana 上の `deployment.environment` 表示用、未設定なら `dev`）を設定して:
+1. compose を起動。リポジトリルートから `make oss-up`（停止は `make oss-down`）で 1 コマンド起動できる。SQLite + Grafana（`make grafana-up`）に代わるローカル第一級の可視化選択肢（issue [0055](../../issues/0055-design-local-otel-visualization-migration.md) ①）。Grafana は `:13001` で上がる。port を変えたい場合、make 経由は `OSS_GRAFANA_PORT=<port> make oss-up`（recipe が compose の `GRAFANA_PORT` に渡すため `make oss-up GRAFANA_PORT=<port>` は効かない）。port / 環境を細かく変えたい・生コマンドで上げたい場合は `DEPLOY_ENV`（Grafana 上の `deployment.environment` 表示用、未設定なら `dev`）を設定して:
 
    ```fish
    cd deploy/oss-observability
