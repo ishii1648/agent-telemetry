@@ -60,7 +60,11 @@ Contextual Commits を使用。Conventional Commits プレフィックス + 構�
 
 ### PR description の issue リンク必須（pr-issue-link）
 
-`.github/workflows/intent.yml` の `pr-issue-link` チェックが **全 PR の本文**に「issue リンク（`issues/NNNN-<cat>-<slug>.md` の文字列を含む）」または `(N/A — chore)` の明示を必須化する。どちらも無いと merge がブロックされる。**PR 作成時（`git-ship` 含む）は本文に必ずどちらかを入れる**こと。後付けで本文だけ編集した場合は、その編集イベントで走った run が古い本文で失敗扱いのまま残ることがあるので、`git push`（synchronize イベント）で現本文を再評価させて緑にする。ルール本体（issue 化の要否・命名・SEQUENCE 運用）は AGENTS.md「issues について」を正とする。
+`.github/workflows/intent.yml` の `pr-issue-link` チェックが **全 PR の本文**に「issue リンク」または `(N/A — chore)` の明示を必須化する。どちらも無いと merge がブロックされる。**PR 作成時（`git-ship` 含む）は本文に必ずどちらかを入れる**こと。
+
+- 受理される issue パスは **open / closed / pending のどれでも可**: 正規表現は `issues/(closed/|pending/)?[0-9]{4}-` なので `issues/NNNN-` / `issues/closed/NNNN-` / `issues/pending/NNNN-` がマッチする（self-main の絶対 URL 内でも可）。同一 PR で issue を `git mv` して closed/ に格納する場合は closed/ パスを貼ってよい。
+- チェックは `pull_request` の `synchronize`（= push）でのみ本文を再評価する。`edited`（本文だけ編集）では再走しないため、**後付けで本文を直したら `git push`（空コミット可: 前例 `chore(...): re-trigger CI to re-evaluate updated PR body`）で synchronize を発火**させて緑にする。
+- ルール本体（issue 化の要否・命名・SEQUENCE 運用）は AGENTS.md「issues について」を正とする。
 
 ### テスト
 

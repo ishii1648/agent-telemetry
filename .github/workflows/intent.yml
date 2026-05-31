@@ -10,6 +10,11 @@ jobs:
   # PR description must link a related issue (the why lives in issues/), or
   # explicitly declare N/A for issue-less chores. This replaces the old
   # affected_paths lint as the device that keeps the why discoverable.
+  #
+  # The regex accepts the issue path in any lifecycle location: open
+  # (issues/NNNN-), closed (issues/closed/NNNN-), and pending
+  # (issues/pending/NNNN-). A PR that resolves and `git mv`s an issue to
+  # closed/ in the same change should be able to link the closed/ path.
   pr-issue-link:
     runs-on: ubuntu-latest
     steps:
@@ -17,7 +22,7 @@ jobs:
         env:
           BODY: ${{ github.event.pull_request.body }}
         run: |
-          if printf '%s' "$BODY" | grep -Eq 'issues/[0-9]{4}-|\(N/A'; then
+          if printf '%s' "$BODY" | grep -Eq 'issues/(closed/|pending/)?[0-9]{4}-|\(N/A'; then
             echo "OK: PR description references an issue or declares N/A."
           else
             echo "::error::PR description must link a related issue (issues/NNNN-<cat>-<slug>.md) or state '(N/A — chore)'." >&2
