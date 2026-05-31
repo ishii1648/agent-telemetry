@@ -22,7 +22,7 @@ Claude Code の `Stop` hook を `"async": true` で登録し、hook プロセス
 
 ## 対応方針
 
-Claude Code v2.1.0+ の Command hook フィールド `"async": true`（公式 hooks reference: https://code.claude.com/docs/en/hooks）で `Stop` hook を登録する。Claude Code は hook をバックグラウンド起動して exit を待たないため、応答サイクルの待ちが消える。detach worker とは相補的（worker は重い処理を、async は hook プロセス待ちを隠す）。
+Claude Code v2.1.0+ の Command hook フィールド `"async": true`（[公式 hooks reference](https://code.claude.com/docs/en/hooks)）で `Stop` hook を登録する。Claude Code は hook をバックグラウンド起動して exit を待たないため、応答サイクルの待ちが消える。detach worker とは相補的（worker は重い処理を、async は hook プロセス待ちを隠す）。
 
 Completed: 2026-06-01
 
