@@ -1,6 +1,6 @@
 # OSS observability レシピ（Collector → Mimir / Loki / Grafana）
 
-`agent-telemetry flush` の OTLP/HTTP **Logs と Metrics** を **OTel Collector 経由**で OSS backend に push し、Grafana の PromQL / LogQL で確認するローカル E2E 構成（issue [0050](../../issues/0050-feat-oss-observability-local-compose.md)）。
+`agent-telemetry flush` の OTLP/HTTP **Logs と Metrics** を **OTel Collector 経由**で OSS backend に push し、Grafana の PromQL / LogQL で確認するローカル E2E 構成（issue [0050](../../issues/closed/0050-feat-oss-observability-local-compose.md)）。
 
 Datadog レシピ（[`../otel-collector/`](../otel-collector/)）と同じ「Collector が backend へ push する」構成を、credential 不要の OSS で再現するのが目的。Prometheus scrape（pull 型）では Datadog exporter と運用感・失敗点がずれるため、あえて push 経路で揃える。
 

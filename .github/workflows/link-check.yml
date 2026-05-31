@@ -32,6 +32,11 @@ jobs:
         with:
           # Markdown 全般 + Hugo content をチェック対象にする
           # docs/archive/ は過去の意思決定記録（凍結）で削除済みファイルへの link 切れを許容する
+          # --remap: 自リポジトリの tree/main・blob/main 絶対 URL を checkout 済みの
+          #   local file に向け直す。同一 PR で新規追加したファイル/dir を main URL で
+          #   参照しても merge 前に 404 にならず（forward reference の false positive 回避）、
+          #   typo は local file 不在として引き続き検出される。\$1 は lychee の置換用 capture
+          #   なので、entrypoint の `eval lychee ${ARGS}` で消費されないよう backslash で escape する。
           args: >-
             --no-progress
             --max-retries 2
@@ -41,6 +46,7 @@ jobs:
             --exclude-path site/public
             --exclude-path site/resources
             --exclude-path docs/archive
+            --remap "https://github.com/ishii1648/agent-telemetry/(?:tree|blob)/main/(.*) file://${{ github.workspace }}/\$1"
             './**/*.md'
           fail: true
           token: ${{ secrets.GITHUB_TOKEN }}
