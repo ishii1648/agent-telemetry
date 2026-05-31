@@ -491,9 +491,11 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 
 attribute 意味分類の表本体と 2 配布形式（direct 用 Datadog Logs Pipeline / collector 用 Collector processor サンプル）は `docs/spec.md`「OTLP export の attribute 意味分類」を正とし、本節には複製しない。各メトリクスが「client 集約 gauge をそのまま使う / raw events から backend formula で出す」のどちらで表現されるかは `docs/metrics.md` を参照する。
 
-#### OSS observability ローカル検証レシピ（`deploy/oss-observability/`）
+#### OSS observability ローカルスタック（`deploy/oss-observability/`）
 
 collector レシピと同じ「Collector が backend へ push する」経路を、credential 不要の OSS（Mimir / Loki / Grafana）でローカル E2E 再現する検証用構成（[issues/0050](../issues/closed/0050-feat-oss-observability-local-compose.md)）。Prometheus の scrape（pull）型で検証すると Datadog exporter と失敗点（OTLP push の経路・`service.name` の昇格）がずれるため、あえて Collector push 経路に揃え、metrics は Mimir・logs は Loki に流す（`service.name` は Mimir で `job` ラベル・Loki で `service_name` ラベルに昇格する）。既存 SQLite ダッシュボードとは別系統の検証用ダッシュボードとして切り、single-process・filesystem storage の検証用最小構成にとどめることで、service / config / volume を Kubernetes manifest に移しやすい単位で分割している。
+
+`make oss-up` / `oss-down` / `oss-flush`（`Makefile`）でこの compose を 1 コマンドで起動・停止し、token 不要の `config.toml.example` で hook の OTLP export（flush → Collector:4318）を流せる。これにより本スタックは検証専用ではなく、ローカル単独利用での **第一級の可視化選択肢**（SQLite + Grafana の代替）として使える（issue [0055](../issues/0055-design-local-otel-visualization-migration.md) ① runtime cutover）。SQLite を client 側 SoR に降格して Grafana から読まなくする明文化（0055 ③）は別 PR のため、現時点では SQLite + Grafana（`make grafana-up`）も既定として残す。
 
 ### プロトコル — OTLP/HTTP Logs
 

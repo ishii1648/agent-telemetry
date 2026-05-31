@@ -1,4 +1,4 @@
-.PHONY: build install uninstall grafana-fixtures grafana-up grafana-up-e2e grafana-down grafana-screenshot lint-dashboard intent test-intent docs-serve docs-build docs-mod-update
+.PHONY: build install uninstall grafana-fixtures grafana-up grafana-up-e2e grafana-down grafana-screenshot oss-up oss-down oss-flush lint-dashboard intent test-intent docs-serve docs-build docs-mod-update
 
 PREFIX ?= $(HOME)/.local
 BIN_DIR := $(PREFIX)/bin
@@ -15,6 +15,12 @@ GRAFANA_PORT         ?= 13010
 GRAFANA_E2E_PORT     ?= 13011
 COMPOSE_PROJECT_REAL ?= agent-telemetry-real
 COMPOSE_PROJECT_E2E  ?= agent-telemetry-e2e
+
+# OSS observability スタック（otel ローカル可視化: Collector -> Mimir/Loki -> Grafana）。
+# SQLite + Grafana（上の grafana-up）とは別 port / 別 project にして共存させる。
+OSS_COMPOSE          ?= deploy/oss-observability/docker-compose.yaml
+OSS_GRAFANA_PORT     ?= 13001
+COMPOSE_PROJECT_OSS  ?= agent-telemetry-oss
 
 build:
 	CGO_ENABLED=0 go build -o bin/$(BIN_NAME) ./cmd/agent-telemetry/
@@ -67,6 +73,27 @@ grafana-up-e2e: grafana-fixtures
 grafana-down:
 	-docker compose -p $(COMPOSE_PROJECT_REAL) down
 	-docker compose -p $(COMPOSE_PROJECT_E2E) down
+
+# otel ローカル可視化スタックを 1 コマンドで起動する。
+#   Collector(:4318) -> Mimir/Loki -> Grafana(:$(OSS_GRAFANA_PORT))
+# SQLite + Grafana に代わるローカル第一級の可視化選択肢（issue 0055 ①）。
+oss-up:
+	GRAFANA_PORT=$(OSS_GRAFANA_PORT) \
+	    docker compose -f $(OSS_COMPOSE) -p $(COMPOSE_PROJECT_OSS) up -d
+	@echo "Grafana (otel): http://localhost:$(OSS_GRAFANA_PORT)  (anonymous admin)"
+	@echo "Collector OTLP/HTTP: http://localhost:4318"
+	@echo "Export hook data: make oss-flush"
+	@echo "First time: cp deploy/oss-observability/config.toml.example ~/.config/agent-telemetry/config.toml"
+
+oss-down:
+	-docker compose -f $(OSS_COMPOSE) -p $(COMPOSE_PROJECT_OSS) down
+
+# 現在のツリーをビルド（古い導入済みバイナリに引っ張られない）してから
+# hook データをスタックへ流す。flush は VIEW を作らないので sync-db を先に
+# 走らせて pr_metrics VIEW と PR 集約を最新化する。
+oss-flush: build
+	bin/$(BIN_NAME) sync-db
+	bin/$(BIN_NAME) flush
 
 grafana-screenshot: grafana-up-e2e
 	GRAFANA_PORT=$(GRAFANA_E2E_PORT) bash e2e/screenshot.sh .outputs/grafana-screenshots

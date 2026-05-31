@@ -357,7 +357,7 @@ Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metri
 | レシピ | client encoding | credential の所在 | 補足 |
 |---|---|---|---|
 | **direct** | backend に依存（Datadog logs は `protobuf`） | client（submit-only key） | 個人 / 小チーム向け。追加プロセス無し。Datadog direct は protobuf + `dd-api-key` |
-| **collector** | `json`（変更不要） | Collector が 1 箇所集約（client は秘密なし） | team / 多 client 向け。Collector が protobuf + `dd-api-key` 変換と fanout を担う。レシピは `deploy/otel-collector/`。credential 不要で同じ collector push 構成をローカル再現する OSS 検証用レシピは [`deploy/oss-observability/`](../deploy/oss-observability/)（Mimir/Loki/Grafana） |
+| **collector** | `json`（変更不要） | Collector が 1 箇所集約（client は秘密なし） | team / 多 client 向け。Collector が protobuf + `dd-api-key` 変換と fanout を担う。レシピは `deploy/otel-collector/`。credential 不要で同じ collector push 構成をローカル再現する OSS ローカルスタックは [`deploy/oss-observability/`](../deploy/oss-observability/)（Mimir/Loki/Grafana。`make oss-up` で 1 コマンド起動でき、ローカル単独利用での第一級の可視化選択肢。issue 0055 ①） |
 
 ### `agent-telemetry flush` のフラグ
 

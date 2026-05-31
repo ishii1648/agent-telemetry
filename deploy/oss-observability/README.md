@@ -22,7 +22,7 @@ hooks
 
 ## 使い方
 
-1. compose を起動（`DEPLOY_ENV` は Grafana 上の `deployment.environment` 表示用、未設定なら `dev`）:
+1. compose を起動。リポジトリルートから `make oss-up`（停止は `make oss-down`）で 1 コマンド起動できる。SQLite + Grafana（`make grafana-up`）に代わるローカル第一級の可視化選択肢（issue [0055](../../issues/0055-design-local-otel-visualization-migration.md) ①）。port / 環境を変えたい・生コマンドで上げたい場合は `DEPLOY_ENV`（Grafana 上の `deployment.environment` 表示用、未設定なら `dev`）を設定して:
 
    ```fish
    cd deploy/oss-observability
@@ -42,7 +42,7 @@ hooks
    signals = ["logs", "metrics"]
    ```
 
-3. flush を実行:
+3. flush を実行（リポジトリルートからは `make oss-flush` がビルド + `sync-db` + `flush` を一括実行する。導入済みバイナリが古い場合に便利）:
 
    ```fish
    agent-telemetry flush
