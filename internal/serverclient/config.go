@@ -62,11 +62,20 @@ type ExportTarget struct {
 	Signals    []string // representations to send: "logs" (this issue), "metrics" (0043)
 }
 
-// Configured reports whether the target can attempt a network call. An empty
-// endpoint or token is treated as "not opted in" rather than an error, so
-// flush stays safe in cron.
+// Configured reports whether the target can attempt a network call. A target is
+// opted in once it has an endpoint and at least one signal: the token is
+// required only by backends that authenticate (Bearer / api-key), not by
+// credential-free local collectors — the OSS observability recipe (issue 0050)
+// sends to a localhost Collector with no token, and demanding one silently
+// dropped every event (issue 0051). normalizeTarget always populates Signals
+// (defaulting to ["logs"]), so in practice this gates on a non-empty endpoint;
+// the signal check documents that a destination must want some representation.
+// An empty endpoint is treated as "not opted in" rather than an error, so flush
+// stays safe in cron. authValue still sends the (possibly empty) token under the
+// configured header — a backend that needs auth then rejects with 4xx, which is
+// visible, instead of the event being silently skipped here.
 func (t ExportTarget) Configured() bool {
-	return t.Endpoint != "" && t.Token != ""
+	return t.Endpoint != "" && len(t.Signals) > 0
 }
 
 // SendsLogs reports whether this target wants the raw-events (OTLP Logs)

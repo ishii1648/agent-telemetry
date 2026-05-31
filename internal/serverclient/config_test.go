@@ -88,7 +88,11 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_PartialServerNotConfigured(t *testing.T) {
+// TestLoadConfig_TokenlessServerConfigured pins issue 0051: a target with an
+// endpoint but no token is Configured(). The token is required only by backends
+// that authenticate; a credential-free local collector (the OSS observability
+// recipe) must still be a flush destination rather than being silently dropped.
+func TestLoadConfig_TokenlessServerConfigured(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	body := `[server]
@@ -103,10 +107,73 @@ endpoint = "https://only-endpoint"
 	}
 	srv, ok := targetByID(targets, legacyServerTargetID)
 	if !ok {
-		t.Fatalf("want a server target even when partial: %+v", targets)
+		t.Fatalf("want a server target: %+v", targets)
 	}
-	if srv.Configured() {
-		t.Error("partial config (no token) should not be Configured()")
+	if srv.Token != "" {
+		t.Errorf("token should be empty, got %q", srv.Token)
+	}
+	if !srv.Configured() {
+		t.Error("tokenless target with an endpoint should be Configured() (issue 0051)")
+	}
+}
+
+// TestLoadConfig_TokenlessExportConfigured covers the OSS observability recipe
+// shape (issue 0050/0051): an [[export]] pointing at a localhost Collector with
+// no token and both signals is Configured() and keeps its empty token.
+func TestLoadConfig_TokenlessExportConfigured(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "oss-collector"
+endpoint = "http://localhost:4318"
+encoding = "json"
+signals = ["logs", "metrics"]
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	tgt, ok := targetByID(targets, "oss-collector")
+	if !ok {
+		t.Fatalf("missing oss-collector target: %+v", targets)
+	}
+	if tgt.Token != "" {
+		t.Errorf("token should be empty, got %q", tgt.Token)
+	}
+	if !tgt.Configured() {
+		t.Error("tokenless local collector should be Configured() (issue 0051)")
+	}
+	if !tgt.SendsLogs() || !tgt.SendsMetrics() {
+		t.Errorf("both signals should be set: %+v", tgt.Signals)
+	}
+}
+
+// TestLoadConfig_NoEndpointNotConfigured pins the other half of issue 0051: a
+// target that is genuinely unset (no endpoint) stays NOT Configured(), so an
+// endpoint typo is not mistaken for a valid tokenless destination.
+func TestLoadConfig_NoEndpointNotConfigured(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "broken"
+signals = ["logs"]
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, ok := targetByID(targets, "broken")
+	if !ok {
+		t.Fatalf("want the broken target surfaced: %+v", targets)
+	}
+	if tgt.Configured() {
+		t.Error("a target with no endpoint must not be Configured()")
 	}
 }
 

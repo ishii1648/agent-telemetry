@@ -1,6 +1,7 @@
 ---
 decision_type: implementation
 tags: [flush, export-target, oss, credential]
+closed_at: 2026-05-31
 ---
 
 # token 無しの export target が flush から黙殺される
@@ -35,3 +36,11 @@ endpoint と token の **両方**が非空でないと「未設定」扱いに�
 - credential 不要の OSS Collector / ローカル endpoint 向けに、token 空でも `Configured() == true` を許容する経路を用意する（例: `auth_header` / `token` がどちらも空なら認証なしで送る、あるいは `signals` が設定され endpoint があれば configured とみなす）。
 - spec（`docs/spec.md` の export target 表で `token` を「必須」としている記述）と OSS レシピ（`config.toml.example`）の整合を取る。token は「認証が必要な backend でのみ必須」に改める。
 - token 空 target を黙ってスキップする場合でも、誤設定と区別できるよう stderr に明示する。
+
+Completed: 2026-05-31
+
+## 解決方法
+
+`ExportTarget.Configured()` の判定を `endpoint != "" && token != ""` から `endpoint != "" && len(signals) > 0` に改めた。token は「認証が必要な backend でのみ必須」とし、認証なしのローカル Collector（OSS レシピ）の token 空 target も送信対象になる。token 空のまま auth header は送られるが、認証を要する backend なら 4xx で可視的に弾かれる（黙殺されない）。
+
+endpoint が空の真の誤設定だけが skip 対象として残るため、`FlushResult.Misconfigured` にその target id を集約し、`Summarize` が stderr に明示する（「設定なし」の opt-out と区別できる）。`docs/spec.md` の export target 表で `token` を「認証が必要な backend でのみ必須」に改め、skip 条件を「endpoint が空」に統一して OSS レシピ（`deploy/oss-observability/config.toml.example`）との two-source 矛盾を解消した。

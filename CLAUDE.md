@@ -40,6 +40,10 @@ Contextual Commits を使用。Conventional Commits プレフィックス + 構�
 
 `feat/`, `fix/`, `docs/`, `chore/` + kebab-case（例: `feat/add-sync-db`）
 
+### 実装完了時のレビュー
+
+実装が完了したら（commit / PR 化の前後を問わず作業が一段落したら）`review-loop` skill を実行し、反対側エージェントによるクロスレビュー → 指摘反映を収束するまで回す。
+
 ### バグ・課題管理
 
 `issues/` 配下で Markdown ライフサイクル管理する。命名規則・SEQUENCE 運用・ディレクトリ構成・close/reopen/pending の手順は `AGENTS.md` の「issues について」セクションを正とする。CLAUDE.md と AGENTS.md の二重管理を避けるため、ルールの本体は AGENTS.md 側のみに置く。
