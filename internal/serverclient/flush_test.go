@@ -348,6 +348,11 @@ func TestFlush_TokenlessTargetSends(t *testing.T) {
 	if len(env.requests) == 0 {
 		t.Error("expected a network call for the tokenless target")
 	}
+	// A tokenless target must send no credential header — an empty "Bearer "
+	// value could be rejected by a fronting proxy as malformed (round-1 review).
+	if av := env.lastRequest().authValue; av != "" {
+		t.Errorf("tokenless target should send no auth header, got %q", av)
+	}
 	if got := env.loadState().FlushCursors["oss-collector"]; got != 2 {
 		t.Errorf("cursor: got %d, want 2", got)
 	}

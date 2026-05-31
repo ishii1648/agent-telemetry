@@ -701,7 +701,13 @@ func doPost(ctx context.Context, client *http.Client, t ExportTarget, endpoint s
 		return nil, 0, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
+	// Attach the credential header only when a token is configured. A tokenless
+	// local collector (issue 0051) gets no auth header at all — sending an empty
+	// "Bearer " value risks a fronting proxy rejecting it as malformed. An
+	// auth-required backend whose token is missing then 401s visibly instead.
+	if t.Token != "" {
+		req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
+	}
 	if contentEncoding != "" {
 		req.Header.Set("Content-Encoding", contentEncoding)
 	}

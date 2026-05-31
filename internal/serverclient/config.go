@@ -71,8 +71,8 @@ type ExportTarget struct {
 // (defaulting to ["logs"]), so in practice this gates on a non-empty endpoint;
 // the signal check documents that a destination must want some representation.
 // An empty endpoint is treated as "not opted in" rather than an error, so flush
-// stays safe in cron. authValue still sends the (possibly empty) token under the
-// configured header — a backend that needs auth then rejects with 4xx, which is
+// stays safe in cron. A configured-but-tokenless target sends no auth header at
+// all (see RunFlush); a backend that needs auth then rejects with 4xx, which is
 // visible, instead of the event being silently skipped here.
 func (t ExportTarget) Configured() bool {
 	return t.Endpoint != "" && len(t.Signals) > 0
