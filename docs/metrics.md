@@ -147,11 +147,11 @@ snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セ�
 
 ### 外部 backend 上の representation
 
-各メトリクスは外部 observability backend 上で 2 通りの representation のどちらかで再現する（join 不可ゆえに 2 表現へ分けた帰結は親 issue [0040] を参照）。カタログ各表の **representation** 列がメトリクスごとの分類を示す。
+各メトリクスは representation を 3 分類する。**外部 observability backend 上で再現できるのは gauge / event-level の 2 通り**で（join 不可ゆえに 2 表現へ分けた帰結は親 issue [0040] を参照）、**SQLite-only は backend では再現せず SQLite + ローカル分析に閉じる**。カタログ各表の **representation** 列がメトリクスごとの分類を示す。
 
 - **gauge** — client がローカル `pr_metrics` VIEW を集約し、PR 単位の pre-aggregated 値を OTLP Metrics gauge（last-value）として送る（[0043]）。`agent_pr_*` 系がこれにあたり、backend では同名の gauge series をそのまま参照する（range 集計は `last` を取る前提。naive な SUM は二重計上になる）
 - **event-level** — raw events（OTLP Logs）の attribute を backend の measure / 次元タグに昇格し（attribute の意味分類は [0044] / `docs/spec.md`）、backend formula（count / sum）で算出する。session 単位の各メトリクスがこれにあたる
-- **SQLite-only** — SQLite VIEW のローカル分析でのみ算出でき、otel+grafana には再現できないメトリクス。同時実行数（`agent_concurrent_sessions_{avg,peak}`）がこれにあたる。区間重なりの計算は flush 時点で値を固定する gauge とも、record 間 join をしない backend formula とも互換でないため、メイン dashboard には持ち込まず abandon する（[0054]）
+- **SQLite-only** — SQLite VIEW のローカル分析でのみ算出でき、**otel+grafana には再現できない**メトリクス。同時実行数（`agent_concurrent_sessions_{avg,peak}`）がこれにあたる。区間重なりの計算は flush 時点で値を固定する gauge とも、record 間 join をしない backend formula とも互換でないため、メイン dashboard には持ち込まず abandon する（[0054]）
 
 event-level の backend formula 例（Datadog の log-based metric。`agent.transcript.scanned` ログから token 流量を出す場合）:
 
