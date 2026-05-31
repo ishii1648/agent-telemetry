@@ -31,6 +31,7 @@ Completed: 2026-06-01
 - `internal/setup/setup.go` の Claude Stop 登録例に `"async": true` を付与し、補足文を追加。`internal/setup/setup_test.go` で登録例に `"async": true` が含まれることを必須化（回帰防止）
 - `docs/spec.md` / `docs/design.md` / `site/content/setup/local/index.md` / `site/content/explain/hooks/index.md` を同期更新。explain/hooks に残っていた detach 前提の「ブロッキング」表記も worker 退避＋async に修正
 - コードロジック（`internal/hook/RunStop`）は無変更。`async` は登録側の話
+- `internal/setup` の `HookSpec` に `Async` フラグを追加し Claude の Stop のみ true に。`internal/doctor` が registered だが async でない Stop を `⚠` の hint で surface（failure ではないので exit code 不変）。これで「async 無しで登録したまま気づかない」状態を doctor が検出できる
 
 ## 採用しなかった代替
 

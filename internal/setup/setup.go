@@ -18,13 +18,18 @@ type HookSpec struct {
 	Event      string // hook event name as written in settings (e.g. "SessionStart")
 	Subcommand string // agent-telemetry hook subcommand
 	Optional   bool   // true → doctor flags as info, not failure
+	Async      bool   // true → hook should be registered with "async": true (doctor hints when missing)
 }
 
 // ClaudeHookSpecs lists the canonical hooks for Claude Code.
+//
+// Stop is Async: it fires every response turn, so it must be registered with
+// "async": true to keep Claude Code from blocking the user's response cycle on
+// the hook process. doctor surfaces a hint when Stop is registered without it.
 var ClaudeHookSpecs = []HookSpec{
 	{Event: "SessionStart", Subcommand: "session-start"},
 	{Event: "SessionEnd", Subcommand: "session-end"},
-	{Event: "Stop", Subcommand: "stop"},
+	{Event: "Stop", Subcommand: "stop", Async: true},
 }
 
 // CodexHookSpecs lists the canonical hooks for Codex CLI. PostToolUse is

@@ -95,6 +95,13 @@ type Env struct {
 	// ConfigPathStatus returns the migration state of the TOML config
 	// path. When nil, defaults to configpath.Status.
 	ConfigPathStatus func() configpath.MigrationStatus
+
+	// AsyncFlags returns, per hook event, whether the agent's registered
+	// agent-telemetry hook is marked "async": true. Used to hint when a hook
+	// that should be async (HookSpec.Async) is registered without it. Only
+	// wired in defaultEnv(); tests that leave it nil skip the async hint, which
+	// keeps them hermetic (no read of the real settings.json).
+	AsyncFlags func(*agent.Agent) map[string]bool
 }
 
 func defaultEnv() Env {
@@ -106,6 +113,7 @@ func defaultEnv() Env {
 		LookPath:   exec.LookPath,
 		BinaryName: "agent-telemetry",
 		Agents:     agents,
+		AsyncFlags: loadAsyncFlagsForAgent,
 	}
 }
 
@@ -178,6 +186,10 @@ type CheckResult struct {
 type HookCheck struct {
 	Spec setup.HookSpec
 	OK   bool
+	// AsyncMissing is true when the hook should be async (Spec.Async) and is
+	// registered, but the registration lacks "async": true. It is a hint, not a
+	// failure — telemetry still works, it just blocks the response cycle.
+	AsyncMissing bool
 }
 
 // LegacyReport lists hitl-metrics era files that still exist on disk
@@ -272,12 +284,23 @@ func checkHooks(env Env, a *agent.Agent) []HookCheck {
 		loader = loadRegisteredCommandsForAgent
 	}
 	registered := loader(a)
+
+	// Async flags are read separately and only when the seam is wired
+	// (production). Tests that leave AsyncFlags nil skip the async hint so they
+	// never touch the real settings.json.
+	var asyncByEvent map[string]bool
+	if env.AsyncFlags != nil {
+		asyncByEvent = env.AsyncFlags(a)
+	}
+
 	specs := setup.HookSpecsFor(a.Name)
 	out := make([]HookCheck, 0, len(specs))
 	for _, spec := range specs {
+		ok := isRegistered(registered[spec.Event], spec.Subcommand)
 		out = append(out, HookCheck{
-			Spec: spec,
-			OK:   isRegistered(registered[spec.Event], spec.Subcommand),
+			Spec:         spec,
+			OK:           ok,
+			AsyncMissing: ok && spec.Async && asyncByEvent != nil && !asyncByEvent[spec.Event],
 		})
 	}
 	return out
@@ -319,6 +342,50 @@ func loadJSONHooks(path string) map[string][]string {
 		for _, e := range entries {
 			for _, h := range e.Hooks {
 				out[event] = append(out[event], h.Command)
+			}
+		}
+	}
+	return out
+}
+
+// loadAsyncFlagsForAgent reports, per hook event, whether the agent's
+// registered agent-telemetry hook is marked "async": true. Codex hook configs
+// have no async concept, so it only inspects Claude's settings.json (other
+// agents yield an empty map and thus no async hint).
+func loadAsyncFlagsForAgent(a *agent.Agent) map[string]bool {
+	switch a.Name {
+	case agent.NameCodex:
+		return nil
+	default:
+		return loadAsyncFlags(setup.SettingsPath())
+	}
+}
+
+// loadAsyncFlags parses a settings JSON file and returns, per event, whether
+// any agent-telemetry hook entry under that event has "async": true.
+func loadAsyncFlags(path string) map[string]bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+				Async   bool   `json:"async"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil
+	}
+	out := make(map[string]bool, len(settings.Hooks))
+	for event, entries := range settings.Hooks {
+		for _, e := range entries {
+			for _, h := range e.Hooks {
+				if strings.Contains(h.Command, "agent-telemetry") && strings.Contains(h.Command, "hook ") && h.Async {
+					out[event] = true
+				}
 			}
 		}
 	}
@@ -435,6 +502,9 @@ func writeHooks(w io.Writer, a *agent.Agent, env Env, checks []HookCheck) {
 	}
 	for _, c := range checks {
 		switch {
+		case c.OK && c.AsyncMissing:
+			fmt.Fprintf(w, "  - %s: %s %s (registered without \"async\": true — add it so the hook does not block the response cycle)\n",
+				c.Spec.Event, c.Spec.Subcommand, markWarn)
 		case c.OK:
 			fmt.Fprintf(w, "  - %s: %s %s\n", c.Spec.Event, c.Spec.Subcommand, markPass)
 		case c.Spec.Optional:

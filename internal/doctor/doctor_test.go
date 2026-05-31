@@ -392,3 +392,84 @@ func TestRun_NoBacklogHintBelowThreshold(t *testing.T) {
 		t.Error("did not expect --gc hint below threshold")
 	}
 }
+
+// TestRun_StopWithoutAsyncHints verifies doctor nudges (but does not fail) when
+// the Claude Stop hook is registered without "async": true.
+func TestRun_StopWithoutAsyncHints(t *testing.T) {
+	dir := t.TempDir()
+	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	env := envWith(t, []*agent.Agent{a}, true, map[string]map[string][]string{
+		agent.NameClaude: {
+			"SessionStart": {"agent-telemetry hook session-start"},
+			"SessionEnd":   {"agent-telemetry hook session-end"},
+			"Stop":         {"agent-telemetry hook stop"},
+		},
+	})
+	// Stop registered but not async; other events absent from the async map.
+	env.AsyncFlags = func(*agent.Agent) map[string]bool { return map[string]bool{} }
+
+	var buf bytes.Buffer
+	r, err := RunWith(&buf, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.HasFailure() {
+		t.Fatalf("missing async is a hint, not a failure; got failure:\n%s", buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "without \"async\": true") {
+		t.Errorf("expected async hint for Stop, got:\n%s", out)
+	}
+}
+
+// TestRun_StopWithAsyncNoHint verifies the hint disappears once Stop is async.
+func TestRun_StopWithAsyncNoHint(t *testing.T) {
+	dir := t.TempDir()
+	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	env := envWith(t, []*agent.Agent{a}, true, map[string]map[string][]string{
+		agent.NameClaude: {"Stop": {"agent-telemetry hook stop"}},
+	})
+	env.AsyncFlags = func(*agent.Agent) map[string]bool { return map[string]bool{"Stop": true} }
+
+	var buf bytes.Buffer
+	if _, err := RunWith(&buf, env); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "without \"async\": true") {
+		t.Errorf("did not expect async hint when Stop is async:\n%s", out)
+	}
+	if !strings.Contains(out, "Stop: stop ✓") {
+		t.Errorf("expected Stop pass mark, got:\n%s", out)
+	}
+}
+
+// TestLoadAsyncFlags_ParsesAsyncPerEvent checks the settings.json parser picks
+// up "async": true only for agent-telemetry hook entries.
+func TestLoadAsyncFlags_ParsesAsyncPerEvent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	const body = `{
+	  "hooks": {
+	    "Stop": [
+	      {"hooks": [
+	        {"type": "command", "command": "~/.claude/scripts/other.sh"},
+	        {"type": "command", "command": "agent-telemetry hook stop --agent claude", "async": true}
+	      ]}
+	    ],
+	    "SessionEnd": [
+	      {"hooks": [{"type": "command", "command": "agent-telemetry hook session-end --agent claude"}]}
+	    ]
+	  }
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flags := loadAsyncFlags(path)
+	if !flags["Stop"] {
+		t.Errorf("Stop should be async, got %v", flags)
+	}
+	if flags["SessionEnd"] {
+		t.Errorf("SessionEnd should not be async, got %v", flags)
+	}
+}

@@ -142,7 +142,7 @@ detached worker は **worker の重い処理** を非ブロッキングにする
 - `async` 時は stdout / exit code が無視される。`RunStop` の error return は元々 non-fatal（telemetry は best-effort）なので実害なし。`asyncRewake`（exit 2 で Claude を再起床）は**使わない** — 非ブロッキングの逆になるため
 - Codex には効かない。Codex の `Stop` は de-facto SessionEnd で `ended_at` を同期更新する別系統（hook 登録も `~/.codex/` 側）。`async` は Claude Code 固有フィールド
 - `SessionEnd`（Claude のみ・セッション終了時 1 回）の `sync-db` は同期のまま残す。発火が 1 回で体感が小さく、終了フェーズで background hook が完了前に kill されるリスクがドキュメント未定義なため
-- doctor への影響は無い: `isRegistered` は `command` 文字列のみを見て登録判定するため、`async` キー追加で誤検知しない
+- 登録判定（`isRegistered`）は `command` 文字列のみを見るため、`async` キー追加で誤検知しない。加えて doctor は `HookSpec.Async`（Claude の Stop のみ true）の hook について `settings.json` の `"async"` を別途読み、**registered だが async でない場合に hint を出す**（`✗`/failure ではなく `⚠` の情報行。telemetry は async 無しでも動くため `doctor` の exit code には影響しない）。Codex は async 概念が無いため対象外
 
 詳細な意思決定は [issues/closed/0056-design-stop-hook-async-nonblocking.md](../issues/closed/0056-design-stop-hook-async-nonblocking.md)。
 
