@@ -409,7 +409,7 @@ ClickHouse / Loki も候補だが、個人利用規模では SQLite で十分。
 
 ### otel+grafana dashboard の Tier 2（merged-PR gauge 集約でヘッドラインを復元）
 
-SQLite を Grafana datasource から外し otel+grafana に一本化する移行（[0054]）で、メイン dashboard を一旦 Tier 1（PR 単位 gauge ＋ raw logs）のみに絞った。ヘッドライン stat / trend のうち、既存の `agent_pr_*` gauge だけで近似できるものを Tier 2 として OSS dashboard に復元する（新規 export 不要。session-grain が要る Tier 3 は別 PR）。詳細・ティア整理は [issues/0053-design-otel-dashboard-tier2-tier3-restore.md](../issues/0053-design-otel-dashboard-tier2-tier3-restore.md)。
+SQLite を Grafana datasource から外し otel+grafana に一本化する移行（[0054]）で、メイン dashboard を一旦 Tier 1（PR 単位 gauge ＋ raw logs）のみに絞った。ヘッドライン stat / trend のうち、既存の `agent_pr_*` gauge だけで近似できるものを Tier 2 として OSS dashboard に復元する（新規 export 不要）。詳細・ティア整理は [issues/closed/0053-design-otel-dashboard-tier2-tier3-restore.md](../issues/closed/0053-design-otel-dashboard-tier2-tier3-restore.md)。
 
 採用した式（`agent_pr_total_tokens` を代表に、いずれも sparse gauge なので `last_over_time([$__range])` で range 内最終値を拾う。naive な `sum`/instant では flush 直後 5 分しか出ない・二重計上になる、は metrics.md の gauge range 集計の前提と整合）:
 
@@ -421,6 +421,14 @@ SQLite を Grafana datasource から外し otel+grafana に一本化する移行
 **volatile label の二重計上対策**: gauge の系列 identity は `(pr_url, coding_agent, user_id, task_type, model)` だが、client の集約 grain は `(pr_url, coding_agent, user_id)`（`task_type`/`model` は代表値ラベル）。range 内で代表 `model`/`task_type` が変わると同一 PR が複数系列として残り、素の `sum` は累積 `total_tokens` を水増しする。そのため sum 系（total tokens / PR per 1M の分母）は `max by (pr_url, coding_agent, user_id)`（= 累積値の最新を表す max）で安定キーに畳んでから合算する。`count`/`group by` 系（merged PRs・週別 trend）は元々畳むため影響を受けない。
 
 **semantic drift を各パネル description に明示する**のが Tier 2 採用の条件。`agent_pr_*` は `pr_metrics`（`is_merged = 1` 限定）の集約なので、これらは「全 session の総量」ではなく「merged-PR に寄与した分」になり、非 PR・未マージ・放棄 session を取りこぼす。曖昧なまま出すと「全活動の総量」と誤読されるため、誤読を防ぐ description を必須とした（merged PRs stat だけは merged 限定の母集団そのものを数えるので近似ではなく一致）。週別 trend は SQLite 版の weekday-0（JST 月曜）起点カレンダー週と境界がずれる rolling/step バケットになる近似で、これも description に記す。
+
+### otel+grafana dashboard の Tier 3（session-grain 週次 gauge で復元）
+
+Tier 2 が `pr_metrics`（merged 限定・PR 単位）止まりなので、top-level session 数や session 単位の token 効率は出せない。これらは **session-grain の新規 export**でしか出せない（LogQL 集約は cross-event join を backend で再現できず不可、[0043]）。`weekly_session_metrics` VIEW を client 側で評価し、`agent_weekly_session_*` gauge として `pr_metrics` gauge と同じ `metrics` signal・同じ cursor・同じ `/v1/metrics` flush で送る（実装は `internal/serverclient/session_metrics.go`、representation 仕様は `docs/spec.md`「session-grain 週次 gauge representation」節）。
+
+**週次 weekday-0 バケット問題**: SQLite の `weekly_session_metrics` は `date(timestamp, 'weekday 0', '-6 days')`（Asia/Tokyo 月曜起点週）でバケットする。PromQL `[1w]` 窓は epoch 整列（UTC 木曜起点）でこの暦週と境界がずれる。解決方針として **client 側（SQLite）で週次集約し、`week_start` を gauge label に載せる**を採った。dashboard は `week_start` label で group するだけで `[1w]` 窓を使わない。recording rule で backend 再集約する案は UTC 境界を再導入し、点を `week_start` に back-date する案は Mimir ingest の out-of-order 却下リスク（区間外サンプル拒否）があるため、いずれも却下した。
+
+**集約安全な ratio**: ratio（tokens_per_session 等）を `coding_agent` 跨ぎで平均すると誤るため、dashboard は base measure（`agent_weekly_session_total_tokens` / `_count` / `_ask_user_question_total`）から `sum by (week_start)(分子) / sum by (week_start)(分母)` で再計算する。この分子確保のため `weekly_session_metrics` に `ask_user_question` 生サム列を追加した（[0043] の「base と ratio を両方送る」方針に揃え、gauge には便宜 ratio も同梱）。
 
 ---
 

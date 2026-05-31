@@ -25,10 +25,13 @@ import (
 // decodes the OTLP Metrics payload so tests can assert the gauge points.
 type metricsTestEnv struct {
 	*flushTestEnv
-	mu          sync.Mutex
-	metricsBody []byte // last decoded /v1/metrics request body (JSON)
-	metricsPath string
-	gaugeCalls  int
+	mu sync.Mutex
+	// A metrics flush now POSTs two gauge families (pr_metrics and
+	// weekly_session_metrics, issue 0053) to /v1/metrics, so bodies accumulate
+	// across calls and decodeMetrics merges them into one payload.
+	metricsBodies [][]byte
+	metricsPath   string
+	gaugeCalls    int
 }
 
 func newMetricsTestEnv(t *testing.T) *metricsTestEnv {
@@ -50,7 +53,7 @@ func (e *metricsTestEnv) handle(w http.ResponseWriter, r *http.Request) {
 			body, _ = io.ReadAll(gz)
 		}
 		e.mu.Lock()
-		e.metricsBody = body
+		e.metricsBodies = append(e.metricsBodies, body)
 		e.metricsPath = r.URL.Path
 		e.gaugeCalls++
 		e.mu.Unlock()
@@ -106,18 +109,51 @@ func (e *metricsTestEnv) seedMergedPR(sessionID, prURL string, inputTokens, outp
 	}
 }
 
+// seedTopLevelSession appends one top-level (non-subagent, non-ghost) session
+// that is NOT a merged PR, with the given timestamp and ask_user_question count.
+// Unlike seedMergedPR it does not (re)apply the schema, so it can add a session
+// to a DB seedMergedPR already initialized — used to prove the weekly session
+// grain counts sessions pr_metrics (is_merged=1) never would.
+func (e *metricsTestEnv) seedTopLevelSession(sessionID, timestamp string, totalInputTokens, askUserQuestion int) {
+	e.t.Helper()
+	db, err := sql.Open("sqlite", e.dbPath)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO sessions
+		(session_id, coding_agent, agent_version, user_id, timestamp, cwd, repo, branch, pr_url, pr_title, transcript, parent_session_id, ended_at, end_reason, backfill_checked, is_merged, review_comments, changes_requested)
+		VALUES (?, 'claude', 'v1', 'alice', ?, '', 'u/r', 'feat/y', '', '', '', '', '', '', 0, 0, 0, 0)`,
+		sessionID, timestamp); err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO transcript_stats
+		(session_id, coding_agent, tool_use_total, mid_session_msgs, ask_user_question, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, reasoning_tokens, model, is_ghost)
+		VALUES (?, 'claude', 0, 0, ?, ?, 0, 0, 0, 0, 'claude-sonnet-4-6', 0)`,
+		sessionID, askUserQuestion, totalInputTokens); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// decodeMetrics merges every captured /v1/metrics body into one payload so a
+// test can assert on a metric regardless of which gauge family's POST carried it
+// (pr_metrics and weekly_session_metrics ride separate batches, issue 0053).
 func (e *metricsTestEnv) decodeMetrics() otlpMetricsPayload {
 	e.t.Helper()
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if len(e.metricsBody) == 0 {
+	if len(e.metricsBodies) == 0 {
 		e.t.Fatal("no metrics request captured")
 	}
-	var p otlpMetricsPayload
-	if err := json.Unmarshal(e.metricsBody, &p); err != nil {
-		e.t.Fatalf("decode metrics body: %v", err)
+	var merged otlpMetricsPayload
+	for _, body := range e.metricsBodies {
+		var p otlpMetricsPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			e.t.Fatalf("decode metrics body: %v", err)
+		}
+		merged.ResourceMetrics = append(merged.ResourceMetrics, p.ResourceMetrics...)
 	}
-	return p
+	return merged
 }
 
 // gaugePoint finds the single data point for a metric name and returns its
@@ -227,6 +263,76 @@ func (e *metricsTestEnv) dropView(name string) {
 	}
 }
 
+// TestFlush_WeeklySessionGauge verifies the Tier 3 session-grain gauge (issue
+// 0053): a metrics target also sends weekly_session_metrics rows keyed by
+// (week_start, coding_agent), counting EVERY top-level session — including a
+// non-merged one that pr_metrics (is_merged=1) would never see — bucketed by the
+// Asia/Tokyo Monday-start week carried as a label.
+func TestFlush_WeeklySessionGauge(t *testing.T) {
+	env := newMetricsTestEnv(t)
+	// s1: a merged PR (also feeds pr_metrics), week of 2026-05-04. 150 tokens.
+	env.seedMergedPR("s1", "https://gh/pr/1", 100, 50, 4)
+	// s2: a NON-merged top-level session in the SAME week, 10 tokens, 2 AUQ.
+	// pr_metrics ignores it (is_merged=0); weekly session grain must count it.
+	env.seedTopLevelSession("s2", "2026-05-08T09:00:00Z", 10, 2)
+	env.writeConfig("[[export]]\n" +
+		"id = \"dd\"\n" +
+		"endpoint = \"" + env.server.URL + "\"\n" +
+		"token = \"t\"\n" +
+		"signals = [\"metrics\"]\n")
+
+	res, err := env.run()
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	tr := res.PerAgent["claude"].Targets["dd"]
+	if tr == nil || tr.MetricsSessionSeries != 1 {
+		t.Fatalf("MetricsSessionSeries: got %+v, want 1 (one week × one agent)", tr)
+	}
+
+	p := env.decodeMetrics()
+	// session_count counts BOTH sessions (the merged PR + the non-merged one),
+	// proving the session grain differs from pr_metrics' merged-only session_count.
+	cnt := gaugePoints(p, "agent_weekly_session_count")
+	if len(cnt) != 1 {
+		t.Fatalf("agent_weekly_session_count points: got %d, want 1", len(cnt))
+	}
+	if cnt[0].AsInt != "2" {
+		t.Errorf("agent_weekly_session_count: got %q, want 2", cnt[0].AsInt)
+	}
+	if got := tagOf(cnt[0], "week_start"); got != "2026-05-04" {
+		t.Errorf("week_start tag: got %q, want 2026-05-04 (JST Monday-start week)", got)
+	}
+	if got := tagOf(cnt[0], "coding_agent"); got != "claude" {
+		t.Errorf("coding_agent tag: got %q", got)
+	}
+	// session_id must never be a tag (cardinality bound: weeks × agents).
+	if got := tagOf(cnt[0], "session_id"); got != "" {
+		t.Errorf("session_id must not be a gauge tag, got %q", got)
+	}
+
+	// total_tokens = 150 + 10 = 160.
+	tot := gaugePoints(p, "agent_weekly_session_total_tokens")
+	if len(tot) != 1 || tot[0].AsInt != "160" {
+		t.Errorf("agent_weekly_session_total_tokens: got %+v, want one point of 160", tot)
+	}
+	// ask_user_question sum = 0 + 2 = 2 (base measure for aggregation-safe ratios).
+	auq := gaugePoints(p, "agent_weekly_session_ask_user_question_total")
+	if len(auq) != 1 || auq[0].AsInt != "2" {
+		t.Errorf("agent_weekly_session_ask_user_question_total: got %+v, want one point of 2", auq)
+	}
+	// tokens_per_session = 160 / 2 = 80.0 (float convenience ratio).
+	tps := gaugePoints(p, "agent_weekly_session_tokens_per_session")
+	if len(tps) != 1 || tps[0].AsDouble == nil || *tps[0].AsDouble != 80.0 {
+		t.Errorf("agent_weekly_session_tokens_per_session: got %+v, want 80.0", tps)
+	}
+	// ask_user_question_per_session = 2 / 2 = 1.0.
+	aps := gaugePoints(p, "agent_weekly_session_ask_user_question_per_session")
+	if len(aps) != 1 || aps[0].AsDouble == nil || *aps[0].AsDouble != 1.0 {
+		t.Errorf("agent_weekly_session_ask_user_question_per_session: got %+v, want 1.0", aps)
+	}
+}
+
 // TestFlush_MetricsHealsMissingPRMetricsView is the issue 0052 regression: a DB
 // that has events but no pr_metrics VIEW must not crash the metrics flush with
 // "no such table: pr_metrics". flush ensures the derived VIEWs non-destructively
@@ -295,16 +401,20 @@ func TestFlush_MetricsUpToDateSkips(t *testing.T) {
 	if _, err := env.run(); err != nil {
 		t.Fatalf("first flush: %v", err)
 	}
-	if env.gaugeCalls != 1 {
-		t.Fatalf("first flush gauge calls: got %d, want 1", env.gaugeCalls)
+	// The first flush POSTs the gauge families (pr_metrics + weekly session);
+	// the exact batch count is an implementation detail, so assert the second
+	// flush adds zero new POSTs rather than a fixed total.
+	if env.gaugeCalls == 0 {
+		t.Fatalf("first flush must send at least one gauge POST, got %d", env.gaugeCalls)
 	}
+	afterFirst := env.gaugeCalls
 
 	res, err := env.run()
 	if err != nil {
 		t.Fatalf("second flush: %v", err)
 	}
-	if env.gaugeCalls != 1 {
-		t.Errorf("second flush must not re-send: gauge calls got %d, want 1", env.gaugeCalls)
+	if env.gaugeCalls != afterFirst {
+		t.Errorf("second flush must not re-send: gauge calls got %d, want %d", env.gaugeCalls, afterFirst)
 	}
 	if !res.PerAgent["claude"].Targets["dd"].MetricsUpToDate {
 		t.Error("second flush should report MetricsUpToDate")

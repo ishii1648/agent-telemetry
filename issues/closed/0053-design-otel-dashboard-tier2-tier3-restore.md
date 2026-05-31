@@ -2,6 +2,7 @@
 decision_type: design
 tags: [otel, grafana, mimir, dashboard, metrics-export, tier2, tier3]
 related: [0040, 0043, 0050, 0054]
+closed_at: 2026-05-31
 ---
 
 # otel+grafana 一本化後に Tier 2/3 パネルを復元する（session-grain export ＋ 集計表現）
@@ -43,6 +44,8 @@ SQLite を Grafana datasource として参照する経路（server/team ③・�
 
 ### Tier 3 — session-grain export を新設（client/spec 拡張が必要）
 
+> **進捗（実装済み）**: `weekly_session_metrics` VIEW を client 側で評価し `agent_weekly_session_*` gauge として OTLP Metrics で送る representation を新設（`metrics` signal・`metrics_cursors` を `pr_metrics` gauge と共有、同一 `/v1/metrics` flush）。`week_start`（JST 月曜起点）を label に載せて weekday-0 バケット問題を解決。OSS dashboard に Tier 3 row（top-level sessions / 週別 token 消費 / 週別 tokens per session / 週別 ask_user_question per session）を追加。詳細は本 issue 末尾「解決方法」。
+
 `pr_metrics` の session_count は「PR 寄与分」のみで top-level session 数とは別物。`weekly_session_metrics` も session-grain。これらは新しい export がないと出せない。
 
 - `agent_session_*`（または session-grain の集約 gauge）を client から OTLP Metrics で export する representation を設計（[0043] の `pr_metrics` gauge representation に倣う）
@@ -60,3 +63,33 @@ Tier 2 は既存 gauge だけで出せるので軽い（先行可）。Tier 3 �
 
 - **Tier 2/3 を即メイン dashboard に載せる**: semantic drift（merged 限定）や未 export を曖昧にしたまま出すと「全活動の総量」と誤読される。Tier 1 のみに絞り、本 issue で明示的に扱う
 - **session-grain を raw logs(Loki) の LogQL 集約で代用**: LogQL の集約は SQL より貧弱で、cross-event join（[0043] §458 のロックイン）を backend で再現できないため不可
+
+Completed: 2026-05-31
+
+## 解決方法
+
+Tier 2 は先行 PR で実装済み。本 close は **Tier 3（session-grain export）** の完了をもって行う。
+
+### session-grain 週次 gauge representation（Tier 3）
+
+`weekly_session_metrics` VIEW（top-level session を JST 月曜起点週で集約）を client 側で評価し、`agent_weekly_session_*` gauge として OTLP Metrics で送る。`pr_metrics` gauge（[0043]）に倣い、同じ `metrics` signal・同じ `metrics_cursors`・同じ `/v1/metrics` flush に相乗りする（2 gauge family を 1 flush で送信）。
+
+- **実装**: `internal/serverclient/session_metrics.go`（VIEW 評価 + gauge payload 構築）、`flush.go`（`flushMetricsToTarget` が pr_metrics に続けて weekly session を送信、`MetricsSessionSeries` を結果に追加）。byte 分割は `splitGaugeBatches`（row 型 generic）に共通化。
+- **送る metric**: base measure（`agent_weekly_session_count` / `agent_weekly_session_total_tokens` / `agent_weekly_session_ask_user_question_total`）＋ 派生 ratio（`agent_weekly_session_tokens_per_session` / `agent_weekly_session_ask_user_question_per_session`）。dimension は `week_start` / `coding_agent` のみ（`session_id` は出さず cardinality を週×agent で有界化）。`weekly_session_metrics` に `ask_user_question` 生サム列を追加（ratio を base から集約安全に再計算するための分子。schema_hash 再生成）。
+
+### 週次 weekday-0 バケット問題の解決方針
+
+**client 側（SQLite）で週次集約し、`week_start` を gauge label に載せる**方針を採用。dashboard は `week_start` label で group するだけで PromQL `[1w]` 窓を使わない。
+
+- **却下: Mimir recording rule で backend 再集約** — `[1w]` は UTC 木曜起点で、SQLite の JST 月曜起点暦週と境界がずれる問題が再発する
+- **却下: 点を `week_start` に back-date して時間軸で表現** — Mimir ingest の out-of-order 却下リスク（gotchas メモリ #5 と同種）。送信時刻スタンプ＋label 方式なら回避できる
+
+### dashboard（OSS）
+
+`deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json` に Tier 3 row を追加: top-level sessions（stat, `sum(last_over_time(agent_weekly_session_count[$__range]))`）/ 週別 token 消費・週別 tokens per session・週別 ask_user_question per session（barchart, xField=`week_start`）。ratio パネルは agent 跨ぎ集約で誤らないよう base measure から再計算（`sum by (week_start)(total) / sum by (week_start)(count)`）。
+
+### 検証
+
+`go test ./...` 全パス（weekly session gauge の tag/値・float ratio・非マージ top-level session の計上・week_start バケット・既存 metrics テストの 2-POST 対応）。`go vet` / `gofmt` clean。OSS dashboard JSON は決定的スクショ手段が無い（0055-⑤）ため、パネル追加と PromQL idiom（Tier 2 で実 Mimir 検証済みの `last_over_time` 集約）の踏襲に留め、README スクショ差替（0055-⑥）は本 PR では行わない。
+
+`docs/spec.md`（「session-grain 週次 gauge representation」節）/ `docs/metrics.md`（`agent_weekly_session_*` カタログ）を同期更新。

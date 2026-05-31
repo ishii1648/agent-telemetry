@@ -120,6 +120,7 @@ agent 跨ぎでは `model` / `agent_version` の混在で平均化が壊れや�
 | `agent_pr_input_tokens_total` / `agent_pr_output_tokens_total` / `agent_pr_cache_write_tokens_total` / `agent_pr_cache_read_tokens_total` / `agent_pr_reasoning_tokens_total` | 1. トークン効率（内訳） |
 | `agent_session_input_tokens_total` / `agent_session_output_tokens_total` / `agent_session_cache_write_tokens_total` / `agent_session_cache_read_tokens_total` / `agent_session_reasoning_tokens_total` | 1. トークン効率（session 粒度の内訳） |
 | `agent_session_mid_session_msgs_total` / `agent_session_ask_user_question_total` | 2. 開発生産性 |
+| `agent_weekly_session_count` / `agent_weekly_session_total_tokens` / `agent_weekly_session_tokens_per_session` / `agent_weekly_session_ask_user_question_per_session` | 1. トークン効率 / 2. 開発生産性（top-level session の週次推移） |
 | `agent_pr_review_comments` / `agent_pr_changes_requested` | 2. 開発生産性 |
 | `agent_concurrent_sessions_avg` / `agent_concurrent_sessions_peak` | 2. 開発生産性（並列上限） |
 | `agent_session_started_timestamp_seconds` / `agent_session_ended_timestamp_seconds` | 並列上限の区間計算 |
@@ -149,7 +150,7 @@ snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セ�
 
 各メトリクスは representation を 3 分類する。**外部 observability backend 上で再現できるのは gauge / event-level の 2 通り**で（join 不可ゆえに 2 表現へ分けた帰結は親 issue [0040] を参照）、**SQLite-only は backend では再現せず SQLite + ローカル分析に閉じる**。カタログ各表の **representation** 列がメトリクスごとの分類を示す。
 
-- **gauge** — client がローカル `pr_metrics` VIEW を集約し、PR 単位の pre-aggregated 値を OTLP Metrics gauge（last-value）として送る（[0043]）。`agent_pr_*` 系がこれにあたり、backend では同名の gauge series をそのまま参照する（range 集計は `last` を取る前提。naive な SUM は二重計上になる）
+- **gauge** — client がローカル VIEW を集約し、pre-aggregated 値を OTLP Metrics gauge（last-value）として送る。PR 単位の `agent_pr_*`（`pr_metrics` VIEW、[0043]）と session 単位の週次 `agent_weekly_session_*`（`weekly_session_metrics` VIEW、[0053]）がこれにあたり、両 family は同一 `metrics` signal・同一 cursor で送られる。backend では同名の gauge series をそのまま参照する（range 集計は `last` を取る前提。naive な SUM は二重計上になる）。`agent_weekly_session_*` は `week_start` を label に載せて暦週（JST 月曜起点）をエンコードし、PromQL `[1w]` 窓の境界ずれを回避する
 - **event-level** — raw events（OTLP Logs）の attribute を backend の measure / 次元タグに昇格し（attribute の意味分類は [0044] / `docs/spec.md`）、backend formula（count / sum）で算出する。session 単位の各メトリクスがこれにあたる
 - **SQLite-only** — SQLite VIEW のローカル分析でのみ算出でき、**otel+grafana には再現できない**メトリクス。同時実行数（`agent_concurrent_sessions_{avg,peak}`）がこれにあたる。区間重なりの計算は flush 時点で値を固定する gauge とも、record 間 join をしない backend formula とも互換でないため、メイン dashboard には持ち込まず abandon する（[0054]）
 
@@ -224,6 +225,24 @@ representation は全行 **gauge**（client がローカル `pr_metrics` VIEW �
 | `agent_pr_tokens_per_session` | gauge | float | gauge | PR 内の平均セッショントークン（派生） |
 | `agent_pr_tokens_per_tool_use` | gauge | float | gauge | PR 内のツール 1 回あたりトークン（派生） |
 | `agent_pr_per_million_tokens` | gauge | float | gauge | 100 万 token あたりに完了した PR 数（効率の逆数指標、派生） |
+
+### session 単位の週次集約（`weekly_session_metrics` VIEW）
+
+トップレベルセッション（`is_subagent = 0` AND `is_ghost = 0` AND `repo NOT IN (...)` AND `timestamp != ''`）を **Asia/Tokyo の月曜起点週**（`date(timestamp, 'weekday 0', '-6 days')`）でバケットした session-grain 集約値。`pr_metrics`（`is_merged = 1` 限定・PR 単位）では出せない **top-level session の総数・session 単位の token 効率**を出すための表現（[0053] Tier 3）。
+
+ラベル: `week_start`（JST 月曜起点 ISO 日付）, `coding_agent`
+
+representation は全行 **gauge**（client がローカル `weekly_session_metrics` VIEW を集約し OTLP Metrics gauge として送る。`pr_metrics` gauge と同一 flush・同一 cursor）。`week_start` を label に載せることで PromQL `[1w]` 窓（UTC 木曜起点）と暦週（JST 月曜起点）の境界ずれを回避する。backend では `week_start` label で group し、各 series を `last` で参照する。
+
+| メトリクス名 | 型 | 値 | representation | 説明 |
+|---|---|---|---|---|
+| `agent_weekly_session_count` | gauge | int | gauge | 週内の distinct top-level session 数。全週合算（`sum`）で「期間内 top-level session 総数」になる |
+| `agent_weekly_session_total_tokens` | counter | int | gauge | 週内 top-level session の総 token（input + output + cache_write + cache_read + reasoning） |
+| `agent_weekly_session_ask_user_question_total` | counter | int | gauge | 週内 top-level session の AskUserQuestion 合計（ratio の分子。Codex は常に 0） |
+| `agent_weekly_session_tokens_per_session` | gauge | float | gauge | 週内の平均 session token（派生）。agent 跨ぎ集約時は base measure から再計算する |
+| `agent_weekly_session_ask_user_question_per_session` | gauge | float | gauge | 週内の session あたり AskUserQuestion（派生）。agent 跨ぎ集約時は base measure から再計算する |
+
+ratio（`tokens_per_session` / `ask_user_question_per_session`）は便宜として同梱するが、`coding_agent` を跨いで集約する場合は ratio の平均ではなく **base measure から再計算**する（`sum by (week_start)(total_tokens) / sum by (week_start)(count)`）ことで集約安全にする。各週バケットは最低 1 session を含むため ratio は NULL にならず、全点を送る。
 
 ### 同時実行数（`session_concurrency_daily` / `session_concurrency_weekly` VIEW）
 

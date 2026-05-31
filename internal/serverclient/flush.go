@@ -92,6 +92,7 @@ type FlushTargetResult struct {
 	SendsMetrics         bool
 	MetricsUpToDate      bool
 	MetricsSeries        int // PR rows (dimension sets) sent this flush
+	MetricsSessionSeries int // weekly session rows (week × agent) sent this flush (issue 0053)
 	MetricsBatches       int
 	MetricsPayloadBytes  int64
 	MetricsRejected      int
@@ -367,12 +368,14 @@ func flushLogsToTarget(ctx context.Context, db *sql.DB, a *agent.Agent, t Export
 	return false, nil
 }
 
-// flushMetricsToTarget evaluates the local pr_metrics VIEW and sends every PR's
-// current value as an OTLP Metrics gauge (last-value) to one target. It rides
-// the separate metrics cursor: the flush is skipped when no new event has
-// arrived since the last gauge flush (no event ⇒ no PR value can have changed),
+// flushMetricsToTarget evaluates the local gauge VIEWs (pr_metrics and
+// weekly_session_metrics) and sends each one's current values as OTLP Metrics
+// gauges (last-value) to one target in a single /v1/metrics flush. It rides the
+// separate metrics cursor: the flush is skipped when no new event has arrived
+// since the last gauge flush (no event ⇒ no VIEW value can have changed),
 // avoiding redundant identical points. On a successful send the cursor advances
-// to the current max local_sequence. See metrics.go for the gauge semantics.
+// to the current max local_sequence. See metrics.go (pr_metrics) and
+// session_metrics.go (weekly session, issue 0053) for the gauge semantics.
 func flushMetricsToTarget(ctx context.Context, db *sql.DB, a *agent.Agent, t ExportTarget, opts FlushOptions, nowNano int64, state *backfill.State, ar *FlushAgentResult) (bool, error) {
 	tr := ar.targetResult(t)
 	tr.SendsMetrics = true
@@ -392,10 +395,24 @@ func flushMetricsToTarget(ctx context.Context, db *sql.DB, a *agent.Agent, t Exp
 	}
 	tr.MetricsSeries = len(rows)
 
-	batches, err := splitMetricBatches(rows, opts.ClientVersion, nowNano, MaxBatchBytes)
+	weeklyRows, err := LoadWeeklySessionMetrics(db, a.Name)
+	if err != nil {
+		return false, fmt.Errorf("load weekly_session_metrics[%s/%s]: %w", a.Name, t.ID, err)
+	}
+	tr.MetricsSessionSeries = len(weeklyRows)
+
+	prBatches, err := splitMetricBatches(rows, opts.ClientVersion, nowNano, MaxBatchBytes)
 	if err != nil {
 		return false, err
 	}
+	weeklyBatches, err := splitWeeklySessionBatches(weeklyRows, opts.ClientVersion, nowNano, MaxBatchBytes)
+	if err != nil {
+		return false, err
+	}
+	// Both gauge families POST to the same /v1/metrics endpoint and advance the
+	// one metrics cursor together; concatenating keeps the send loop and the
+	// transport-failure handling identical.
+	batches := append(prBatches, weeklyBatches...)
 	tr.MetricsBatches = len(batches)
 
 	if opts.DryRun {
@@ -776,8 +793,8 @@ func (r *FlushResult) Summarize(w io.Writer) {
 				fmt.Fprintf(w, "flush[%s→%s] dry-run: sent=%d skipped=%d batches=%d payload=%d bytes encoding=%s\n",
 					name, id, tr.Sent, tr.Skipped, tr.Batches, tr.PayloadBytes, tr.Encoding)
 				if tr.SendsMetrics {
-					fmt.Fprintf(w, "flush[%s→%s] dry-run (metrics): series=%d batches=%d payload=%d bytes encoding=%s\n",
-						name, id, tr.MetricsSeries, tr.MetricsBatches, tr.MetricsPayloadBytes, tr.Encoding)
+					fmt.Fprintf(w, "flush[%s→%s] dry-run (metrics): pr_series=%d session_series=%d batches=%d payload=%d bytes encoding=%s\n",
+						name, id, tr.MetricsSeries, tr.MetricsSessionSeries, tr.MetricsBatches, tr.MetricsPayloadBytes, tr.Encoding)
 				}
 				continue
 			}
@@ -793,8 +810,8 @@ func (r *FlushResult) Summarize(w io.Writer) {
 				if tr.MetricsUpToDate {
 					fmt.Fprintf(w, "flush[%s→%s] (metrics): up-to-date — no new events since last gauge flush\n", name, id)
 				} else {
-					fmt.Fprintf(w, "flush[%s→%s] (metrics): series=%d batches=%d payload=%d bytes encoding=%s rejected=%d\n",
-						name, id, tr.MetricsSeries, tr.MetricsBatches, tr.MetricsPayloadBytes, tr.Encoding, tr.MetricsRejected)
+					fmt.Fprintf(w, "flush[%s→%s] (metrics): pr_series=%d session_series=%d batches=%d payload=%d bytes encoding=%s rejected=%d\n",
+						name, id, tr.MetricsSeries, tr.MetricsSessionSeries, tr.MetricsBatches, tr.MetricsPayloadBytes, tr.Encoding, tr.MetricsRejected)
 					if tr.MetricsRejected > 0 {
 						fmt.Fprintf(w, "  warning: %d gauge points permanently rejected by %s (not retried): %s\n",
 							tr.MetricsRejected, id, tr.MetricsRejectedError)
