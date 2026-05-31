@@ -1,8 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - .goreleaser.yaml
-  - .github/workflows/
 tags: [release, ci, goreleaser]
 ---
 

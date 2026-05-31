@@ -3,6 +3,10 @@
 
 外部依存なし（標準ライブラリ unittest のみ）。fixture は TemporaryDirectory に
 fresh な git repo を作って組み立てる。
+
+intent-lookup は path → issue の対応を **issue 本文の grep**（手書きの
+affected_paths ではなく）と git 履歴から動的に求める。そのため fixture issue は
+本文中に対象 path を言及することでヒット対象になる。
 """
 from __future__ import annotations
 
@@ -43,7 +47,11 @@ def write(path: Path, content: str) -> None:
 
 
 def make_fixture_repo(work: Path) -> dict:
-    """Create a deterministic fixture git repo with issues + commits."""
+    """Create a deterministic fixture git repo with issues + commits.
+
+    issues reference their target paths in the BODY (no affected_paths
+    frontmatter), since lookup matches by grepping the issue text.
+    """
     env = {
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com",
@@ -55,16 +63,14 @@ def make_fixture_repo(work: Path) -> dict:
     (work / "issues" / "pending").mkdir(parents=True)
     (work / "internal" / "hook").mkdir(parents=True)
     (work / "internal" / "syncdb").mkdir(parents=True)
+    (work / "internal" / "other").mkdir(parents=True)
     (work / "cmd" / "agent-telemetry").mkdir(parents=True)
-    (work / "issues" / "SEQUENCE").write_text("0005\n")
+    (work / "issues" / "SEQUENCE").write_text("0006\n")
 
-    # 0001 closed — internal/hook/stop.go + internal/syncdb/
+    # 0001 closed — mentions internal/hook/stop.go + internal/syncdb/ in body
     write(work / "issues" / "closed" / "0001-bug-fixture-stop.md", """
         ---
         decision_type: design
-        affected_paths:
-          - internal/hook/stop.go
-          - internal/syncdb/
         tags: [hooks, fixture]
         closed_at: 2026-01-02
         ---
@@ -75,7 +81,8 @@ def make_fixture_repo(work: Path) -> dict:
 
         ## 概要
 
-        fixture の stop hook 概要文。短い段落。
+        fixture の stop hook 概要文。`internal/hook/stop.go` と `internal/syncdb/`
+        に effect を持つ短い段落。
 
         ## 対応方針
 
@@ -90,12 +97,10 @@ def make_fixture_repo(work: Path) -> dict:
         多重呼び出しに耐える。
         """)
 
-    # 0002 open — internal/hook/ ディレクトリ全体
+    # 0002 open — mentions internal/hook/ directory in body (ancestor-dir recall)
     write(work / "issues" / "0002-feat-fixture-hook-area.md", """
         ---
         decision_type: implementation
-        affected_paths:
-          - internal/hook/
         tags: [hooks, fixture, broad]
         ---
 
@@ -105,15 +110,13 @@ def make_fixture_repo(work: Path) -> dict:
 
         ## 概要
 
-        広い範囲を扱う fixture。
+        `internal/hook/` ディレクトリ全体を扱う広い範囲の fixture。
         """)
 
-    # 0003 pending — 関係ない path
+    # 0003 pending — unrelated path
     write(work / "issues" / "pending" / "0003-design-fixture-unrelated.md", """
         ---
         decision_type: design
-        affected_paths:
-          - cmd/agent-telemetry/main.go
         tags: [unrelated, fixture]
         ---
 
@@ -123,35 +126,32 @@ def make_fixture_repo(work: Path) -> dict:
 
         ## 概要
 
-        無関係。
+        `cmd/agent-telemetry/main.go` の話。stop hook とは無関係。
         """)
 
-    # 0004 — invalid decision_type / missing affected_path / broad path (lint targets)
-    # `examples/` は他テストの query path (internal/* / cmd/*) と overlap しない broad dir
-    (work / "examples").mkdir()
-    write(work / "issues" / "0004-bug-fixture-lint-targets.md", """
+    # 0005 pending — mentions internal/other/, must NOT match an internal/hook query
+    # (guards against a bare top-level component "internal" leaking into grep keys)
+    write(work / "issues" / "pending" / "0005-design-fixture-other-internal.md", """
         ---
-        decision_type: bogus
-        affected_paths:
-          - examples/
-          - examples/does-not-exist.go
-        tags: [lint, fixture]
+        decision_type: design
+        tags: [fixture]
         ---
 
-        # Fixture: lint targets
+        # Fixture: 別の internal サブツリー
 
         Created: 2026-01-01
 
         ## 概要
 
-        故意に lint で warning を発生させる fixture。
+        `internal/other/thing.go` の設計。hook とは別領域。
         """)
 
-    # frontmatter なし issue (skip されるべき / lint で warning)
+    # frontmatter なし issue (skip されるべき)
     write(work / "issues" / "no-frontmatter.md", """
         # 古い形式の issue
 
-        frontmatter を持たない。intent-lookup は skip するはず。
+        frontmatter を持たない。`internal/hook/stop.go` に言及するが
+        intent-lookup は skip するはず。
         """)
 
     # 内部ファイル + commits
@@ -203,13 +203,11 @@ def make_rename_fixture(work: Path) -> dict:
     (work / "old").mkdir()
     (work / "issues" / "SEQUENCE").write_text("0002\n")
 
-    # commit 1: create old/file.go
+    # commit 1: create old/file.go; issue references old/file.go in body
     (work / "old" / "file.go").write_text("package old\n// substantial content\n" * 5)
     write(work / "issues" / "closed" / "0001-design-old-path-decision.md", """
         ---
         decision_type: design
-        affected_paths:
-          - old/file.go
         tags: [rename, fixture]
         closed_at: 2026-02-01
         ---
@@ -220,7 +218,7 @@ def make_rename_fixture(work: Path) -> dict:
 
         ## 概要
 
-        後の rename を見越した issue。affected_paths は古い path のまま。
+        後の rename を見越した issue。本文は古い path `old/file.go` を参照したまま。
         """)
     run_git("add", "-A", cwd=work, env=env)
     run_git("commit", "-q", "-m", "feat: add old/file.go", cwd=work, env=env)
@@ -254,7 +252,8 @@ class IntentLookupTests(unittest.TestCase):
         data = json.loads(r.stdout)
         self.assertEqual(data["path"], "internal/hook/stop.go")
 
-    def test_lookup_json_matches_specific_and_dir_issues(self):
+    def test_lookup_matches_exact_and_ancestor_dir_mentions(self):
+        # 0001 mentions the exact file; 0002 mentions the parent dir internal/hook/
         r = run_script("--format=json", "internal/hook/stop.go", cwd=self.work)
         data = json.loads(r.stdout)
         ids = sorted(i["id"] for i in data["issues"])
@@ -265,6 +264,14 @@ class IntentLookupTests(unittest.TestCase):
         data = json.loads(r.stdout)
         ids = [i["id"] for i in data["issues"]]
         self.assertNotIn("0003", ids)
+
+    def test_bare_top_level_component_does_not_overmatch(self):
+        # 0005 mentions internal/other/...; querying internal/hook/stop.go must NOT
+        # pull it in (grep keys are {internal/hook/stop.go, internal/hook}, never "internal")
+        r = run_script("--format=json", "internal/hook/stop.go", cwd=self.work)
+        data = json.loads(r.stdout)
+        ids = [i["id"] for i in data["issues"]]
+        self.assertNotIn("0005", ids)
 
     def test_lookup_frontmatter_preserved(self):
         r = run_script("--format=json", "internal/hook/stop.go", cwd=self.work)
@@ -312,14 +319,17 @@ class IntentLookupTests(unittest.TestCase):
         self.assertTrue(any("intent: capture stop signals" in a for a in all_actions))
         self.assertTrue(any("learned:" in a for a in all_actions))
 
-    # ----- lookup: bidirectional prefix overlap -----
-    def test_broad_query_dir_matches_specific(self):
+    # ----- lookup: directory query -----
+    def test_dir_query_matches_mentions_within(self):
+        # querying the directory matches both the exact-file issue and the dir issue
         r = run_script("--format=json", "internal/hook/", cwd=self.work)
         data = json.loads(r.stdout)
         ids = sorted(i["id"] for i in data["issues"])
         self.assertEqual(ids, ["0001", "0002"])
 
-    def test_narrow_query_matches_broader_affected_path(self):
+    def test_sibling_dir_mention_matches_via_ancestor(self):
+        # internal/syncdb/foo.go → grep keys {.../foo.go, internal/syncdb};
+        # 0001 mentions internal/syncdb/ → matched. 0002 (internal/hook) not.
         r = run_script("--format=json", "internal/syncdb/foo.go", cwd=self.work)
         data = json.loads(r.stdout)
         ids = sorted(i["id"] for i in data["issues"])
@@ -352,162 +362,18 @@ class IntentLookupTests(unittest.TestCase):
         r = run_script(cwd=self.work)
         self.assertNotEqual(r.returncode, 0)
 
-    def test_lint_with_path_fails(self):
-        r = run_script("--lint", "internal/hook/stop.go", cwd=self.work)
+    def test_lint_flag_removed(self):
+        # --lint was removed; argparse should reject it
+        r = run_script("--lint", cwd=self.work)
         self.assertNotEqual(r.returncode, 0)
 
     # ----- frontmatter-less skip -----
     def test_frontmatter_less_skipped_in_lookup(self):
+        # no-frontmatter.md mentions internal/hook/stop.go but must be skipped
         r = run_script("--format=json", "internal/hook/stop.go", cwd=self.work)
         data = json.loads(r.stdout)
         for i in data["issues"]:
             self.assertNotIn("no-frontmatter", i["path"])
-
-    # ----- lint mode -----
-    def test_lint_detects_all_findings(self):
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        # 0004 has invalid decision_type → error → exit 2 (errors always gate)
-        self.assertEqual(r.returncode, 2)
-        data = json.loads(r.stdout)
-        codes_by_path = {}
-        for f in data["findings"]:
-            codes_by_path.setdefault(f["path"], []).append(f["code"])
-
-        # frontmatter missing
-        nf = [p for p in codes_by_path if "no-frontmatter" in p]
-        self.assertEqual(len(nf), 1)
-        self.assertIn("frontmatter_missing", codes_by_path[nf[0]])
-
-        # 0004: bogus decision_type (error) + broad + missing
-        f0004 = [p for p in codes_by_path if "0004" in p][0]
-        self.assertIn("decision_type_invalid", codes_by_path[f0004])
-        self.assertIn("affected_path_broad", codes_by_path[f0004])
-        self.assertIn("affected_path_missing", codes_by_path[f0004])
-
-        # exit code reflects errors when present
-        self.assertEqual(data["errors"], 1)
-
-    def test_lint_errors_force_exit_2(self):
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        # 0004 has invalid decision_type → error → exit 2
-        self.assertEqual(r.returncode, 2)
-
-    def test_lint_warnings_only_exit_zero_by_default(self):
-        # Replace 0004 (which has the only error) with a warnings-only fixture.
-        (self.work / "issues" / "0004-bug-fixture-lint-targets.md").unlink()
-        write(self.work / "issues" / "0004-bug-fixture-warnings-only.md", """
-            ---
-            decision_type: design
-            affected_paths:
-              - examples/
-              - examples/does-not-exist.go
-            tags: [lint, fixture]
-            ---
-
-            # Fixture: warnings only
-        """)
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        data = json.loads(r.stdout)
-        self.assertEqual(data["errors"], 0)
-        self.assertGreater(data["warnings"], 0)
-        # default: warnings do not gate
-        self.assertEqual(r.returncode, 0)
-
-    def test_lint_strict_warnings_force_exit_1(self):
-        (self.work / "issues" / "0004-bug-fixture-lint-targets.md").unlink()
-        write(self.work / "issues" / "0004-bug-fixture-warnings-only.md", """
-            ---
-            decision_type: design
-            affected_paths:
-              - examples/
-            tags: [lint, fixture]
-            ---
-
-            # Fixture: warnings only
-        """)
-        r = run_script("--lint", "--strict", "--format=json", cwd=self.work)
-        data = json.loads(r.stdout)
-        self.assertEqual(data["errors"], 0)
-        self.assertGreater(data["warnings"], 0)
-        self.assertEqual(r.returncode, 1)
-
-    def test_lint_ignore_broad_suppresses_warning(self):
-        # Add an issue that legitimately needs a broad path, with lint_ignore_broad.
-        write(self.work / "issues" / "0098-feat-meta-broad.md", """
-            ---
-            decision_type: process
-            affected_paths:
-              - examples/
-            lint_ignore_broad: [examples/]
-            tags: [fixture]
-            ---
-
-            # Fixture: legitimate broad
-        """)
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        data = json.loads(r.stdout)
-        for f in data["findings"]:
-            if "0098" in f["path"]:
-                self.assertNotEqual(f["code"], "affected_path_broad",
-                                    msg=f"ignore did not suppress: {f}")
-
-    def test_lint_ignore_missing_suppresses_warning(self):
-        write(self.work / "issues" / "0097-feat-future-path.md", """
-            ---
-            decision_type: design
-            affected_paths:
-              - future/path.go
-            lint_ignore_missing: [future/path.go]
-            tags: [fixture]
-            ---
-
-            # Fixture: future path
-        """)
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        data = json.loads(r.stdout)
-        for f in data["findings"]:
-            if "0097" in f["path"]:
-                self.assertNotEqual(f["code"], "affected_path_missing",
-                                    msg=f"ignore did not suppress: {f}")
-
-    def test_lint_ignore_only_matches_exact_path(self):
-        # ignore "foo/" should NOT suppress warnings for "bar/"
-        write(self.work / "issues" / "0096-feat-mismatch.md", """
-            ---
-            decision_type: design
-            affected_paths:
-              - bar/
-            lint_ignore_broad: [foo/]
-            tags: [fixture]
-            ---
-
-            # Fixture: ignore mismatch
-        """)
-        (self.work / "bar").mkdir()
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        data = json.loads(r.stdout)
-        codes = [f["code"] for f in data["findings"] if "0096" in f["path"]]
-        self.assertIn("affected_path_broad", codes)
-
-    def test_lint_top_level_files_not_broad(self):
-        # Add a top-level file reference that should NOT be broad
-        write(self.work / "issues" / "0099-feat-toplevel-file.md", """
-            ---
-            decision_type: design
-            affected_paths:
-              - Makefile
-            tags: [fixture]
-            ---
-
-            # Fixture: top-level file reference
-        """)
-        (self.work / "Makefile").write_text("# fixture\n")
-        r = run_script("--lint", "--format=json", cwd=self.work)
-        data = json.loads(r.stdout)
-        for f in data["findings"]:
-            if f["path"].endswith("0099-feat-toplevel-file.md"):
-                self.assertNotEqual(f["code"], "affected_path_broad",
-                                    msg=f"top-level file flagged as broad: {f}")
 
 
 class RenameAwareTests(unittest.TestCase):
@@ -520,6 +386,8 @@ class RenameAwareTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_query_new_path_finds_issue_with_old_path(self):
+        # query the new path; rename resolution adds old/file.go to grep keys,
+        # which the issue body still references → matched.
         r = run_script("--format=json", "new/file.go", cwd=self.work)
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         data = json.loads(r.stdout)
@@ -530,7 +398,7 @@ class RenameAwareTests(unittest.TestCase):
         self.assertTrue(any("old/file.go" in p for p in data["resolved_paths"]))
 
     def test_query_old_path_still_finds_issue(self):
-        # querying the old path itself: file no longer exists, but git log knows it
+        # querying the old path itself: file no longer exists, but the body references it
         r = run_script("--format=json", "old/file.go", cwd=self.work)
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         data = json.loads(r.stdout)

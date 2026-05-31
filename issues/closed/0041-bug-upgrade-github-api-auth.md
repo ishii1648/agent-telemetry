@@ -1,7 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/upgrade/
 tags: [upgrade, github, rate-limit]
 closed_at: 2026-05-28
 ---

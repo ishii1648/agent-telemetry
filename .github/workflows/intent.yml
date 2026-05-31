@@ -2,27 +2,29 @@ name: Intent
 
 on:
   pull_request:
-    paths:
-      - "issues/**"
-      - "scripts/intent-lookup"
-      - "scripts/test_intent_lookup.py"
-      - "Makefile"
-      - ".github/workflows/intent.yml"
 
 permissions:
   contents: read
 
 jobs:
-  lint:
+  # PR description must link a related issue (the why lives in issues/), or
+  # explicitly declare N/A for issue-less chores. This replaces the old
+  # affected_paths lint as the device that keeps the why discoverable.
+  pr-issue-link:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.x"
-      - name: Lint affected_paths
-        run: make intent-lint STRICT=1
+      - name: Require issue link or explicit N/A in PR description
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if printf '%s' "$BODY" | grep -Eq 'issues/[0-9]{4}-|\(N/A'; then
+            echo "OK: PR description references an issue or declares N/A."
+          else
+            echo "::error::PR description must link a related issue (issues/NNNN-<cat>-<slug>.md) or state '(N/A — chore)'." >&2
+            exit 1
+          fi
 
+  # Regression guard for the grep-based intent-lookup script.
   test:
     runs-on: ubuntu-latest
     steps:

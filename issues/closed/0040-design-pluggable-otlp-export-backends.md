@@ -1,10 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - docs/spec.md
-  - docs/design.md
-  - docs/metrics.md
-  - internal/serverclient/
 depends_on: [0038]
 tags: [otel, export, pluggable-backend, observability-backend, datadog, semantic-conventions]
 closed_at: 2026-05-30

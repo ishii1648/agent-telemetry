@@ -1,7 +1,5 @@
 ---
 decision_type: spec
-affected_paths:
-  - docs/metrics.md
 depends_on: [0040, 0043, 0044]
 tags: [otel, export, metrics, docs]
 ---

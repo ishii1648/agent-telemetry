@@ -1,11 +1,5 @@
 ---
 decision_type: spec
-affected_paths:
-  - internal/userid/
-  - internal/sessionindex/
-  - internal/syncdb/schema/schema.sql
-  - internal/syncdb/syncdb.go
-  - internal/agent/
 tags: [retro, multi-user, schema, server-aggregation]
 closed_at: 2026-05-08
 ---

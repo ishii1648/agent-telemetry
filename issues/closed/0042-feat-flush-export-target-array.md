@@ -1,10 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/serverclient/
-  - cmd/agent-telemetry/
-  - docs/spec.md
-  - deploy/otel-collector/
 depends_on: [0040]
 tags: [otel, export, pluggable-backend, datadog, collector]
 closed_at: 2026-05-30

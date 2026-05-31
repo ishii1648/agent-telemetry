@@ -1,16 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - docs/history.md
-  - issues/
-# meta issue: history.md の retro 化方針を定義し 11 件の retro issue を生成する
-# 規約系 issue なので issues/ への broad 参照は legitimate
-# (retro 化で 11 件の new issue を生むため、issues/ 全体への影響は legitimate)
-lint_ignore_broad:
-  - issues/
-# 0027 で docs/history.md 自体を廃止したため path 不在
-lint_ignore_missing:
-  - docs/history.md
 tags: [intent, history, retro, decision-record]
 closed_at: 2026-05-10
 ---

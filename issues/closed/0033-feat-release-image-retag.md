@@ -1,8 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - .github/workflows/docker-image.yml
-  - .github/workflows/release-tag-image.yml
 tags: [server, ci, ghcr, release]
 closed_at: 2026-05-11
 ---

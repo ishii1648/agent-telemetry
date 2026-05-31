@@ -1,9 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/backfill/
-  - internal/hook/stop.go
-  - internal/sessionindex/
 tags: [retro, backfill, hooks, batch]
 closed_at: 2026-04-30
 ---

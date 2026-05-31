@@ -1,14 +1,5 @@
 ---
 decision_type: spec
-affected_paths:
-  - cmd/agent-telemetry/main.go
-  - go.mod
-  - internal/legacy/
-  - internal/doctor/
-  - internal/upgrade/
-  - grafana/dashboards/agent-telemetry.json
-  - grafana/provisioning/datasources/
-  - README.md
 supersedes: [0014]
 tags: [retro, rename, breaking, packaging]
 closed_at: 2026-05-04

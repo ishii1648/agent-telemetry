@@ -1,14 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - docs/history.md
-  - CLAUDE.md
-  - AGENTS.md
-  - docs/spec.md
-  - docs/design.md
-# 本 issue で docs/history.md を削除したため path 不在
-lint_ignore_missing:
-  - docs/history.md
 supersedes: [0013, 0019]
 tags: [process, documentation, history, primary-store]
 closed_at: 2026-05-10

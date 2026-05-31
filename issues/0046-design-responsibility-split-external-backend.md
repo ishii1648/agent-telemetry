@@ -1,7 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - docs/design.md
 depends_on: [0040, 0042, 0043]
 tags: [design, otel, export, responsibility]
 ---

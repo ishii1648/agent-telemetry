@@ -1,9 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/serverclient/
-  - cmd/agent-telemetry/
-  - internal/sessionindex/
 tags: [server, push, client]
 closed_at: 2026-05-10
 ---

@@ -1,13 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - internal/install/
-  - internal/setup/
-  - internal/doctor/
-# ec8e905 で internal/install/ package 自体を廃止したため path 不在。
-# 本 issue は廃止前の hook 自動登録方針の決定記録として path を保持する。
-lint_ignore_missing:
-  - internal/install/
 tags: [retro, hooks, setup, doctor, dotfiles-integration]
 closed_at: 2026-05-10
 ---
