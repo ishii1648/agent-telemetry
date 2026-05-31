@@ -40,7 +40,12 @@ func EnsureSchema(db *sql.DB) error {
 	var current string
 	err := db.QueryRow("SELECT value FROM schema_meta WHERE key = 'schema_hash'").Scan(&current)
 	if err == nil && current == schema.Hash {
-		return nil
+		// Hash matches — the events table the server is the store of is current.
+		// A derived VIEW could still have been dropped out-of-band; repair it
+		// non-destructively (issue 0052). Never reapply the full schema on a
+		// hash match: schema.SQL drops the events table, which would wipe
+		// received events.
+		return schema.EnsureViews(db)
 	}
 	if err := dropLegacyRelations(db); err != nil {
 		return err

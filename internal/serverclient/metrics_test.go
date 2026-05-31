@@ -213,6 +213,74 @@ func TestFlush_MetricsGauge(t *testing.T) {
 	}
 }
 
+// dropView removes a relation from the test DB to simulate a DB whose derived
+// VIEWs went missing (an old binary's layout, or an out-of-band DROP).
+func (e *metricsTestEnv) dropView(name string) {
+	e.t.Helper()
+	db, err := sql.Open("sqlite", e.dbPath)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("DROP VIEW IF EXISTS " + name); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// TestFlush_MetricsHealsMissingPRMetricsView is the issue 0052 regression: a DB
+// that has events but no pr_metrics VIEW must not crash the metrics flush with
+// "no such table: pr_metrics". flush ensures the derived VIEWs non-destructively
+// before reading them, so the gauge is sent and the events are preserved.
+func TestFlush_MetricsHealsMissingPRMetricsView(t *testing.T) {
+	env := newMetricsTestEnv(t)
+	env.seedMergedPR("s1", "https://gh/pr/1", 100, 50, 4)
+	// weekly_pr_metrics depends on pr_metrics; drop both so the VIEW is genuinely
+	// absent (mirrors the broken-DB state the bug was hit on).
+	env.dropView("weekly_pr_metrics")
+	env.dropView("pr_metrics")
+	env.writeConfig("[[export]]\n" +
+		"id = \"dd\"\n" +
+		"endpoint = \"" + env.server.URL + "\"\n" +
+		"token = \"t\"\n" +
+		"signals = [\"metrics\"]\n")
+
+	res, err := env.run()
+	if err != nil {
+		t.Fatalf("flush must self-heal a missing pr_metrics VIEW, got: %v", err)
+	}
+	tr := res.PerAgent["claude"].Targets["dd"]
+	if tr == nil || tr.MetricsSeries != 1 {
+		t.Fatalf("MetricsSeries: got %+v, want 1 (VIEW recreated and read)", tr)
+	}
+	// The VIEW is back and the seeded events survived (the gauge value proves it).
+	p := env.decodeMetrics()
+	dps := gaugePoints(p, "agent_pr_total_tokens")
+	if len(dps) != 1 || dps[0].AsInt != "150" {
+		t.Errorf("agent_pr_total_tokens after heal: got %+v, want one point of 150", dps)
+	}
+}
+
+// TestFlush_MetricsUninitializedDBHint verifies the actionable failure for a DB
+// that was never built by sync-db (no events table). Rather than a cryptic
+// "no such table: pr_metrics", flush surfaces a hint to run sync-db first.
+func TestFlush_MetricsUninitializedDBHint(t *testing.T) {
+	env := newFlushTestEnv(t)
+	// No seed: the DB file does not exist / has no schema yet.
+	env.writeConfig("[[export]]\n" +
+		"id = \"dd\"\n" +
+		"endpoint = \"" + env.server.URL + "\"\n" +
+		"token = \"t\"\n" +
+		"signals = [\"metrics\"]\n")
+
+	_, err := env.run()
+	if err == nil {
+		t.Fatal("flush against an uninitialized DB must error")
+	}
+	if !strings.Contains(err.Error(), "sync-db") {
+		t.Errorf("error should hint at sync-db, got: %v", err)
+	}
+}
+
 // TestFlush_MetricsUpToDateSkips verifies the cursor optimization: a second
 // flush with no new events sends no gauge request and reports up-to-date.
 func TestFlush_MetricsUpToDateSkips(t *testing.T) {

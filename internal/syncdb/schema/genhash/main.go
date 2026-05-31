@@ -1,5 +1,6 @@
-// genhash reads schema.sql from the parent directory, computes its SHA256,
-// and writes schema_hash.go alongside it. Invoked via go:generate.
+// genhash reads schema.sql and views.sql from the parent directory, computes
+// the SHA256 over their composition (matching schema.SQL = schema.sql + "\n" +
+// views.sql), and writes schema_hash.go alongside them. Invoked via go:generate.
 package main
 
 import (
@@ -17,12 +18,20 @@ const Hash = %q
 `
 
 func main() {
-	data, err := os.ReadFile("schema.sql")
+	tables, err := os.ReadFile("schema.sql")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "read schema.sql: %v\n", err)
 		os.Exit(1)
 	}
-	sum := sha256.Sum256(data)
+	views, err := os.ReadFile("views.sql")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read views.sql: %v\n", err)
+		os.Exit(1)
+	}
+	// Hash the same string schema.go composes into schema.SQL, so any edit to
+	// either file changes the hash and triggers a rebuild.
+	composed := string(tables) + "\n" + string(views)
+	sum := sha256.Sum256([]byte(composed))
 	hash := hex.EncodeToString(sum[:])
 	out := fmt.Sprintf(outputTemplate, hash)
 	if err := os.WriteFile("schema_hash.go", []byte(out), 0644); err != nil {
