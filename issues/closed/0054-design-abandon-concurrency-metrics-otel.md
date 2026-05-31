@@ -2,11 +2,13 @@
 decision_type: design
 tags: [otel, grafana, concurrency, dashboard, fidelity-loss, tier4]
 related: [0050, 0053]
+closed_at: 2026-05-31
 ---
 
 # 並列度メトリクス（peak / avg concurrent）は otel+grafana では諦める
 
 Created: 2026-05-31
+Completed: 2026-05-31
 
 ## 決定
 
@@ -30,3 +32,13 @@ SQLite を Grafana datasource として参照する経路を廃し可視化を o
 
 - **日次 peak gauge を export して近似で残す**: 「日次 peak の max」は真の任意レンジ peak と意味が異なり、誤読を招く。明示的に abandon する方が誠実
 - **session_concurrency VIEW ごと削除**: client SoR / ローカル分析では有用なので VIEW は残す。落とすのは「メイン dashboard への表示」だけ
+
+## 解決方法
+
+決定どおり「メイン dashboard 表示の abandon」だけを実施し、VIEW は温存した。
+
+- `grafana/dashboards/agent-telemetry.json`: `peak concurrent` stat（旧 id=26）を削除し、残る 3 headline stat を `w=8` で 24 幅に均等再配置。`e2e/screenshot.sh` から panel 26 のキャプチャを除外し、`make grafana-screenshot` で `docs/assets/dashboard-full.png` を再生成。
+- `docs/design.md` / `docs/metrics.md`: 並列度は「SQLite + ローカル分析でのみ参照可能」と明記。metrics catalog の representation を `event-level` → `SQLite-only` に修正（gauge / record 間 join のいずれとも計算モデルが非互換であるため event-level 表現は誤りだった）。
+- `site/content/explain/metrics/index.md`: 公開 explain docs の主要指標テーブル・mermaid・交差分析から並列度を外し、「メイン dashboard 非搭載・SQLite-only」の注記に置換。
+- `internal/syncdb/schema/`（`session_intervals` / `session_concurrency_daily` / `session_concurrency_weekly` VIEW）は変更せず client SoR として残置。
+- otel 版 dashboard（`deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json`）は元から並列度パネルを持たず「Tier 4 は別管理」と明示済みのため、追加対応は不要だった。

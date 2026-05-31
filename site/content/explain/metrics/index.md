@@ -12,7 +12,7 @@ agent-telemetry が **何を観察しているか・なぜそれを選んだか*
 ```mermaid
 flowchart TB
     A1["<b>1. トークン効率</b><br/>1 PR を完了するのに何 token か<br/>― total / fresh / per_million_tokens"]
-    A2["<b>2. 開発生産性</b><br/>道筋を一発で見つけられているか<br/>― mid_session_msgs / review_comments / changes_requested / 同時実行数"]
+    A2["<b>2. 開発生産性</b><br/>道筋を一発で見つけられているか<br/>― mid_session_msgs / review_comments / changes_requested"]
 ```
 
 軸ごとに「答えたい疑問」と「主要指標」を並べると次のとおりです。
@@ -20,7 +20,7 @@ flowchart TB
 | 軸 | 答えたい疑問 | 主要指標 |
 |---|---|---|
 | 1. トークン効率 | 1 PR を完了するのに何 token かかっているか | `agent_pr_total_tokens` / `agent_pr_fresh_tokens` / `agent_pr_per_million_tokens` |
-| 2. 開発生産性 | 詰まらず PR をマージまで到達させられているか | `agent_session_mid_session_msgs_total` / `agent_pr_changes_requested` / `agent_concurrent_sessions_peak` |
+| 2. 開発生産性 | 詰まらず PR をマージまで到達させられているか | `agent_session_mid_session_msgs_total` / `agent_pr_changes_requested` |
 
 ## 落とし穴
 
@@ -64,9 +64,8 @@ token と違い「人間との対話量」が混ざるので、レビュア・PR
 | `mid_session_msgs` | エージェントが正しい道筋を見つけられない／ユーザが auto を信用しきれていない | 初手プロンプトの前提・ゴール・制約の明示で減らせる |
 | `ask_user_question` | 仕様不明瞭 | **Claude のみ計上**。Codex は 0 固定なので agent 跨ぎ比較不可 |
 | `changes_requested` | レビュー差し戻し | 人間レビュアの厳しさ・PR 規模に依存。同一レビュア・同一規模帯での時系列比較が安全 |
-| `concurrent_sessions_peak` | 並列度の上限 | peak が高い時期に token 効率が落ちていれば「並列やりすぎ」のサイン |
 
-`ended_at` が空のセッションは現在時刻で打ち切る扱いのため、**進行中セッションを含む時間帯は同時実行数が膨らみます**。
+> **並列度（`agent_concurrent_sessions_{avg,peak}`）はメイン dashboard に載せていません。** 区間（interval）の重なりは otel+grafana の gauge スナップショットから再構成できない（任意レンジの真の peak を保持できず、bucket をまたぐ合成もできない）ため、可視化では諦め **SQLite + ローカル分析でのみ参照可能** としています（決定: [issues/0054](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0054-design-abandon-concurrency-metrics-otel.md)）。ローカル SQLite で見る場合、`ended_at` が空のセッションは現在時刻で打ち切る扱いのため、**進行中セッションを含む時間帯は同時実行数が膨らむ** 点に注意します。
 
 ## 計測の実務
 
@@ -79,7 +78,7 @@ token と違い「人間との対話量」が混ざるので、レビュア・PR
 | ドリルダウン | PR → session → 内訳（input / output / cache_write / reasoning）→ transcript | PR → session の `mid_session_msgs` 推移 → transcript の人間介入局面 |
 | 時系列比較で固定するラベル | `model` / `agent_version` | `coding_agent` / レビュア |
 
-両軸を交差させる典型的な観察は **並列稼働の評価**: `concurrent_sessions_peak` が高い期間に `fresh_tokens / PR` も悪化していれば「並列詰め込み過ぎ」のサインです。
+両軸を交差させる典型的な観察は **並列稼働の評価** です（ただし並列度はメイン dashboard 非搭載のため、この交差分析はローカル SQLite で行います）: 同時実行のピークが高い期間に `fresh_tokens / PR` も悪化していれば「並列詰め込み過ぎ」のサインです。
 
 具体的なクエリとパネル定義は [grafana/dashboards/agent-telemetry.json](https://github.com/ishii1648/agent-telemetry/blob/main/grafana/dashboards/agent-telemetry.json) を参照してください。
 

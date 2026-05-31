@@ -56,7 +56,7 @@ agent-telemetry は **HITL 型コーディングエージェント（Claude Code
 - `agent_session_ask_user_question_total` — 仕様確認ツールの発火回数（Claude のみ、Codex は 0 固定）
 - `agent_pr_review_comments` — PR レビューコメント数
 - `agent_pr_changes_requested` — CHANGES_REQUESTED レビュー回数
-- `agent_concurrent_sessions_avg` / `agent_concurrent_sessions_peak` — 日次・週次の同時実行数。ユーザのマルチタスク上限を測る
+- `agent_concurrent_sessions_avg` / `agent_concurrent_sessions_peak` — 日次・週次の同時実行数。ユーザのマルチタスク上限を測る（**SQLite + ローカル分析のみ。otel+grafana では非対応** — 区間重なりが gauge スナップショットから再構成できないため abandon。[0054]）
 
 **解釈の注意**:
 - `mid_session_msgs` が高い = **エージェントが正しい道筋を見つけられない**、もしくはユーザが auto モードを信用しきれていない
@@ -147,10 +147,11 @@ snapshot 系（`agent.transcript.scanned` / `agent.pr.observed`）は同一セ�
 
 ### 外部 backend 上の representation
 
-各メトリクスは外部 observability backend 上で 2 通りの representation のどちらかで再現する（join 不可ゆえに 2 表現へ分けた帰結は親 issue [0040] を参照）。カタログ各表の **representation** 列がメトリクスごとの分類を示す。
+各メトリクスは representation を 3 分類する。**外部 observability backend 上で再現できるのは gauge / event-level の 2 通り**で（join 不可ゆえに 2 表現へ分けた帰結は親 issue [0040] を参照）、**SQLite-only は backend では再現せず SQLite + ローカル分析に閉じる**。カタログ各表の **representation** 列がメトリクスごとの分類を示す。
 
 - **gauge** — client がローカル `pr_metrics` VIEW を集約し、PR 単位の pre-aggregated 値を OTLP Metrics gauge（last-value）として送る（[0043]）。`agent_pr_*` 系がこれにあたり、backend では同名の gauge series をそのまま参照する（range 集計は `last` を取る前提。naive な SUM は二重計上になる）
-- **event-level** — raw events（OTLP Logs）の attribute を backend の measure / 次元タグに昇格し（attribute の意味分類は [0044] / `docs/spec.md`）、backend formula（count / sum / 区間計算）で算出する。session 単位・同時実行数の各メトリクスがこれにあたる
+- **event-level** — raw events（OTLP Logs）の attribute を backend の measure / 次元タグに昇格し（attribute の意味分類は [0044] / `docs/spec.md`）、backend formula（count / sum）で算出する。session 単位の各メトリクスがこれにあたる
+- **SQLite-only** — SQLite VIEW のローカル分析でのみ算出でき、**otel+grafana には再現できない**メトリクス。同時実行数（`agent_concurrent_sessions_{avg,peak}`）がこれにあたる。区間重なりの計算は flush 時点で値を固定する gauge とも、record 間 join をしない backend formula とも互換でないため、メイン dashboard には持ち込まず abandon する（[0054]）
 
 event-level の backend formula 例（Datadog の log-based metric。`agent.transcript.scanned` ログから token 流量を出す場合）:
 
@@ -232,10 +233,10 @@ representation は全行 **gauge**（client がローカル `pr_metrics` VIEW �
 
 | メトリクス名 | 型 | 値 | representation | 説明 |
 |---|---|---|---|---|
-| `agent_concurrent_sessions_avg` | gauge | float | event-level | bucket 内の平均同時実行数 |
-| `agent_concurrent_sessions_peak` | gauge | int | event-level | bucket 内のピーク同時実行数 |
+| `agent_concurrent_sessions_avg` | gauge | float | SQLite-only | bucket 内の平均同時実行数 |
+| `agent_concurrent_sessions_peak` | gauge | int | SQLite-only | bucket 内のピーク同時実行数 |
 
-同時実行数は `started` / `ended` の区間重なりから算出するため、backend では `agent_session_started/ended_timestamp_seconds`（event-level）の生ログに対する区間計算で再現する。単純な count / sum では出ない点に注意（`pr_metrics` gauge には含めない）。
+同時実行数は `started` / `ended` の区間重なりから算出するため、**SQLite + ローカル分析でのみ参照可能**で、otel+grafana には再現できない（メイン dashboard では abandon、[0054]）。任意レンジの真の peak は flush 時点で値を固定する gauge では保持できず（任意レンジ性）、bucket をまたぐ合成もできない（非分解性 — `max_over_time` で出せるのは「日次 peak の最大」止まり）。raw timestamp（`agent_session_started/ended_timestamp_seconds`）から backend formula で区間計算する案も、log-metric backend / Collector が record 間 join をしないため現実的でない。`session_concurrency_*` VIEW 自体は client SoR / ローカル分析のために残す（`pr_metrics` gauge には含めない）。
 
 ---
 
@@ -378,7 +379,7 @@ GROUP BY pr_url, coding_agent, model
 
 #### 代表例: `agent_concurrent_sessions_avg` / `peak`
 
-`session_concurrency_daily` / `session_concurrency_weekly` VIEW で `sessions.timestamp` と `sessions.ended_at` の区間重なりから算出。`ended_at` が空のセッションは現在時刻で打ち切る扱いのため、進行中セッションを含む時間帯は値が膨らむ。subagent / ghost / 運用ノイズリポジトリを除外。
+`session_concurrency_daily` / `session_concurrency_weekly` VIEW で `sessions.timestamp` と `sessions.ended_at` の区間重なりから算出。`ended_at` が空のセッションは現在時刻で打ち切る扱いのため、進行中セッションを含む時間帯は値が膨らむ。subagent / ghost / 運用ノイズリポジトリを除外。**この区間重なり計算は SQLite + ローカル分析でのみ参照可能で、otel+grafana には持ち込まない**（gauge スナップショットからは再構成できないため abandon、[0054]）。
 
 #### 代表例: `agent_session_is_subagent`
 
