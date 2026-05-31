@@ -1,8 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/serverclient/config.go
-  - deploy/oss-observability/config.toml.example
 tags: [flush, export-target, oss, credential]
 ---
 

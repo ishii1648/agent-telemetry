@@ -1,10 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - deploy/oss-observability/
-  - docs/spec.md
-  - docs/design.md
-  - site/content/setup/server/
 tags: [otel, collector, oss, mimir, loki, grafana]
 closed_at: 2026-05-31
 ---

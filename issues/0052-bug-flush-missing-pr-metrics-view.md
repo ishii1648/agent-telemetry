@@ -1,9 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/serverclient/flush.go
-  - internal/serverclient/metrics.go
-  - internal/syncdb/syncdb.go
 tags: [flush, metrics, pr_metrics, schema, sqlite]
 ---
 
