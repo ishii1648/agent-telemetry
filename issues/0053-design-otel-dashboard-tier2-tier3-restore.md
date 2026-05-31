@@ -1,11 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json
-  - internal/serverclient/metrics.go
-  - internal/syncdb/schema/schema.sql
-  - docs/spec.md
-  - docs/metrics.md
 tags: [otel, grafana, mimir, dashboard, metrics-export, tier2, tier3]
 related: [0040, 0043, 0050, 0054]
 ---

@@ -1,9 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json
-  - internal/syncdb/schema/schema.sql
-  - docs/design.md
 tags: [otel, grafana, concurrency, dashboard, fidelity-loss, tier4]
 related: [0050, 0053]
 ---
