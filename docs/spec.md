@@ -290,7 +290,7 @@ GROUP BY は (`pr_url`, `coding_agent`, `user_id`)。同一 PR が複数 agent /
 
 転送モデルは **append-only イベント列の OTLP/HTTP flush**。クライアントはローカル `events` テーブルから未送信行を抽出し、OTel Logs 形式で **1 つ以上の export target**（中央サーバ / OTel Collector / backend の OTLP intake）に送る。中央サーバ（`agent-telemetry-server`）は受信した events を冪等に追記し、`sessions` / `transcript_stats` / `pr_metrics` などは VIEW として組み立てる。実装方針・差分検知・配布形態の詳細は `docs/design.md ## サーバ側集約パイプライン` を参照。本節はクライアント・サーバの外部契約のみ記述する。
 
-> **pluggable export（[0040] / [0042]）**: 旧来の「単一 `[server]` + 固定 Bearer + JSON OTLP Logs」を、**endpoint + 可変 auth header + encoding/protocol + signal/representation を持つ export target の配列**に拡張した。`[server]` は安定 ID `"server"` の単一 target として後方互換に正規化される。**direct**（client → backend intake 直送）と **collector**（client → OTel Collector → fanout）の 2 デプロイレシピをサポートし、Datadog をリファレンス実装とする。本節は raw events（OTLP Logs）の representation を記述する。`pr_metrics` gauge（OTLP Metrics）の representation は [0043] で追加する。
+> **pluggable export（[0040] / [0042]）**: 旧来の「単一 `[server]` + 固定 Bearer + JSON OTLP Logs」を、**endpoint + 可変 auth header + encoding/protocol + signal/representation を持つ export target の配列**に拡張した。`[server]` は安定 ID `"server"` の単一 target として後方互換に正規化される。**direct**（client → backend intake 直送）と **collector**（client → OTel Collector → fanout）の 2 デプロイレシピをサポートし、Datadog をリファレンス実装とする。本節は raw events（OTLP Logs）の representation を記述し、`pr_metrics` gauge（OTLP Metrics）の representation は後述「`pr_metrics` gauge representation」節（[0043]）で記述する。
 
 ### 送信するデータ — events のみ
 
@@ -337,9 +337,9 @@ signals = ["logs"]
 | `auth_header` | string | `Authorization` | credential を載せる HTTP ヘッダ名。Datadog は `dd-api-key` |
 | `auth_scheme` | string | `Authorization` 時は `Bearer`、それ以外は空 | ヘッダ値の prefix。空なら raw token（`dd-api-key: <token>`）、非空なら `<scheme> <token>`（`Authorization: Bearer <token>`） |
 | `encoding` | string | `json` | wire encoding。`json`（自前サーバ / Collector）または `protobuf`（Datadog direct logs は protobuf 必須） |
-| `signals` | array | `["logs"]` | 送る representation。本仕様では `logs`（raw events / OTLP Logs）。`metrics`（`pr_metrics` gauge）は [0043] |
+| `signals` | array | `["logs"]` | 送る representation。`logs`（raw events / OTLP Logs）と `metrics`（`pr_metrics` gauge / OTLP Metrics、後述「`pr_metrics` gauge representation」節）の 2 種。両方指定可（`["logs", "metrics"]`）で、representation ごとに別 cursor で独立に前進する |
 
-設定された target が 1 つも無い、または全 target の `endpoint`/`token` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。`signals` に `logs` を含まない target は本仕様の logs flush では skip される（[0043] の metrics flush が扱う）。
+設定された target が 1 つも無い、または全 target の `endpoint`/`token` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。`signals` に `logs` を含む target だけが logs flush の対象、`metrics` を含む target だけが metrics flush の対象になる（両 representation は同一 flush 内で別経路として処理される）。
 
 #### endpoint モデル（base + signal path 補完）
 
@@ -348,7 +348,7 @@ target の `endpoint` は **base URL** とし、クライアントが signal ご
 | signal | 補完される path | 例（base = `https://otlp.datadoghq.com`） |
 |---|---|---|
 | logs | `/v1/logs` | `https://otlp.datadoghq.com/v1/logs` |
-| metrics（[0043]） | `/v1/metrics` | `https://otlp.datadoghq.com/v1/metrics` |
+| metrics | `/v1/metrics` | `https://otlp.datadoghq.com/v1/metrics` |
 
 Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metrics`）も自前サーバ（base + `/v1/logs`）もこのモデルに一致する。「signal ごとの完全 URL を設定する」方式は採らない。
 
@@ -363,9 +363,9 @@ Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metri
 
 | フラグ | 説明 |
 |---|---|
-| `--since-last`（既定） | `state.json` の `flush_cursors[target_id]`（各 target の cursor）より後に挿入された events を OTLP/HTTP で送信 |
-| `--full` | cursor を無視して events 全体を全 target に送信（サーバ初期化や障害復旧で使う。冪等なので二重送信は害がない） |
-| `--dry-run` | 送信せず target ごとの対象件数とサイズだけ表示 |
+| `--since-last`（既定） | logs target には `flush_cursors[target_id]` より後の events を送信。metrics target には新規イベントがあれば `pr_metrics` の現在値を gauge 送信（`metrics_cursors[target_id]` で判定、後述「`pr_metrics` gauge representation」節） |
+| `--full` | cursor を無視して全件送信。logs は events 全体、metrics は全 PR の現在 gauge 値を再送（サーバ初期化や障害復旧で使う。logs は冪等、gauge は新 timestamp の別点になるが `last` 集計では無害） |
+| `--dry-run` | 送信せず target ごとの対象件数とサイズだけ表示（logs / metrics それぞれの行を出す） |
 | `--agent <claude\|codex>` | agent を絞り込む。省略時は検出された全 agent |
 
 進行中セッション（`agent.session.ended` が未着）の events も送る。サーバ側 VIEW が「`session.ended` が無いセッションは `ended_at = NULL`」として表現するため、進行中の状態もダッシュボードに反映できる（旧設計と異なり、Stop 完了を待つ必要がない）。
@@ -380,11 +380,15 @@ Datadog の OTLP intake（`https://otlp.datadoghq.com` + `/v1/logs`・`/v1/metri
   "flush_cursors": {
     "server": 12345,
     "datadog": 12000
+  },
+  "metrics_cursors": {
+    "datadog": 12300
   }
 }
 ```
 
 - `flush_cursors` は **`{target_id: last_flushed_sequence}` の map**。各 target は自身の cursor を**独立**に持ち、その target への送信成功時のみ前進する（[0040] per-target cursor 契約）。`event_id` は冪等性キーであり差分 cursor には使わない（cursor は単調増加する `local_sequence`）
+- `metrics_cursors` は **`pr_metrics` gauge representation 専用の per-target cursor**（`flush_cursors` とは別）。raw events（logs）が「未送信行の append-only な差分送信」なのに対し、gauge は「VIEW を毎回再評価して全 PR の現在値を再送」するので、cursor の意味が異なる（後述「`pr_metrics` gauge representation」節）。同一 target が `logs` / `metrics` 両方を送る場合、両 map に同じ `target_id` のエントリを持つ
 - **独立前進**: target A 成功 / B 失敗の部分失敗時、A の cursor だけ進み B は据え置く。次回 flush で B の範囲のみ再送する（A は二重送信しない）。受理済み events は受信側 `INSERT OR IGNORE` で無害にスキップされる
 - **新規 target**: cursor 不在は 0 扱い（= 全 events を送る。冪等にスキップされるが raw-logs を新サーバに向ける初期同期は重い）
 - **レガシー seed**: `flush_cursors` に `"server"` エントリが無い場合に限り、旧フィールド `last_flushed_sequence` を `"server"` target の cursor として seed する（pre-0042 binary からのアップグレードで全履歴を再送しないため）。`last_flushed_sequence` 自体は後方互換のため残す
@@ -470,6 +474,67 @@ OTLP/HTTP の標準 `partialSuccess` レスポンスをそのまま使う（自�
 
 `rejectedLogRecords` は reject **件数**しか返さず、どの record が拒否されたかは示さない。永続拒否は同一データの再送で解消しないため、cursor を据え置く設計は無限ループになる。よって永続拒否はサーバ側 `rejected.log` への記録に委ね、クライアントは前進する。スキーマ不一致での全拒否は廃止（events table の DDL は安定で、新メトリクスは新属性で追加可能なため）。
 
+### `pr_metrics` gauge representation（OTLP Metrics）
+
+`signals` に `metrics` を含む target には、`pr_metrics` VIEW を **client 側で評価した PR 単位の pre-aggregated 値** を **OTLP Metrics gauge（last-value）** として送る。logs（raw events）と同じ差分スキャンから別 projection を作り、`metrics_cursors[target_id]` の独立 cursor で前進する（[0043]）。
+
+**なぜ client 集約か**: log-metric backend は record 間 join をしない。`pr_metrics` は token（`agent.transcript.scanned`）/ `pr_url`・`is_merged`（`agent.pr.observed`）/ `user_id`（`agent.session.started`）が別イベントに分散したものを `session_id` で join + latest-wins + sum して算出するので、raw events を流すだけでは backend で再現できない。よって client がローカル VIEW を評価して gauge で送る。
+
+**送信先 / encoding**: base endpoint + `/v1/metrics` に POST。auth header / encoding / gzip は logs と同じ target 設定に従う（Datadog の metrics intake は JSON / protobuf 両対応だが、logs と揃えて `protobuf` にできる）。
+
+**gauge の意味論（重要）**:
+
+- gauge は **冪等 upsert ではない**。各 data point は **送信時刻（flush 実行時刻）** で timestamp を打つ。同一 PR の再計算値は **同一 timestamp & dimensions の点のみ** last-write-wins で、新 timestamp での再送は series 内の **別の点**になる
+- したがって backend は range 集計で dimension set ごとに **`last`（または `max`）** を取る前提。**naive な SUM は二重計上**になる（同じ PR の累積スナップショットを時系列で足してしまう）
+- client は 1 flush 内で **PR（`pr_url` / `coding_agent` / `user_id`）ごとに 1 点だけ**送る（dimension set の重複なし）ので、`last` が一意に定まる
+- **temporality**: gauge は temporality を持たない（OTLP の delta/cumulative 要件は sum / histogram のみ）。Datadog の delta 要件も gauge 対象外なので設定不要
+
+**dimension（tag）**: `pr_metrics` VIEW の projection に等しく **`pr_url` / `coding_agent` / `user_id` / `task_type` / `model`** のみ。`session_id` は出さない（cardinality を PR 数で有界に抑える）。`repo` / `pr_state` / `branch` を tag に載せたい場合は VIEW projection の拡張が前提（本仕様では最小限に留め、後続 issue 送り）。
+
+**送る metric**: `pr_metrics` の各カラムを `docs/metrics.md` の `agent_pr_*` 名で gauge として送る。base measure（`agent_pr_total_tokens` / `agent_pr_fresh_tokens` / `agent_pr_input_tokens_total` ほか各 token・count）に加え、ratio（`agent_pr_session_count` / `agent_pr_tokens_per_session` / `agent_pr_tokens_per_tool_use` / `agent_pr_per_million_tokens`）も同梱する（backend 側 formula を持たない場合でも効率指標が出るように。formula を持つ backend は base measure から再計算してもよい）。ratio が NULL（分母 0）の PR はその点を送らない（偽の 0 を送らない）。`docs/metrics.md` 上の counter / gauge 区別に関わらず、wire 上は全て gauge（last-value）で送る。
+
+**cursor（`metrics_cursors`）**: gauge は VIEW を毎回再評価して全 PR を再送するので、logs のような「未送信行の cursor」とは意味が違う。`metrics_cursors[target_id]` は **最後に gauge flush した時点の `max(local_sequence)`** を記録し、新しいイベントが来ていない（= どの PR の値も変わりようがない）flush は **skip** する（同一値の冗長な点を送らないため）。送信成功時に現在の `max(local_sequence)` まで前進する。merged PR が 0 件でも（送る点が無くても）cursor は前進する（後から merge されると、より大きい `local_sequence` のイベントが追記されて次回拾われる）。`--full` は cursor を無視して全 PR の現在値を再送する。logs と同じく **transport 失敗時は cursor 据え置き**で次回再送する。
+
+OTLP/HTTP Metrics（JSON encoding）の例:
+
+```
+POST /v1/metrics
+Authorization: Bearer <api_key>
+Content-Type: application/json
+
+{
+  "resourceMetrics": [{
+    "resource": { "attributes": [
+      {"key": "service.name", "value": {"stringValue": "agent-telemetry"}}
+    ]},
+    "scopeMetrics": [{
+      "scope": {"name": "agent-telemetry/client"},
+      "metrics": [
+        {
+          "name": "agent_pr_total_tokens",
+          "gauge": { "dataPoints": [
+            {
+              "timeUnixNano": "1716000000000000000",
+              "asInt": "150",
+              "attributes": [
+                {"key": "pr_url",       "value": {"stringValue": "https://github.com/o/r/pull/1"}},
+                {"key": "coding_agent", "value": {"stringValue": "claude"}},
+                {"key": "user_id",      "value": {"stringValue": "alice"}},
+                {"key": "task_type",    "value": {"stringValue": "feat"}},
+                {"key": "model",        "value": {"stringValue": "claude-sonnet-4-6"}}
+              ]
+            }
+          ]}
+        },
+        { "name": "agent_pr_tokens_per_session", "gauge": { "dataPoints": [
+            { "timeUnixNano": "1716000000000000000", "asDouble": 150.0, "attributes": [ ... ] }
+        ]}}
+      ]
+    }]
+  }]
+}
+```
+
 ### サーバ binary
 
 サーバは `agent-telemetry-server` という別 binary で提供する。
@@ -528,7 +593,7 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 ### 適用範囲
 
 - **対象は raw events（OTLP Logs）側の全 attribute。** ここでの分類は `events` テーブルの各イベントが載せる attribute（「[イベント名と属性](#イベント名と属性)」）に効く。event-level 分析（素の token 推移・流量・カウント）を一級にするための整形である。
-- **`pr_metrics` gauge（OTLP Metrics）が載せる tag はこの分類とは別物。** gauge の tag は client 側 VIEW projection の出力（`pr_url` / `coding_agent` / `user_id` / `task_type` / `model`）に限られ、`repo` / `pr_state` / `branch` は VIEW に出力されておらず、`is_merged` は `pr_metrics` の WHERE で 1 固定（gauge では常に true なので tag にしても無意味）。下表の次元タグをそのまま gauge に載せられる前提にはしないこと。gauge へ追加の tag を載せたい場合は **VIEW projection 拡張が必要**で、これは [0043] の範囲（本節は raw events 側のみを扱う）。
+- **`pr_metrics` gauge（OTLP Metrics）が載せる tag はこの分類とは別物。** gauge の tag は client 側 VIEW projection の出力（`pr_url` / `coding_agent` / `user_id` / `task_type` / `model`）に限られ、`repo` / `pr_state` / `branch` は VIEW に出力されておらず、`is_merged` は `pr_metrics` の WHERE で 1 固定（gauge では常に true なので tag にしても無意味）。下表の次元タグをそのまま gauge に載せられる前提にはしないこと。[0043] では gauge tag を VIEW projection（上記 5 つ）に留め、`repo` / `pr_state` / `branch` 等を載せるための **VIEW projection 拡張は後続 issue に先送り**した（合否条件は「PR 単位 gauge が送れて backend で last 集計できる」ことなので tag 拡張は必須でない）。gauge の representation 仕様は「`pr_metrics` gauge representation」節を参照。
 - gauge（Metrics）は最初から metric なので facet / measure 概念は不要。本節の整形・facet/measure 化は **event-level 分析（Logs）の経路にのみ** 効く。
 
 ### 意味分類の対応表（backend 非依存 + Datadog リファレンス）

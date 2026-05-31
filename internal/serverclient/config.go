@@ -27,9 +27,16 @@ import (
 const (
 	defaultAuthHeader = "Authorization"
 	defaultAuthScheme = "Bearer"
-	defaultEncoding   = "json"
-	signalLogs        = "logs"
-	signalMetrics     = "metrics"
+
+	// Allowed `encoding` values (issue 0048 allow-list). signalJSON is also the
+	// default applied when the key is omitted.
+	signalJSON      = "json"
+	signalProtobuf  = "protobuf"
+	defaultEncoding = signalJSON
+
+	// Allowed `signals` values (issue 0048 allow-list).
+	signalLogs    = "logs"
+	signalMetrics = "metrics"
 
 	// legacyServerTargetID is the stable target_id synthesized for a config
 	// that only has the legacy [server] section. Keeping it stable lets the
@@ -64,10 +71,21 @@ func (t ExportTarget) Configured() bool {
 
 // SendsLogs reports whether this target wants the raw-events (OTLP Logs)
 // representation. Targets default to logs-only; the pr_metrics gauge (OTLP
-// Metrics) representation is added by 0043.
+// Metrics) representation is opt-in via signals = ["metrics"].
 func (t ExportTarget) SendsLogs() bool {
+	return t.hasSignal(signalLogs)
+}
+
+// SendsMetrics reports whether this target wants the pre-aggregated pr_metrics
+// gauge (OTLP Metrics, last-value) representation (issue 0043). A target may
+// send both ("logs" and "metrics"); each representation rides its own cursor.
+func (t ExportTarget) SendsMetrics() bool {
+	return t.hasSignal(signalMetrics)
+}
+
+func (t ExportTarget) hasSignal(want string) bool {
 	for _, s := range t.Signals {
-		if s == signalLogs {
+		if s == want {
 			return true
 		}
 	}
@@ -168,6 +186,11 @@ func LoadConfig(path string) ([]ExportTarget, error) {
 	if err := assertUniqueIDs(targets); err != nil {
 		return nil, err
 	}
+	for i := range targets {
+		if err := validateTarget(targets[i]); err != nil {
+			return nil, err
+		}
+	}
 	return targets, nil
 }
 
@@ -211,6 +234,29 @@ func normalizeTarget(t *ExportTarget) {
 	if len(t.Signals) == 0 {
 		t.Signals = []string{signalLogs}
 	}
+}
+
+// validateTarget rejects non-empty but unknown `encoding` / `signals` values
+// (issue 0048). normalizeTarget runs first, so empty values are already
+// defaulted (json / ["logs"]); this only ever sees configured values. Unknown
+// values are fail-fast like a missing/duplicate id rather than silently
+// fed to encodeBatch's JSON default branch (encoding) or dropped from both
+// logs/metrics target sets (signals), which made flush mislabel the wire or
+// report "export target 設定なし" with exit 0.
+func validateTarget(t ExportTarget) error {
+	switch t.Encoding {
+	case signalJSON, signalProtobuf:
+	default:
+		return fmt.Errorf("export target %q: unknown encoding %q (allowed: %q, %q)", t.ID, t.Encoding, signalJSON, signalProtobuf)
+	}
+	for _, s := range t.Signals {
+		switch s {
+		case signalLogs, signalMetrics:
+		default:
+			return fmt.Errorf("export target %q: unknown signal %q (allowed: %q, %q)", t.ID, s, signalLogs, signalMetrics)
+		}
+	}
+	return nil
 }
 
 // assertUniqueIDs rejects duplicate target ids: cursors are keyed by id, so two

@@ -73,6 +73,20 @@ type FlushTargetResult struct {
 	Rejected      int
 	RejectedError string
 	StateUpdated  bool
+
+	// Metrics* mirror the logs fields for the pr_metrics gauge representation
+	// (issue 0043). A target that sends both representations populates both
+	// halves. SendsMetrics reports whether this target opted into the gauge at
+	// all (so Summarize knows to print a metrics line); MetricsUpToDate is set
+	// when the gauge flush was skipped because no new event had arrived.
+	SendsMetrics         bool
+	MetricsUpToDate      bool
+	MetricsSeries        int // PR rows (dimension sets) sent this flush
+	MetricsBatches       int
+	MetricsPayloadBytes  int64
+	MetricsRejected      int
+	MetricsRejectedError string
+	MetricsStateUpdated  bool
 }
 
 type EventRow struct {
@@ -178,15 +192,20 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, targets []ExportTarget, opts FlushOptions) (*FlushAgentResult, error) {
 	ar := &FlushAgentResult{DryRun: opts.DryRun, Targets: map[string]*FlushTargetResult{}}
 
-	// logsTargets are the destinations that want the raw-events (OTLP Logs)
-	// representation and are populated enough to send. A metrics-only target
-	// (signals = ["metrics"]) is skipped here and handled by the gauge path
-	// (issue 0043); an unconfigured target (missing endpoint/token) is the
-	// opt-out case.
-	var logsTargets []ExportTarget
+	// Partition configured targets by representation. A target opts into each
+	// independently via signals; one target can be in both lists (it then rides
+	// two cursors). An unconfigured target (missing endpoint/token) is the
+	// opt-out case and appears in neither.
+	var logsTargets, metricsTargets []ExportTarget
 	for _, t := range targets {
-		if t.Configured() && t.SendsLogs() {
+		if !t.Configured() {
+			continue
+		}
+		if t.SendsLogs() {
 			logsTargets = append(logsTargets, t)
+		}
+		if t.SendsMetrics() {
+			metricsTargets = append(metricsTargets, t)
 		}
 	}
 
@@ -195,9 +214,10 @@ func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, targets [
 		return ar, fmt.Errorf("count events[%s]: %w", a.Name, err)
 	}
 
-	if len(logsTargets) == 0 {
-		// No destination opted in: report what would be sent (from a zero
-		// cursor) so the CLI can print the "not configured" hint, then return.
+	if len(logsTargets) == 0 && len(metricsTargets) == 0 {
+		// No destination opted into any representation: report what would be
+		// sent (from a zero cursor) so the CLI can print the "not configured"
+		// hint, then return.
 		ar.NoConfig = true
 		ar.Eligible = total
 		return ar, nil
@@ -208,68 +228,27 @@ func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, targets [
 		return ar, fmt.Errorf("load state[%s]: %w", a.Name, err)
 	}
 
+	// One send time for the whole agent flush: every gauge point is stamped
+	// with it so each flush is a single fresh sample per PR (see metrics.go).
+	nowNano := time.Now().UnixNano()
+
 	var firstErr error
 	stateDirty := false
+	noteErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	for _, t := range logsTargets {
-		tr := &FlushTargetResult{Endpoint: t.Endpoint, Encoding: t.Encoding}
-		ar.Targets[t.ID] = tr
-
-		after := cursorFor(state, t.ID)
-		if opts.Full {
-			after = 0
-		}
-		events, err := LoadEvents(db, a.Name, after)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("load events[%s/%s]: %w", a.Name, t.ID, err)
-			}
-			continue
-		}
-		tr.Sent = len(events)
-		tr.Skipped = total - tr.Sent
-
-		batches, err := splitEventBatches(events, opts.ClientVersion, MaxBatchBytes)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		tr.Batches = len(batches)
-
-		if opts.DryRun {
-			// Report the size in the target's own encoding so a protobuf
-			// destination shows its actual wire size, not the JSON estimate.
-			for _, b := range batches {
-				body, _, err := encodeBatch(t.Encoding, b)
-				if err != nil {
-					if firstErr == nil {
-						firstErr = err
-					}
-					break
-				}
-				tr.PayloadBytes += int64(len(body))
-			}
-			continue
-		}
-
-		if err := sendBatches(ctx, opts.HTTPClient, t, batches, tr); err != nil {
-			// Transport failure: the cursor stays put so the next flush resends
-			// this target's range. Other targets are unaffected (independent
-			// advance). Surface the first error but keep flushing the rest.
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if len(events) > 0 {
-			if state.FlushCursors == nil {
-				state.FlushCursors = map[string]int64{}
-			}
-			state.FlushCursors[t.ID] = events[len(events)-1].LocalSequence
-			stateDirty = true
-			tr.StateUpdated = true
-		}
+		dirty, err := flushLogsToTarget(ctx, db, a, t, opts, total, &state, ar)
+		noteErr(err)
+		stateDirty = stateDirty || dirty
+	}
+	for _, t := range metricsTargets {
+		dirty, err := flushMetricsToTarget(ctx, db, a, t, opts, nowNano, &state, ar)
+		noteErr(err)
+		stateDirty = stateDirty || dirty
 	}
 
 	if stateDirty {
@@ -278,6 +257,140 @@ func runFlushForAgent(ctx context.Context, db *sql.DB, a *agent.Agent, targets [
 		}
 	}
 	return ar, firstErr
+}
+
+// targetResult returns the shared per-target result, creating it on first use.
+// Both representations write into the same struct so a target sending logs and
+// metrics reports both halves under one id.
+func (ar *FlushAgentResult) targetResult(t ExportTarget) *FlushTargetResult {
+	if tr := ar.Targets[t.ID]; tr != nil {
+		return tr
+	}
+	tr := &FlushTargetResult{Endpoint: t.Endpoint, Encoding: t.Encoding}
+	ar.Targets[t.ID] = tr
+	return tr
+}
+
+// flushLogsToTarget sends the raw-events (OTLP Logs) representation to one
+// target and reports whether the shared state was mutated (cursor advanced).
+func flushLogsToTarget(ctx context.Context, db *sql.DB, a *agent.Agent, t ExportTarget, opts FlushOptions, total int, state *backfill.State, ar *FlushAgentResult) (bool, error) {
+	tr := ar.targetResult(t)
+
+	after := cursorFor(*state, t.ID)
+	if opts.Full {
+		after = 0
+	}
+	events, err := LoadEvents(db, a.Name, after)
+	if err != nil {
+		return false, fmt.Errorf("load events[%s/%s]: %w", a.Name, t.ID, err)
+	}
+	tr.Sent = len(events)
+	tr.Skipped = total - tr.Sent
+
+	batches, err := splitEventBatches(events, opts.ClientVersion, MaxBatchBytes)
+	if err != nil {
+		return false, err
+	}
+	tr.Batches = len(batches)
+
+	if opts.DryRun {
+		// Report the size in the target's own encoding so a protobuf
+		// destination shows its actual wire size, not the JSON estimate.
+		for _, b := range batches {
+			body, _, err := encodeBatch(t.Encoding, b)
+			if err != nil {
+				return false, err
+			}
+			tr.PayloadBytes += int64(len(body))
+		}
+		return false, nil
+	}
+
+	if err := sendBatches(ctx, opts.HTTPClient, t, batches, tr); err != nil {
+		// Transport failure: the cursor stays put so the next flush resends
+		// this target's range. Other targets are unaffected (independent
+		// advance).
+		return false, err
+	}
+	if len(events) > 0 {
+		if state.FlushCursors == nil {
+			state.FlushCursors = map[string]int64{}
+		}
+		state.FlushCursors[t.ID] = events[len(events)-1].LocalSequence
+		tr.StateUpdated = true
+		return true, nil
+	}
+	return false, nil
+}
+
+// flushMetricsToTarget evaluates the local pr_metrics VIEW and sends every PR's
+// current value as an OTLP Metrics gauge (last-value) to one target. It rides
+// the separate metrics cursor: the flush is skipped when no new event has
+// arrived since the last gauge flush (no event ⇒ no PR value can have changed),
+// avoiding redundant identical points. On a successful send the cursor advances
+// to the current max local_sequence. See metrics.go for the gauge semantics.
+func flushMetricsToTarget(ctx context.Context, db *sql.DB, a *agent.Agent, t ExportTarget, opts FlushOptions, nowNano int64, state *backfill.State, ar *FlushAgentResult) (bool, error) {
+	tr := ar.targetResult(t)
+	tr.SendsMetrics = true
+
+	maxSeq, err := maxLocalSequence(db, a.Name)
+	if err != nil {
+		return false, fmt.Errorf("max sequence[%s/%s]: %w", a.Name, t.ID, err)
+	}
+	if !opts.Full && maxSeq <= metricsCursorFor(*state, t.ID) {
+		tr.MetricsUpToDate = true
+		return false, nil
+	}
+
+	rows, err := LoadPRMetrics(db, a.Name)
+	if err != nil {
+		return false, fmt.Errorf("load pr_metrics[%s/%s]: %w", a.Name, t.ID, err)
+	}
+	tr.MetricsSeries = len(rows)
+
+	batches, err := splitMetricBatches(rows, opts.ClientVersion, nowNano, MaxBatchBytes)
+	if err != nil {
+		return false, err
+	}
+	tr.MetricsBatches = len(batches)
+
+	if opts.DryRun {
+		for _, b := range batches {
+			body, _, err := encodeMetricsBatch(t.Encoding, b)
+			if err != nil {
+				return false, err
+			}
+			tr.MetricsPayloadBytes += int64(len(body))
+		}
+		return false, nil
+	}
+
+	endpoint, err := metricsURL(t.Endpoint)
+	if err != nil {
+		return false, err
+	}
+	for _, b := range batches {
+		resp, wire, err := postMetricsBatch(ctx, opts.HTTPClient, t, endpoint, b)
+		tr.MetricsPayloadBytes += int64(wire)
+		if err != nil {
+			// Transport failure: hold the metrics cursor so the next flush
+			// re-sends the current gauge values.
+			return false, err
+		}
+		tr.MetricsRejected += resp.PartialSuccess.RejectedDataPoints
+		if resp.PartialSuccess.RejectedDataPoints > 0 && resp.PartialSuccess.ErrorMessage != "" {
+			tr.MetricsRejectedError = resp.PartialSuccess.ErrorMessage
+		}
+	}
+	// Advance even when rows is empty (no merged PRs yet): the cursor records
+	// that we have processed up to maxSeq, so we don't re-scan an unchanged
+	// VIEW every flush. A later merge appends a higher-sequence event.
+	if state.MetricsCursors == nil {
+		state.MetricsCursors = map[string]int64{}
+	}
+	state.MetricsCursors[t.ID] = maxSeq
+	tr.MetricsStateUpdated = true
+	return true, nil
 }
 
 // sendBatches posts every batch to one target. On the first transport failure
@@ -317,6 +430,14 @@ func cursorFor(s backfill.State, targetID string) int64 {
 		return s.LastFlushedSequence
 	}
 	return 0
+}
+
+// metricsCursorFor returns the max local_sequence observed at the last gauge
+// flush to a target. Unlike cursorFor there is no legacy seed: the gauge
+// representation is new in 0043, so an absent entry means "never flushed" and
+// starts at 0 (the first flush re-fills every PR's current value).
+func metricsCursorFor(s backfill.State, targetID string) int64 {
+	return s.MetricsCursors[targetID]
 }
 
 func countEvents(db *sql.DB, codingAgent string) (int, error) {
@@ -491,42 +612,9 @@ func postLogsBatch(ctx context.Context, client *http.Client, t ExportTarget, end
 	if err != nil {
 		return flushResponse{}, 0, err
 	}
-	var reqBody io.Reader = bytes.NewReader(body)
-	contentEncoding := ""
-	wireSize := len(body)
-	if len(body) >= gzipThreshold {
-		var buf bytes.Buffer
-		gz := gzip.NewWriter(&buf)
-		if _, err := gz.Write(body); err != nil {
-			return flushResponse{}, 0, fmt.Errorf("gzip write: %w", err)
-		}
-		if err := gz.Close(); err != nil {
-			return flushResponse{}, 0, fmt.Errorf("gzip close: %w", err)
-		}
-		reqBody = &buf
-		contentEncoding = "gzip"
-		wireSize = buf.Len()
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, reqBody)
+	respBody, wireSize, err := doPost(ctx, client, t, endpoint, body, contentType)
 	if err != nil {
-		return flushResponse{}, 0, fmt.Errorf("new request: %w", err)
-	}
-	req.Header.Set("Content-Type", contentType)
-	req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
-	if contentEncoding != "" {
-		req.Header.Set("Content-Encoding", contentEncoding)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return flushResponse{}, wireSize, fmt.Errorf("post: %w", err)
-	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return flushResponse{}, wireSize, fmt.Errorf("read response: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		return flushResponse{}, wireSize, fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return flushResponse{}, wireSize, err
 	}
 	var r flushResponse
 	// A protobuf intake (Datadog) replies with a protobuf
@@ -539,6 +627,53 @@ func postLogsBatch(ctx context.Context, client *http.Client, t ExportTarget, end
 		}
 	}
 	return r, wireSize, nil
+}
+
+// doPost encodes auth/gzip and POSTs a pre-serialized body, returning the
+// (size-limited) response body and the wire size. It is the shared transport
+// for both the logs and metrics representations; only the response decoding
+// (partialSuccess shape) differs per signal and stays in the callers. A non-2xx
+// status is a transport failure (returned as an error) so the caller holds its
+// cursor for a retry.
+func doPost(ctx context.Context, client *http.Client, t ExportTarget, endpoint string, body []byte, contentType string) ([]byte, int, error) {
+	var reqBody io.Reader = bytes.NewReader(body)
+	contentEncoding := ""
+	wireSize := len(body)
+	if len(body) >= gzipThreshold {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write(body); err != nil {
+			return nil, 0, fmt.Errorf("gzip write: %w", err)
+		}
+		if err := gz.Close(); err != nil {
+			return nil, 0, fmt.Errorf("gzip close: %w", err)
+		}
+		reqBody = &buf
+		contentEncoding = "gzip"
+		wireSize = buf.Len()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, reqBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set(t.AuthHeader, authValue(t.AuthScheme, t.Token))
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, wireSize, fmt.Errorf("post: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, wireSize, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, wireSize, fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return respBody, wireSize, nil
 }
 
 // encodeBatch serializes a payload in the requested wire encoding and returns
@@ -587,6 +722,10 @@ func (r *FlushResult) Summarize(w io.Writer) {
 			if ar.DryRun {
 				fmt.Fprintf(w, "flush[%s→%s] dry-run: sent=%d skipped=%d batches=%d payload=%d bytes encoding=%s\n",
 					name, id, tr.Sent, tr.Skipped, tr.Batches, tr.PayloadBytes, tr.Encoding)
+				if tr.SendsMetrics {
+					fmt.Fprintf(w, "flush[%s→%s] dry-run (metrics): series=%d batches=%d payload=%d bytes encoding=%s\n",
+						name, id, tr.MetricsSeries, tr.MetricsBatches, tr.MetricsPayloadBytes, tr.Encoding)
+				}
 				continue
 			}
 			fmt.Fprintf(w, "flush[%s→%s]: sent=%d skipped=%d batches=%d payload=%d bytes encoding=%s rejected=%d\n",
@@ -596,6 +735,18 @@ func (r *FlushResult) Summarize(w io.Writer) {
 				// them); warn so the operator can inspect the server's rejected.log.
 				fmt.Fprintf(w, "  warning: %d records permanently rejected by %s (not retried): %s\n",
 					tr.Rejected, id, tr.RejectedError)
+			}
+			if tr.SendsMetrics {
+				if tr.MetricsUpToDate {
+					fmt.Fprintf(w, "flush[%s→%s] (metrics): up-to-date — no new events since last gauge flush\n", name, id)
+				} else {
+					fmt.Fprintf(w, "flush[%s→%s] (metrics): series=%d batches=%d payload=%d bytes encoding=%s rejected=%d\n",
+						name, id, tr.MetricsSeries, tr.MetricsBatches, tr.MetricsPayloadBytes, tr.Encoding, tr.MetricsRejected)
+					if tr.MetricsRejected > 0 {
+						fmt.Fprintf(w, "  warning: %d gauge points permanently rejected by %s (not retried): %s\n",
+							tr.MetricsRejected, id, tr.MetricsRejectedError)
+					}
+				}
 			}
 		}
 	}
