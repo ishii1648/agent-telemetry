@@ -22,7 +22,9 @@ services:
     environment:
       DEPLOY_ENV: ${DEPLOY_ENV:-dev}
     ports:
-      - "4318:4318" # OTLP/HTTP (clients flush here)
+      # host port は env で可変（既定 4318）。スクショ用の e2e stack を
+      # `make oss-up` と別 port・別 project で並走させるため (issue 0055 ⑤)。
+      - "${OSS_COLLECTOR_PORT:-4318}:4318" # OTLP/HTTP (clients flush here)
     depends_on:
       - mimir
       - loki
@@ -34,7 +36,7 @@ services:
       - ./mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
       - mimir-data:/data
     ports:
-      - "9009:9009" # HTTP (OTLP ingest + Prometheus query API)
+      - "${OSS_MIMIR_PORT:-9009}:9009" # HTTP (OTLP ingest + Prometheus query API)
 
   loki:
     image: grafana/loki:3.3.2
@@ -43,7 +45,7 @@ services:
       - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
       - loki-data:/loki
     ports:
-      - "3100:3100" # HTTP (OTLP ingest + LogQL query API)
+      - "${OSS_LOKI_PORT:-3100}:3100" # HTTP (OTLP ingest + LogQL query API)
 
   grafana:
     image: grafana/grafana-oss:11.5.2

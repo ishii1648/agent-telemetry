@@ -1,0 +1,23 @@
+# 決定的スクショ用の overlay (issue 0055 ⑤)。
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.screenshot.yaml up -d
+#
+# base compose (Collector / Mimir / Loki / Grafana) に Grafana Image Renderer を
+# 足し、Grafana の /render エンドポイントを有効化する。renderer は SQLite e2e の
+# top-level docker-compose.yaml と同じ image / 同じ配線。
+#
+# 本番の `make oss-up` には renderer を積まない（スクショ時だけ overlay で足す）。
+# compose は environment / depends_on を base とマージするので、ここでは Grafana に
+# render 設定を追記し renderer service を追加するだけでよい。
+services:
+  grafana:
+    environment:
+      - GF_RENDERING_SERVER_URL=http://oss-renderer:8081/render
+      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
+    depends_on:
+      - oss-renderer
+
+  oss-renderer:
+    image: grafana/grafana-image-renderer:3.11.6
+    expose:
+      - "8081"

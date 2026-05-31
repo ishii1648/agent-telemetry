@@ -5,9 +5,11 @@ weight: 10
 
 ローカルマシンに agent-telemetry を導入する手順です。
 
-agent-telemetry は **ローカル単独で完結** します。本ページの手順を実施すると、`~/.claude/agent-telemetry.db` に集計結果が蓄積され、Grafana ダッシュボードで PR 単位の token 効率や開発生産性を可視化できます。
+agent-telemetry は **ローカル単独で完結** します。本ページの手順を実施すると、`~/.claude/agent-telemetry.db`（client 側 SoR）に開発セッションが蓄積され、`flush` 経由で立ち上げたローカルの **otel スタック（OTel Collector → Mimir / Loki → Grafana）** で PR 単位の token 効率や開発生産性を可視化できます。
 
-複数マシンやチームメンバーで集計値を集約したい場合は、**オプトイン** で `agent-telemetry-server` に送信する経路を有効化できます（[server]({{< relref "/setup/server" >}})）。サーバ送信を設定しなくてもローカル利用は従来どおり動きます。
+ローカル可視化は **otel+grafana に一本化** しました。SQLite (`~/.claude/agent-telemetry.db`) は append-only な `events` テーブルと集約 VIEW を保持する **client 側 SoR** で、Grafana は SQLite を直接読まず、`flush` がローカルの OTel Collector に送ったデータを Mimir/Loki 経由で読みます。SQLite を Grafana datasource に直結する旧経路は [legacy 経路](#legacy-sqlite-datasource-を直接読む経路) として残していますが、新規導入では otel スタックを推奨します。
+
+複数マシンやチームメンバーで集計値を集約したい場合は、同じ `flush` の export target を中央 `agent-telemetry-server` や外部 backend に向けるだけで拡張できます（[server]({{< relref "/setup/server" >}})）。export を設定しなければデータ収集と SQLite 集約は従来どおり動き、どこへも送信しません。
 
 動作の仕組みは [仕組み解説]({{< relref "/explain" >}}) と [docs/spec.md](https://github.com/ishii1648/agent-telemetry/blob/main/docs/spec.md) を参照してください。
 
@@ -15,10 +17,11 @@ agent-telemetry は **ローカル単独で完結** します。本ページの�
 
 | ツール | 用途 |
 |--------|------|
-| Grafana 11+ | ダッシュボード表示 |
-| [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource) | Grafana の SQLite プラグイン |
+| Docker + Docker Compose | otel スタック（Collector / Mimir / Loki / Grafana）の 1 コマンド起動 |
 | gh CLI | PR URL の自動補完（`backfill` コマンド） |
-| Docker（任意） | E2E テスト用の Grafana 環境 |
+| Go 1.25+（任意） | ソースからビルドする場合 / `make oss-flush` を使う場合 |
+
+> otel スタックは Grafana も含めて compose が提供するため、Grafana や SQLite プラグインを個別に用意する必要はありません（[legacy SQLite datasource 経路](#legacy-sqlite-datasource-を直接読む経路) を使う場合のみ Grafana 11+ と [frser-sqlite-datasource](https://github.com/fr-ser/grafana-sqlite-datasource) が必要です）。
 
 ## 1. CLI のインストール
 
@@ -119,7 +122,54 @@ agent-telemetry sync-db
 
 特定 agent だけを処理したい場合は `--agent <claude|codex>` を付けます。省略時は検出された agent すべてを対象にします。
 
-## 4. Grafana ダッシュボードの設定
+## 4. ローカル可視化（otel スタック）
+
+リポジトリを clone した環境で、Collector → Mimir / Loki → Grafana の最小スタックを 1 コマンドで起動します。`flush` がローカルの Collector（認証不要）にデータを push し、Grafana がそれを Mimir（gauge metrics）/ Loki（raw events logs）経由で表示します。
+
+### 4-1. config.toml に export target を追加
+
+ローカル可視化は `flush` を localhost の Collector に向ける **credential 不要の export target** で成り立ちます。[`deploy/oss-observability/config.toml.example`](https://github.com/ishii1648/agent-telemetry/blob/main/deploy/oss-observability/config.toml.example) を `~/.config/agent-telemetry/config.toml` にコピーするか、以下を追記します:
+
+```toml
+[[export]]
+id = "oss-collector"
+endpoint = "http://localhost:4318"   # base URL; client が /v1/logs・/v1/metrics を補完
+encoding = "json"                    # Collector 宛ては JSON（既定）
+signals = ["logs", "metrics"]        # raw events(logs) と pr_metrics gauge(metrics) 両方
+# token は不要（ローカル Collector は認証なし）
+```
+
+> ローカル Collector は認証なしのため `token` は省略します。`endpoint` さえあれば送信対象になります（[docs/spec.md「サーバ送信」](https://github.com/ishii1648/agent-telemetry/blob/main/docs/spec.md#サーバ送信)）。
+
+### 4-2. スタックを起動して flush
+
+```fish
+make oss-up      # Collector(:4318) → Mimir/Loki → Grafana(:13001) を起動
+make oss-flush   # ツリーをビルド → sync-db → flush（hook データを otel スタックへ投入）
+```
+
+`make oss-up` は Grafana を <http://localhost:13001>（匿名ログイン・Admin）で立ち上げます。停止は `make oss-down`。port を変えたい場合は `OSS_GRAFANA_PORT=<port> make oss-up`。
+
+> `make oss-flush` は現在のツリーをビルドしてから `sync-db` → `flush` を実行します（導入済みバイナリが `flush` 非対応の古い版でも確実に流すため）。導入済みバイナリで流す場合は `agent-telemetry sync-db; agent-telemetry flush` を手で実行します。
+
+### 4-3. dashboard を開く
+
+Grafana（<http://localhost:13001>）の **agent-telemetry (OSS)** フォルダにある `agent-telemetry (OSS backend)` dashboard を開きます。次の 4 ブロックで構成されます:
+
+- **状態評価（Tier 2）** — merged PRs / total tokens / PR per 1M tokens の stat と週別 merged PR 数 trend（`agent_pr_*` gauge を `last_over_time` で集約。`pr_metrics`（`is_merged = 1` 限定）由来のため merged-PR 寄与分）。
+- **session-grain（Tier 3）** — top-level sessions 数と週別 token 消費 / tokens per session / ask_user_question per session（`agent_weekly_session_*` gauge 由来。非 PR・未マージを含む全 top-level session を session 単位で集計）。
+- **PR 単位の外れ値検出（Tier 1）** — PR 別 token スコアカード / session_count / tokens per tool_use。
+- **Raw events（Tier 1）** — Loki の OTLP Logs を LogQL でドリルダウン。
+
+レシピの詳細・確認クエリ・Datadog レシピとの対応・Kubernetes への橋渡しは [`deploy/oss-observability/README.md`](https://github.com/ishii1648/agent-telemetry/blob/main/deploy/oss-observability/README.md) を参照してください。
+
+> **gauge は sparse 系列**: `agent_pr_*` / `agent_weekly_session_*` は flush した瞬間だけ push される sparse gauge です。素の instant クエリ（`sum(agent_pr_total_tokens)` 等）は最後の flush から Prometheus lookback delta（既定 5 分）を超えると空になるため、range 集計は必ず `last_over_time(metric[$__range])` で最終値を拾います（dashboard はこの idiom で実装済み）。
+
+## legacy: SQLite datasource を直接読む経路
+
+> **新規導入では非推奨**。otel スタック（上の手順 4）が第一級のローカル可視化です。以下は export を設定せず、SQLite (`~/.claude/agent-telemetry.db`) を Grafana の SQLite datasource で**直接** SQL 集計したい低レベル / オフライン用途のために残している経路です。otel 経路と機能は重複します。
+
+frser-sqlite-datasource プラグインを入れた Grafana で `grafana/dashboards/agent-telemetry.json` を読みます。
 
 ### 方法 A: ローカル Grafana に手動設定
 
@@ -161,7 +211,7 @@ jsonData:
 リポジトリを clone した環境では、実 DB を mount した Grafana コンテナを 1 コマンドで起動できます。
 
 ```fish
-make grafana-up          # ~/.claude/agent-telemetry.db を mount → http://localhost:13000
+make grafana-up          # ~/.claude/agent-telemetry.db を mount → http://localhost:13010
 make grafana-down
 ```
 

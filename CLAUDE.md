@@ -66,9 +66,11 @@ make grafana-screenshot                # E2E: Grafana スクリーンショッ�
 
 ### ダッシュボード変更時の必須作業
 
-- `grafana/dashboards/agent-telemetry.json` の表示を変更した場合は、必ず `make grafana-screenshot` を実行して README 用スクリーンショット（`docs/assets/dashboard-*.png`）も同じ変更に合わせて更新する（`grafana-screenshot` は `grafana-up-e2e` 経由で fixture データを使うので、画像が決定的に再現される）。
-- スクリーンショット生成でポート競合が起きる場合は `GRAFANA_PORT=<unused-port> make grafana-screenshot` を使う。
-- 実データで動作確認したい場合は `make grafana-up`（`~/.claude/agent-telemetry.db` を mount）。E2E と同じコンテナを使うので、切替時は片方が再作成される。
+otel 一本化（[0055]）後、dashboard とスクショは 2 系統に分かれる。変更した dashboard に対応する make ターゲットを必ず実行する:
+
+- **OSS otel dashboard（メイン）** `deploy/oss-observability/grafana/dashboards/agent-telemetry-oss.json` を変更した場合は、必ず `make oss-screenshot` を実行して README ヒーロー（`docs/assets/dashboard-full.png`）を更新する。これが README ヒーローの **owner**。`e2e/oss-screenshot.sh` が fixture を HOME サンドボックス flush で Mimir/Loki に決定的投入して撮る（build / fixture / compose / flush / render / down -v まで一括。詳細は `docs/design.md ## 可視化層 > E2E スクリーンショット`）。port を変えたい場合は `GRAFANA_PORT=<port> OSS_MIMIR_PORT=<port> ... make oss-screenshot`。
+- **SQLite dashboard（legacy datasource 経路）** `grafana/dashboards/agent-telemetry.json` を変更した場合は `make grafana-screenshot` を実行する。これは `.outputs/grafana-screenshots/` のパネル PNG と `docs/assets/dashboard-pr-scorecard.png` を更新するが、**README ヒーロー（`dashboard-full.png`）は上書きしない**（otel 一本化でヒーローは OSS 側に移管済み。`e2e/screenshot.sh` から hero コピーを外してある）。ポート競合時は `GRAFANA_PORT=<unused-port> make grafana-screenshot`。
+- 実データで動作確認したい場合: otel は `make oss-up` → `make oss-flush`（`:13001`）、SQLite legacy は `make grafana-up`（`~/.claude/agent-telemetry.db` を mount、`:13010`）。`grafana-up` は E2E と同じコンテナを使うので切替時は片方が再作成される。`make oss-screenshot` のスクショ stack は別 port・別 project なので `make oss-up` と並走できる。
 
 ### docs site（`site/`）
 
