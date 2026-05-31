@@ -37,7 +37,7 @@ Completed: 2026-05-31
 スキーマ DDL を耐久層と派生層に分離し、**派生 VIEW を非破壊で再生成できる経路**を作って自己修復に充てた。
 
 - `internal/syncdb/schema/schema.sql` を `schema.sql`（events / schema_meta テーブル + index）と `views.sql`（全 VIEW + トリガ）に分割。`schema.SQL = schema.sql + views.sql` を合成し、`genhash` は合成文字列に対してハッシュを計算する。
-- `schema.EnsureViews` を追加（`pr_metrics` VIEW の有無を確認し、欠落していれば `views.sql` のみ適用＝events を触らない非破壊修復）。events テーブル自体が無ければ `schema.ErrEventsTableMissing` を返す。
+- `schema.EnsureViews` を追加（`views.sql` が宣言する全 VIEW / トリガの有無を `sqlite_master` で確認し、1 つでも欠落していれば `views.sql` のみ適用＝events を触らない非破壊修復）。期待リストは `views.sql` の `CREATE VIEW/TRIGGER` から正規表現で導出しドリフトを防ぐ。`pr_metrics` だけを見るとトリガ欠落時の `INSERT INTO sessions` 失敗や weekly VIEW 欠落を取りこぼすため全関係を検査する。events テーブル自体が無ければ `schema.ErrEventsTableMissing` を返す。
 - `serverclient.RunFlush` は metrics target が設定されているときに限り DB オープン直後に `schema.EnsureViews` を呼ぶ。これで `flush` 単独でも VIEW を保証し、未 sync な DB では「`sync-db` を先に実行してください」と案内して終わる（cryptic な `no such table` を出さない）。logs-only flush は VIEW 非依存なのでスキップ。
 - hash 一致 skip の自己修復: `syncdb.ensureSchema` / `serverpipe.EnsureSchema` の hash 一致パスを `schema.EnsureViews` 呼び出しに置き換え、DROP された VIEW を hash を触らず復旧できるようにした。**ハッシュ一致時に full `schema.SQL` は流さない**（events を消すため）のが要点。
 

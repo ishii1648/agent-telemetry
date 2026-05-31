@@ -181,11 +181,11 @@ global single-flight ロック（`~/.agent-telemetry/backfill.lock`）は別物�
 
 | 状態 | DDL 実行 | events への書き込み |
 |---|---|---|
-| ハッシュ一致 + 派生 VIEW 健在 | しない | `INSERT OR IGNORE` のみ |
-| ハッシュ一致 + 派生 VIEW 欠落 | `views.sql` のみ再適用（events は触らない＝非破壊。`schema.EnsureViews`）| `INSERT OR IGNORE` のみ |
+| ハッシュ一致 + 派生 VIEW/トリガ健在 | しない | `INSERT OR IGNORE` のみ |
+| ハッシュ一致 + 派生 VIEW/トリガ欠落 | `views.sql` のみ再適用（events は触らない＝非破壊。`schema.EnsureViews`）| `INSERT OR IGNORE` のみ |
 | ハッシュ不一致 / `schema_meta` 不在 | `schema.SQL`（= tables + views）を全実行（events テーブルを DROP & CREATE）| `INSERT OR IGNORE` 後に新ハッシュを `schema_meta` へ書き込む |
 
-ハッシュ一致時でも `pr_metrics` VIEW の有無を 1 クエリ確認し、欠落していれば `views.sql` を再適用する自己修復を入れている（`schema.EnsureViews`）。これは旧設計の「ハッシュ一致なら全 DDL skip」が、DROP された aggregate VIEW を復旧できず `DELETE FROM schema_meta` の手作業を強いていた問題への対処（[0052]）。**ハッシュ一致時に full `schema.SQL` を流さない**のが要点で、`schema.SQL` 先頭の `DROP TABLE events` は client なら `sync-db --recheck` で再構築できるが server では受信済み events を消すため、修復は VIEW 限定に閉じる。
+ハッシュ一致時でも `views.sql` が宣言する **全 VIEW / トリガ**（`pr_metrics` だけでなく `weekly_*` / `session_concurrency_*` や `sessions_insert_events` 等の `INSTEAD OF INSERT` トリガ）の有無を `sqlite_master` で確認し、1 つでも欠落していれば `views.sql` を再適用する自己修復を入れている（`schema.EnsureViews`。期待リストは `views.sql` の `CREATE VIEW/TRIGGER` から正規表現で導出し、DDL 追加時のドリフトを防ぐ）。`pr_metrics` だけを見ると、トリガ欠落時に後続の `INSERT INTO sessions` が失敗したり、weekly VIEW 欠落でダッシュボードが壊れたままになるケースを取りこぼす。これは旧設計の「ハッシュ一致なら全 DDL skip」が、DROP された派生関係を復旧できず `DELETE FROM schema_meta` の手作業を強いていた問題への対処（[0052]）。**ハッシュ一致時に full `schema.SQL` を流さない**のが要点で、`schema.SQL` 先頭の `DROP TABLE events` は client なら `sync-db --recheck` で再構築できるが server では受信済み events を消すため、修復は VIEW 限定に閉じる。
 
 理由:
 

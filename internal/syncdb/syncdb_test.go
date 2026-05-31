@@ -568,6 +568,54 @@ func TestRunWithPaths_HealsMissingViewOnHashMatch(t *testing.T) {
 	}
 }
 
+// TestRunWithPaths_HealsMissingTriggerOnHashMatch covers the trigger variant of
+// the 0052 self-heal: with schema_hash intact but an INSTEAD OF INSERT trigger
+// dropped, the next sync-db must recreate it — otherwise its own `INSERT INTO
+// sessions` fails against the trigger-less VIEW. pr_metrics presence alone would
+// not have caught this.
+func TestRunWithPaths_HealsMissingTriggerOnHashMatch(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "agent-telemetry.db")
+	indexPath := filepath.Join(dir, "session-index.jsonl")
+	os.WriteFile(indexPath, []byte(
+		`{"timestamp":"2026-03-01 10:00:00","session_id":"s1","cwd":"/tmp","repo":"u/r","branch":"feat/x","pr_urls":[],"transcript":"","parent_session_id":""}`+"\n",
+	), 0644)
+
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Drop the trigger while leaving schema_hash intact.
+	drop, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drop.Exec("DROP TRIGGER sessions_insert_events"); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	drop.Close()
+
+	// Second run: the hash-match fast path must heal the trigger before its
+	// INSERT INTO sessions, so the run succeeds rather than erroring on the
+	// trigger-less VIEW.
+	if err := RunWithPaths(indexPath, dbPath); err != nil {
+		t.Fatalf("second run must heal the dropped trigger, got: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='sessions_insert_events'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("sessions_insert_events trigger not recreated by hash-match heal (count=%d)", n)
+	}
+}
+
 // TestRunWithPaths_BusyTimeoutWaitsForWriter verifies that a concurrent
 // sync-db invocation waits for an in-flight writer instead of failing
 // immediately with SQLITE_BUSY. Without busy_timeout configured on the
