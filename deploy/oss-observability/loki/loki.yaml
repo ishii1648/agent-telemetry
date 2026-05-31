@@ -20,6 +20,12 @@ common:
     kvstore:
       store: inmemory
 
+ingester:
+  # "entry too far behind" は ingester の head chunk 受理窓 (max_chunk_age 由来、
+  # 既定 2h) で決まる。agent-telemetry の初回 flush は数週間ぶんの過去イベントを
+  # 一括投入するため、検証用に窓を広げて過去ログも head chunk に追記できるようにする。
+  max_chunk_age: 2160h # 90 日
+
 schema_config:
   configs:
     - from: 2020-10-24
@@ -34,6 +40,12 @@ limits_config:
   # native OTLP は log attribute を structured metadata に載せるため必須。
   allow_structured_metadata: true
   volume_enabled: true
+  # agent-telemetry のイベントは過去セッションの occurred_at を timestamp に持つ。
+  # Loki の既定 (reject_old_samples: 1 週間) だと初回 flush で過去ログが弾かれ
+  # "entry too far behind" で部分却下されるため、検証用に受理窓を大きく取る。
+  reject_old_samples: false
+  # 未来方向のずれ (clock skew / バッチ遅延) も検証用に許容する。
+  creation_grace_period: 24h
 
 query_range:
   results_cache:
