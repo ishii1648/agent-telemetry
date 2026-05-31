@@ -1,10 +1,5 @@
 ---
 decision_type: spec
-affected_paths:
-  - internal/syncdb/schema/schema.sql
-  - internal/syncdb/syncdb.go
-  - grafana/dashboards/agent-telemetry.json
-  - internal/transcript/
 tags: [retro, metrics, dashboard, breaking]
 closed_at: 2026-04-25
 ---

@@ -1,7 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - internal/syncdb/syncdb.go
 tags: [sqlite, concurrency, sync-db]
 closed_at: 2026-05-08
 ---

@@ -1,7 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - site/content/setup/local/index.md
 tags: [testing, ci, sqlite, reproducibility]
 ---
 

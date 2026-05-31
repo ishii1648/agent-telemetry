@@ -1,10 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/sessionindex/
-  - internal/hook/stop.go
-  - internal/hook/posttooluse.go
-  - internal/backfill/backfill.go
 tags: [retro, pr-binding, hooks, sessionindex]
 closed_at: 2026-05-07
 ---

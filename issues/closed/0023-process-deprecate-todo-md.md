@@ -1,15 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - issues/
-  - .claude/skills/impl/
-  - internal/hook/
-  - cmd/agent-telemetry/main.go
-  - internal/setup/
-# issues/ は本決定が定義する場所そのもの。broad 参照は legitimate
-# (本決定がプロジェクトのタスク管理を issues/ に移行したため、broad 指定が legitimate)
-lint_ignore_broad:
-  - issues/
 tags: [retro, task-management, issues, todo]
 closed_at: 2026-05-08
 ---

@@ -1,10 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - cmd/agent-telemetry-server/
-  - internal/serverpipe/
-  - internal/syncdb/
-  - Dockerfile.server
 tags: [server, ingest, http, k8s]
 closed_at: 2026-05-10
 ---

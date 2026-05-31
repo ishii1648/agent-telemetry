@@ -1,12 +1,5 @@
 ---
 decision_type: spec
-affected_paths:
-  - docs/spec.md
-  - docs/design.md
-  - cmd/agent-telemetry/
-  - cmd/agent-telemetry-server/
-  - internal/syncdb/
-  - internal/sessionindex/
 supersedes: [0009]
 tags: [server, transport, event-sourcing, otel, append-only]
 closed_at: 2026-05-28

@@ -1,7 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - .claude/skills/impl/
 tags: [retro, dispatch, skills, workflow]
 closed_at: 2026-05-10
 ---

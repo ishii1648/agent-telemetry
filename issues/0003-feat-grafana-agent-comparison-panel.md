@@ -1,8 +1,5 @@
 ---
 decision_type: implementation
-affected_paths:
-  - grafana/dashboards/agent-telemetry.json
-  - docs/assets/
 tags: [grafana, dashboard, multi-agent]
 ---
 

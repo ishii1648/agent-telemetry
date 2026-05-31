@@ -1,12 +1,5 @@
 ---
 decision_type: spec
-affected_paths:
-  - internal/agent/
-  - cmd/agent-telemetry/main.go
-  - internal/setup/
-  - internal/sessionindex/
-  - internal/syncdb/schema/schema.sql
-  - internal/transcript/
 tags: [retro, multi-agent, codex, schema, breaking]
 closed_at: 2026-05-02
 ---

@@ -1,16 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/sessionindex/
-  - internal/hook/stop.go
-  - internal/hook/posttooluse.go
-  - internal/backfill/backfill.go
-  - docs/spec.md
-  - docs/design.md
-  - docs/history.md
-# 0027 で docs/history.md 自体を廃止したため path 不在
-lint_ignore_missing:
-  - docs/history.md
 tags: [pr-binding, hooks, sessionindex]
 closed_at: 2026-05-08
 ---

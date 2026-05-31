@@ -1,8 +1,5 @@
 ---
 decision_type: process
-affected_paths:
-  - .github/workflows/
-  - .goreleaser.yaml
 tags: [ci, oss-hygiene, supply-chain]
 ---
 

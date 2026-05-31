@@ -1,15 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - internal/backfill/backfill.go
-  - internal/hook/stop.go
-  - internal/hook/sessionend.go
-  - internal/sessionindex/sessionindex.go
-  - internal/sessionindex/update.go
-  - internal/syncdb/syncdb.go
-  - internal/doctor/doctor.go
-  - internal/sessionindex/lock.go
-  - cmd/agent-telemetry/main.go
 tags: [backfill, hooks, stop-hook-cost, rate-limit, blocking-ux]
 closed_at: 2026-05-27
 ---

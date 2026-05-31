@@ -1,10 +1,5 @@
 ---
 decision_type: design
-affected_paths:
-  - examples/
-# pending: prototype 領域 (examples/ 全体) を対象とする方針なので broad は意図通り。
-# 方針確定時に具体的な examples/<name>/ に絞る予定。
-lint_ignore_broad: [examples/]
 tags: [retro-pr, integration, automation]
 ---
 
