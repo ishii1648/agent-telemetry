@@ -1,0 +1,335 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "description": "otel+grafana 一本化後の主可視化（Tier 1 のみ）。PR 単位の gauge（agent_pr_*）と raw events(Loki) で構成。session-grain / 集計系（Tier 2/3）は issues/0053、並列度（Tier 4）は issues/0054 で別管理。",
+  "panels": [
+    {
+      "id": 102,
+      "title": "改善のきっかけ — PR 単位の外れ値検出",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "title": "PR 別 token スコアカード",
+      "description": "PR ごとの token 消費・効率・品質指標一覧。複雑度の異なる PR を比較するのではなく、外れ値を発見しドリルダウンする用途。pr_title は gauge ラベルに含まれないため列にしない（[docs/spec.md] gauge tag は VIEW projection に限定）",
+      "type": "table",
+      "gridPos": { "h": 16, "w": 16, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "last_over_time(agent_pr_total_tokens{coding_agent=~\"$coding_agent\"}[$__range])",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "last_over_time(agent_pr_fresh_tokens{coding_agent=~\"$coding_agent\"}[$__range])",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "last_over_time(agent_pr_tokens_per_tool_use{coding_agent=~\"$coding_agent\"}[$__range])",
+          "format": "table",
+          "instant": true,
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "last_over_time(agent_pr_session_count{coding_agent=~\"$coding_agent\"}[$__range])",
+          "format": "table",
+          "instant": true,
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "last_over_time(agent_pr_mid_session_msgs_total{coding_agent=~\"$coding_agent\"}[$__range])",
+          "format": "table",
+          "instant": true,
+          "refId": "E"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": { "byField": "pr_url", "mode": "outer" }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "__name__": true,
+              "__name__ 1": true,
+              "__name__ 2": true,
+              "__name__ 3": true,
+              "__name__ 4": true,
+              "__name__ 5": true,
+              "job": true,
+              "job 1": true,
+              "job 2": true,
+              "job 3": true,
+              "job 4": true,
+              "job 5": true,
+              "instance": true,
+              "instance 1": true,
+              "instance 2": true,
+              "instance 3": true,
+              "instance 4": true,
+              "instance 5": true,
+              "task_type 2": true,
+              "task_type 3": true,
+              "task_type 4": true,
+              "task_type 5": true,
+              "coding_agent 2": true,
+              "coding_agent 3": true,
+              "coding_agent 4": true,
+              "coding_agent 5": true,
+              "user_id 2": true,
+              "user_id 3": true,
+              "user_id 4": true,
+              "user_id 5": true,
+              "model 2": true,
+              "model 3": true,
+              "model 4": true,
+              "model 5": true
+            },
+            "indexByName": {
+              "pr_url": 0,
+              "user_id": 1,
+              "user_id 1": 1,
+              "coding_agent": 2,
+              "coding_agent 1": 2,
+              "model": 3,
+              "model 1": 3,
+              "Value #A": 4,
+              "Value #B": 5,
+              "Value #C": 6,
+              "Value #D": 7,
+              "Value #E": 8
+            },
+            "renameByName": {
+              "Value #A": "total_tokens",
+              "Value #B": "fresh_tokens",
+              "Value #C": "tokens_per_tool_use",
+              "Value #D": "session_count",
+              "Value #E": "mid_session_msgs",
+              "user_id 1": "user_id",
+              "coding_agent 1": "coding_agent",
+              "model 1": "model"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "pr_url" },
+            "properties": [
+              { "id": "displayName", "value": "pr" },
+              { "id": "links", "value": [{ "title": "Open PR", "url": "${__data.fields.pr_url}" }] },
+              { "id": "custom.width", "value": 320 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/^(total_tokens|fresh_tokens)$/" },
+            "properties": [
+              { "id": "unit", "value": "short" },
+              { "id": "decimals", "value": 1 },
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "tokens_per_tool_use" },
+            "properties": [
+              { "id": "unit", "value": "short" },
+              { "id": "decimals", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "lg",
+        "sortBy": [{ "displayName": "fresh_tokens", "desc": true }]
+      }
+    },
+    {
+      "id": 14,
+      "title": "PR 別 session_count 分布",
+      "description": "多セッション PR の外れ値検出。脱線・やり直しの兆候。上位 5 件のみ",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "topk(5, last_over_time(agent_pr_session_count{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "coding_agent": true,
+              "user_id": true,
+              "model": true,
+              "task_type": true
+            },
+            "renameByName": { "Value": "session_count" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#64748b", "mode": "fixed" },
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "pr_url",
+        "orientation": "horizontal",
+        "showValue": "always",
+        "barWidth": 0.6,
+        "text": { "valueSize": 30 },
+        "legend": { "showLegend": false }
+      }
+    },
+    {
+      "id": 15,
+      "title": "PR 別 tokens / tool_use",
+      "description": "1 tool_use あたりの token 消費が大きい PR。ファイル肥大・無駄な再読みの兆候。上位 5 件のみ",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+          "expr": "topk(5, last_over_time(agent_pr_tokens_per_tool_use{coding_agent=~\"$coding_agent\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "coding_agent": true,
+              "user_id": true,
+              "model": true,
+              "task_type": true
+            },
+            "renameByName": { "Value": "tokens_per_tool_use" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#dc2626", "mode": "fixed" },
+          "unit": "short",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "pr_url",
+        "orientation": "horizontal",
+        "showValue": "always",
+        "barWidth": 0.6,
+        "text": { "valueSize": 30 },
+        "legend": { "showLegend": false }
+      }
+    },
+    {
+      "id": 103,
+      "title": "Raw events — Loki / OTLP Logs",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 6,
+      "title": "Raw events (Loki / OTLP Logs)",
+      "description": "OTel Collector 経由で Loki に流れた raw events（OTLP Logs）。PR 集約 gauge では追えない個々のイベントを LogQL でドリルダウンする",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 18 },
+      "datasource": { "type": "loki", "uid": "oss-loki" },
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "oss-loki" },
+          "expr": "{service_name=\"agent-telemetry\"}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["agent-telemetry", "oss"],
+  "templating": {
+    "list": [
+      {
+        "name": "coding_agent",
+        "label": "agent",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "oss-mimir" },
+        "definition": "label_values(agent_pr_total_tokens, coding_agent)",
+        "query": { "query": "label_values(agent_pr_total_tokens, coding_agent)", "refId": "StandardVariableQuery" },
+        "includeAll": true,
+        "allValue": ".+",
+        "multi": true,
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "Asia/Tokyo",
+  "title": "agent-telemetry (OSS backend)",
+  "uid": "agent-telemetry-oss",
+  "version": 3,
+  "weekStart": ""
+}

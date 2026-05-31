@@ -469,6 +469,10 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 
 attribute 意味分類の表本体と 2 配布形式（direct 用 Datadog Logs Pipeline / collector 用 Collector processor サンプル）は `docs/spec.md`「OTLP export の attribute 意味分類」を正とし、本節には複製しない。各メトリクスが「client 集約 gauge をそのまま使う / raw events から backend formula で出す」のどちらで表現されるかは `docs/metrics.md` を参照する。
 
+#### OSS observability ローカル検証レシピ（`deploy/oss-observability/`）
+
+collector レシピと同じ「Collector が backend へ push する」経路を、credential 不要の OSS（Mimir / Loki / Grafana）でローカル E2E 再現する検証用構成（[issues/0050](../issues/closed/0050-feat-oss-observability-local-compose.md)）。Prometheus の scrape（pull）型で検証すると Datadog exporter と失敗点（OTLP push の経路・`service.name` の昇格）がずれるため、あえて Collector push 経路に揃え、metrics は Mimir・logs は Loki に流す（`service.name` は Mimir で `job` ラベル・Loki で `service_name` ラベルに昇格する）。既存 SQLite ダッシュボードとは別系統の検証用ダッシュボードとして切り、single-process・filesystem storage の検証用最小構成にとどめることで、service / config / volume を Kubernetes manifest に移しやすい単位で分割している。
+
 ### プロトコル — OTLP/HTTP Logs
 
 OTel SDK / Collector エコシステムに乗ることを優先し、独自 JSON ではなく **OTLP/HTTP JSON エンコード** を採用する。クライアントは `go.opentelemetry.io/otel/sdk/log` + `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp` を使い、`/v1/logs` に POST する。サーバは自前の OTLP Logs receiver を `internal/serverpipe/` に持つ（OTel Collector を間に挟まないことで運用構成を単純化する）。

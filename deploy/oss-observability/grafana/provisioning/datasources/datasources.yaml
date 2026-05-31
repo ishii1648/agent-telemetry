@@ -1,0 +1,21 @@
+apiVersion: 1
+
+# OSS backend 検証用 datasource。既存 SQLite dashboard (top-level
+# docker-compose.yaml / grafana/) とは別系統で、Mimir(PromQL) と Loki(LogQL)
+# を読む (issue 0050 対応方針 3)。
+datasources:
+  - name: Mimir
+    uid: oss-mimir
+    type: prometheus
+    access: proxy
+    # Mimir の Prometheus 互換 query API は /prometheus 配下。
+    url: http://mimir:9009/prometheus
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+
+  - name: Loki
+    uid: oss-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100

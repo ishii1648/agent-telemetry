@@ -1,0 +1,15 @@
+# agent-telemetry client 設定例 — OSS observability compose (issue 0050) 向け。
+#
+# Collector はローカル compose で立てるので credential 不要。endpoint は
+# Collector の OTLP/HTTP receiver を指す (client が /v1/logs・/v1/metrics を補完)。
+# logs と metrics の両 representation を 1 target で送る (signals = ["logs", "metrics"])。
+#
+# 配置先: ~/.config/agent-telemetry/config.toml など (docs/spec.md「設定」参照)。
+
+[[export]]
+id = "oss-collector"
+endpoint = "http://localhost:4318"   # base URL; client が /v1/logs・/v1/metrics を補完
+encoding = "json"                    # 自前サーバ / Collector 宛ては JSON (既定)
+signals = ["logs", "metrics"]        # raw events(logs) と pr_metrics gauge(metrics) 両方
+# token は不要 (ローカル Collector は認証なし)。本番 collector 前段に認証を
+# 置く場合は token = "${COLLECTOR_TOKEN}" を足す。
