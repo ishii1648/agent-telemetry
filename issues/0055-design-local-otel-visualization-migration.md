@@ -35,3 +35,4 @@ SQLite を Grafana datasource として参照する経路を廃し、可視化�
 - 上の 1→6 の順に進める。README/スクショ（5・6）は runtime cutover（1）と parity（2）の **後** に行う。先に画像だけ替えるのは負債（非再現・parity 未達・PII〔メール/private repo 名〕混入）。
 - 規模が大きいので、実装着手時に runtime cutover（1）と Tier 3（2, [0053]）を独立 PR / 子 issue に切ることを検討する。Tier 3（2）は本 PR で完了済み。runtime cutover（1）は別 PR が担当。本 issue はローカル経路移行の傘として全体像と順序を保持する（傘 issue 自体は全項完了まで open）。
 - それまで README ヒーローは現状の SQLite dashboard 画像を据え置く（既に [0054] で post-concurrent-removal 状態に再生成済み。これ以上 SQLite スクショは磨かない。PR #102 closed の教訓）。
+- **着手状況（2026-05-31）**: ① runtime cutover に着手（branch `feat/issue-0055-local-otel-runtime-cutover`）。`make oss-up` / `oss-down` / `oss-flush` で Collector→Mimir/Loki→Grafana の最小スタックを 1 コマンド起動し、token 不要の `config.toml.example` で hook export（flush → Collector:4318）を流す導線を整備。②Tier3 / ③SQLite 降格明文化 / ④docs 全面書換 / ⑤決定的スクショ / ⑥README ヒーロー差し替えは別 PR。本傘 issue は B/C/D 完了まで open のまま。
