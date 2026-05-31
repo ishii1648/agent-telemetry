@@ -3,6 +3,7 @@ package serverclient
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -233,5 +234,77 @@ token = "t1"
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("[[export]] without id must be rejected")
+	}
+}
+
+// TestLoadConfig_InvalidEncodingRejected pins issue 0048(a): a non-empty but
+// unknown `encoding` must fail-fast rather than silently falling through to JSON
+// while the dry-run/summary mislabels the wire as the bogus value.
+func TestLoadConfig_InvalidEncodingRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "badenc"
+endpoint = "http://127.0.0.1:9"
+token = "t1"
+encoding = "xml"
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("unknown encoding must be rejected")
+	}
+	if !strings.Contains(err.Error(), "badenc") || !strings.Contains(err.Error(), "xml") {
+		t.Errorf("error should name the target id and the bad value: %v", err)
+	}
+}
+
+// TestLoadConfig_InvalidSignalRejected pins issue 0048(b): a non-empty but
+// unknown `signals` value must fail-fast rather than silently disabling the
+// target (which then reports "export target 設定なし").
+func TestLoadConfig_InvalidSignalRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "badsig"
+endpoint = "http://127.0.0.1:9"
+token = "t1"
+signals = ["traces"]
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("unknown signal must be rejected")
+	}
+	if !strings.Contains(err.Error(), "badsig") || !strings.Contains(err.Error(), "traces") {
+		t.Errorf("error should name the target id and the bad value: %v", err)
+	}
+}
+
+// TestLoadConfig_PartiallyInvalidSignalsRejected ensures validation rejects a
+// signals array where only one element is unknown (the valid ones must not mask
+// the bad one).
+func TestLoadConfig_PartiallyInvalidSignalsRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[[export]]
+id = "mixedsig"
+endpoint = "http://127.0.0.1:9"
+token = "t1"
+signals = ["logs", "traces"]
+`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("partially invalid signals must be rejected")
+	}
+	if !strings.Contains(err.Error(), "mixedsig") || !strings.Contains(err.Error(), "traces") {
+		t.Errorf("error should name the target id and the bad value: %v", err)
 	}
 }

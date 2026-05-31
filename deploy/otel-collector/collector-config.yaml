@@ -35,45 +35,49 @@ processors:
   transform/agent_telemetry:
     log_statements:
       - context: log
+        # OTTL の path は context prefix 付き記法で書く (contrib v0.153.0 以降で
+        # 旧 `attributes[...]` は deprecation 警告 → 将来 prefix 必須化で起動失敗
+        # しうる)。LogRecord attribute は `log.attributes[...]`、resource attribute
+        # は `resource.attributes[...]` (既に prefixed) を使う。
         statements:
           # rename 例: deployment.environment の慣習に合わせ env エイリアスを残す。
           # (Datadog 予約 tag `env` は deployment.environment から導出されるが、
           #  独自に env attribute を参照するクエリ向けにエイリアスを張る例)
-          - set(attributes["env"], resource.attributes["deployment.environment"]) where attributes["env"] == nil
+          - set(log.attributes["env"], resource.attributes["deployment.environment"]) where log.attributes["env"] == nil
 
           # 派生次元タグ: is_subagent / task_type は raw attribute に無く
           #   (spec「0/1 フラグ」「群 1」参照)、それぞれ parent_session_id / branch から
           #   導出する。下の drop で元属性を落とすので、必ず drop より前に導出する。
           #   どちらの元属性も agent.session.started のみが載せる (他イベントでは nil)
           #   ので、属性が在るレコードに限って導出する。
-          - set(attributes["is_subagent"], "true")  where attributes["parent_session_id"] != nil and attributes["parent_session_id"] != ""
-          - set(attributes["is_subagent"], "false") where attributes["parent_session_id"] == ""
-          - set(attributes["task_type"], "feat")  where attributes["branch"] != nil and IsMatch(attributes["branch"], "^feat/")
-          - set(attributes["task_type"], "fix")   where attributes["branch"] != nil and IsMatch(attributes["branch"], "^fix/")
-          - set(attributes["task_type"], "docs")  where attributes["branch"] != nil and IsMatch(attributes["branch"], "^docs/")
-          - set(attributes["task_type"], "chore") where attributes["branch"] != nil and IsMatch(attributes["branch"], "^chore/")
+          - set(log.attributes["is_subagent"], "true")  where log.attributes["parent_session_id"] != nil and log.attributes["parent_session_id"] != ""
+          - set(log.attributes["is_subagent"], "false") where log.attributes["parent_session_id"] == ""
+          - set(log.attributes["task_type"], "feat")  where log.attributes["branch"] != nil and IsMatch(log.attributes["branch"], "^feat/")
+          - set(log.attributes["task_type"], "fix")   where log.attributes["branch"] != nil and IsMatch(log.attributes["branch"], "^fix/")
+          - set(log.attributes["task_type"], "docs")  where log.attributes["branch"] != nil and IsMatch(log.attributes["branch"], "^docs/")
+          - set(log.attributes["task_type"], "chore") where log.attributes["branch"] != nil and IsMatch(log.attributes["branch"], "^chore/")
 
           # 群 3: 高 cardinality 識別子の drop。
           #   コスト/index を抑えたい場合に「次元タグに昇格させたくない」属性を落とす。
           #   検索 facet として残したいものは drop せず、Datadog 側 facet 設定で扱う
           #   (facet 化は Collector では不可)。下記は全部 drop する最も保守的な例。
-          - delete_key(attributes, "session_id")
-          - delete_key(attributes, "parent_session_id")
-          - delete_key(attributes, "branch")
-          - delete_key(attributes, "pr_title")
+          - delete_key(log.attributes, "session_id")
+          - delete_key(log.attributes, "parent_session_id")
+          - delete_key(log.attributes, "branch")
+          - delete_key(log.attributes, "pr_title")
 
           # 既定で facet/tag に昇格しない低価値 attribute も drop する。
-          - delete_key(attributes, "cwd")
-          - delete_key(attributes, "transcript")
-          - delete_key(attributes, "started_at")
-          - delete_key(attributes, "ended_at")
-          - delete_key(attributes, "pr_pinned")
-          - delete_key(attributes, "backfill_checked")
+          - delete_key(log.attributes, "cwd")
+          - delete_key(log.attributes, "transcript")
+          - delete_key(log.attributes, "started_at")
+          - delete_key(log.attributes, "ended_at")
+          - delete_key(log.attributes, "pr_pinned")
+          - delete_key(log.attributes, "backfill_checked")
 
           # 内部構造 (export しても backend では無価値)。
-          - delete_key(attributes, "event_id")
-          - delete_key(attributes, "local_sequence")
-          - delete_key(attributes, "received_at")
+          - delete_key(log.attributes, "event_id")
+          - delete_key(log.attributes, "local_sequence")
+          - delete_key(log.attributes, "received_at")
 
   batch:
     timeout: 5s

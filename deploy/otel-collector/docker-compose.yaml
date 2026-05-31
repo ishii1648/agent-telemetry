@@ -8,7 +8,11 @@
 # or the agent-telemetry-server (SQLite/Grafana path).
 services:
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    # 再現性のため版を pin する (:latest だと検証時と運用時で OTTL の挙動が動く)。
+    # collector-config.yaml の OTTL は context-prefixed 記法 (log.attributes[...])
+    # を使うので contrib v0.153.0 で valid (警告ゼロ)。版を上げる際は
+    # `validate --config` で警告が出ないことを確認すること。
+    image: otel/opentelemetry-collector-contrib:0.153.0
     command: ["--config=/etc/otelcol/collector-config.yaml"]
     volumes:
       - ./collector-config.yaml:/etc/otelcol/collector-config.yaml:ro
