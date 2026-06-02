@@ -1,6 +1,7 @@
 ---
 decision_type: design
 tags: [security, server, multi-tenancy]
+closed_at: 2026-06-02
 ---
 
 # server に per-client identity が無く user_id 偽装・dashboard 汚染が可能
