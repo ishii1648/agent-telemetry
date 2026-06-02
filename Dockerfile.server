@@ -22,4 +22,8 @@ VOLUME ["/var/lib/agent-telemetry"]
 EXPOSE 8443
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/agent-telemetry-server"]
-CMD ["--data-dir", "/var/lib/agent-telemetry", "--listen", ":8443"]
+# No --listen here: the binary defaults to loopback (127.0.0.1:8443), so a bare
+# `docker run` does NOT silently expose the unauthenticated /v1/logs. To make the
+# container reachable via a published port / ClusterIP, pass `--listen :8443`
+# explicitly (see site/content/setup/server) — an intentional opt-in to exposure.
+CMD ["--data-dir", "/var/lib/agent-telemetry"]

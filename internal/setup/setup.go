@@ -109,7 +109,7 @@ func printConfigFile(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "    [server]")
 	fmt.Fprintln(w, "    endpoint = \"https://telemetry.example.com\"")
-	fmt.Fprintln(w, "    token    = \"your-api-token\"")
+	fmt.Fprintln(w, "    # token は付属サーバには不要（認証なし）。認証付き proxy を前段に置くときだけ設定する")
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  旧パス %s にあるファイルもしばらく fallback として読みますが、将来削除予定です。\n", configpath.Legacy())
 }
