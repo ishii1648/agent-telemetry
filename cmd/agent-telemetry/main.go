@@ -18,7 +18,6 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/sessionindex"
 	"github.com/ishii1648/agent-telemetry/internal/setup"
 	"github.com/ishii1648/agent-telemetry/internal/syncdb"
-	"github.com/ishii1648/agent-telemetry/internal/upgrade"
 )
 
 // version is overwritten at build time via -ldflags "-X main.version=<tag>".
@@ -48,8 +47,6 @@ func main() {
 		runDoctor()
 	case "hook":
 		runHook(os.Args[2:])
-	case "upgrade":
-		runUpgrade(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("agent-telemetry %s\n", version)
 	case "help", "--help", "-h":
@@ -82,7 +79,6 @@ Commands:
     stop                                 ended_at を記録し backfill worker を非同期起動
     post-tool-use                        tool_response から PR URL を抽出（Codex 用）
     pre-tool-use                         per-session tool 注釈を記録（Claude のみ）
-  upgrade [--check]                      GitHub Releases から最新版を取得して自身を置き換える（--check は確認のみ）
   version                                version を表示
   help                                   このヘルプを表示
 
@@ -330,26 +326,6 @@ func runSetup(args []string) {
 	}
 	if err := setup.Run(a); err != nil {
 		fmt.Fprintf(os.Stderr, "setup error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func runUpgrade(args []string) {
-	checkOnly := false
-	for _, a := range args {
-		switch a {
-		case "--check":
-			checkOnly = true
-		default:
-			fmt.Fprintf(os.Stderr, "upgrade: unknown flag %q\n", a)
-			os.Exit(1)
-		}
-	}
-	if err := upgrade.Run(upgrade.Options{
-		CurrentVersion: version,
-		CheckOnly:      checkOnly,
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "upgrade error: %v\n", err)
 		os.Exit(1)
 	}
 }

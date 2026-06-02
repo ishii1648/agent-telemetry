@@ -493,6 +493,22 @@ hook の自動登録はしない。ユーザが手動（または個人の設定
 
 未登録の hook は warning として表示するが**自動修復はしない**。ユーザ側の設定一元管理の前提を壊さないため。
 
+### `upgrade` サブコマンドの廃止（self-update 経路の除去）（[0062]）
+
+かつて `upgrade` サブコマンド（`internal/upgrade/`）は GitHub Releases から platform-matched tarball を取得し、`checksums.txt` の SHA-256 で検証してから running executable に rename して自身を置き換えていた。だが tarball も `checksums.txt` も同一 release artifact 由来で、checksum 検証は integrity（破損検知）にはなるが authenticity（出所証明）にはならない。release（GitHub 上の release asset / repo write 権限）が侵害されれば両方同時に差し替え可能で、ユーザは攻撃者バイナリを **rename して即実行** してしまう。セキュリティレビュー §4 で Critical に較正された残課題（[0062]）。
+
+**方針: 独立署名を導入するのではなく、`upgrade` サブコマンドそのものを廃止して self-update 経路（任意コード実行に直結する attack surface）を除去する。**
+
+- self-update を持たないため、署名の独立した信頼の根・公開鍵配布・client 側検証・鍵ローテーションといった仕組みを一切持ち込まずに、Critical 課題を attack surface の除去で解消する。
+- 更新は **再インストール** で行う。配布は従来どおり GitHub Releases の tarball ダウンロード / `go build` / `make install`（[setup/install](https://ishii1648.github.io/agent-telemetry/setup/local/) 参照）であり、self-update を前提にしていない。CLI は hook / CLI / ダッシュボードの計測ツールで頻繁な自動更新を要する性質ではないため、self-update を削っても運用上の損失は小さい。
+
+**却下した代替:**
+
+- **cosign keyless 等で `checksums.txt` を独立署名し client 検証を実装**: 一度は方針として検討したが（旧 0062 草案）、(1) `sigstore-go` による client 検証・鍵 / identity 管理・air-gapped bypass まで含めると実装・保守コストが大きく、(2) 同一 pipeline 内署名は build 時 CI runner 侵害には無効で完全な防御にならず、(3) そもそも self-update を保持する便益（再インストールで足りる）がそのコストに見合わない。self-update を削る方が単純かつ攻撃面が小さい。
+- **GitHub release の信頼を前提に `upgrade` を据え置き（署名なしのまま受容）**: 受容しない。据え置けば「取得 binary を rename して即実行」する経路が残り、Critical 較正を下げる根拠にならない。
+
+**較正の扱い**: self-update 経路が無くなることで「`upgrade`/release 経路の侵害でユーザが攻撃者バイナリを実行」という Critical シナリオの **agent-telemetry 起因の経路は消える**。残るのは「ユーザが手動で Releases から落とした tarball が侵害されている」一般的な供給網リスクだが、これは self-update を持たない一般的な CLI と同等で、本ツール固有の Critical ではない（手動 DL の authenticity 強化＝署名は将来の任意改善として余地を残すが、本 issue のスコープ外）。
+
 ---
 
 ## サーバ側集約パイプライン
