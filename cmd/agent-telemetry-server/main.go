@@ -75,10 +75,20 @@ func run(args []string) error {
 	})
 	handler.Routes(mux)
 
+	// Timeouts bound a slow-body / idle-keepalive connection so a single
+	// peer can't pin a goroutine indefinitely. This is defence-in-depth
+	// only: TLS termination and rate limiting are the ingress/proxy's
+	// responsibility (docs/spec.md ## サーバ binary の運用前提). ReadTimeout
+	// is generous enough to ingest a MaxPayloadBytes (50 MB) gzip body over
+	// a slow link; WriteTimeout must exceed it because Go starts the write
+	// deadline after the request headers, so it bounds the whole handler.
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      90 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

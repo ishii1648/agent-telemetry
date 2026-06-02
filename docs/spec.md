@@ -570,6 +570,24 @@ agent-telemetry-server [--data-dir <path>] [--listen <addr>]
 
 環境変数 `AGENT_TELEMETRY_SERVER_TOKEN` で API key を受け取る。未設定時は起動時にエラー終了する。
 
+### サーバ binary の運用前提（信頼境界 / proxy 終端）
+
+サーバ binary は **TLS 終端・レート制限を持たない平文 HTTP ingest** であり、**reverse proxy / ingress の背後に置く構成を契約とする**。`--listen` をインターネットへ直接公開してはならない。次を proxy / ingress 側の責務として固定する（[0057]）:
+
+| 関心事 | 責務 | 根拠 |
+|---|---|---|
+| **TLS 終端** | proxy / ingress | binary は平文 HTTP のみを話す。Bearer token を平文で運ぶため、公開経路は必ず TLS 終端の背後に置く |
+| **レート制限** | proxy / ingress | token 総当たり・大量 ingest の抑制。binary 内にレート制限は無い |
+| **接続元の制限** | proxy / ingress / network policy | `/v1/logs` は単一共有 token のみで認可するため、到達範囲を信頼ネットワーク（VPN / cluster 内 / 許可 IP）に絞る |
+
+binary が単体で閉じるのは「公開しても安価に効く最小限」のみ:
+
+- **request timeout**: `http.Server` に `ReadHeaderTimeout=10s` / `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を設定し、slow-body / idle keep-alive 接続が goroutine を無期限に占有するのを防ぐ。`ReadTimeout` は `MaxPayloadBytes`（50 MB）の gzip body を低速回線で受け切れる余裕を持たせ、`WriteTimeout` は Go が request header 読了後に write deadline を開始する仕様に合わせて `ReadTimeout` より大きく取る。
+- **payload 上限**: `MaxPayloadBytes`（50 MB）で圧縮転送フレームと展開後 payload の双方を上限し、zip-bomb 系入力を弾く。
+- **Bearer 認証**: `AGENT_TELEMETRY_SERVER_TOKEN` を定数時間比較で検証する。
+
+書き込み token は**単一共有**であり、漏えい時の影響範囲は全クライアントに及ぶ。per-client identity / token scoping は本 binary では扱わず、別 issue [0058] の範疇とする。
+
 ### サーバ側データ配置
 
 | ファイル | 形式 | 役割 |

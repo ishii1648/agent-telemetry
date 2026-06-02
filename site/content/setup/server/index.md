@@ -45,6 +45,24 @@ openssl rand -hex 32
 
 漏えい時はサーバ側 env と全クライアントの `[server] token` を同時にローテーションしてください。
 
+## 運用前提 — TLS / レート制限は proxy 側の責務
+
+`agent-telemetry-server` は **TLS 終端もレート制限も持たない平文 HTTP ingest** です。`--listen` を **インターネットへ直接公開しないでください**。公開する場合は必ず reverse proxy / ingress（nginx / Caddy / cloud LB など）の背後に置き、次を proxy 側で担保するのが契約です（[issues/0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md)）:
+
+| 関心事 | どこで担保するか |
+|---|---|
+| **TLS 終端** | proxy / ingress。Bearer token を平文で運ぶため、公開経路は必ず TLS の背後に置く（§3 の Ingress 例は cert-manager で TLS を張る前提） |
+| **レート制限** | proxy / ingress。token 総当たり・大量 ingest の抑制。binary 内にレート制限は無い |
+| **接続元の制限** | proxy / ingress / NetworkPolicy。`/v1/logs` は単一共有 token のみで認可するため、到達範囲を信頼ネットワーク（VPN / cluster 内 / 許可 IP）へ絞る |
+
+binary 単体で閉じているのは「公開しても安価に効く最小限」だけです:
+
+- **request timeout**: slow-body / idle keep-alive 接続が goroutine を無期限に占有しないよう `ReadHeaderTimeout=10s` / `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を設定済み。
+- **payload 上限**: 1 リクエストを 50 MB（圧縮フレーム・展開後の双方）で上限し、zip-bomb 系入力を弾く。
+- **Bearer 認証**: token を定数時間比較で検証する。
+
+書き込み token は **単一共有** で、漏えい時の影響範囲は全クライアントに及びます。クライアント単位の identity / token scoping は本 binary の対象外です（[issues/0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0058-design-server-per-client-identity-userid-spoofing.md) で別途検討）。VPN / port-forward のみで使う（公開しない）場合は §3 の Ingress ブロックを丸ごと削除して構いません。
+
 ## 3. k8s 参考デプロイ — 最小構成（サーバのみ）
 
 サーバ単体を立て、Grafana は既存環境を使う構成です。下記スニペットを `kubectl apply -f -` してください。`# REPLACE_ME` コメントの箇所は cluster ごとに調整します。
