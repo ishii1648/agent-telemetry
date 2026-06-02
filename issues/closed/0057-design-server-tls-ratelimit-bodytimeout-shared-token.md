@@ -1,6 +1,7 @@
 ---
 decision_type: design
 tags: [security, server, ingest]
+closed_at: 2026-06-02
 ---
 
 # agent-telemetry-server に TLS/レート制限/body タイムアウトが無く書き込み token が単一共有
