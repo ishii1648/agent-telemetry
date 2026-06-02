@@ -626,6 +626,29 @@ Stop hook 経路には載せない方針は維持する。理由は旧設計と�
 
 旧設計と同じ。サーバ起動時に `AGENT_TELEMETRY_SERVER_TOKEN` 環境変数で API key を渡し、クライアントは `~/.config/agent-telemetry/config.toml` の `[server] token` で同値を持つ。`user_id`（人物識別）は events の `agent.session.started` 属性に含まれる。**API key の認証**（信頼境界）と **`user_id` 経路**（集計軸）は責務を分ける。
 
+### 信頼境界と identity のスコープ（[0058]）
+
+現行の認証は **単一の共有 write token** で信頼境界を表現する。`internal/serverpipe/handler.go` は Bearer token の一致だけを検証し、payload 中の `event_id` / `session_id` / `coding_agent` / `eventName` / 全属性（`user_id` を含む）はクライアント申告をそのまま受理する。つまり **`user_id` は認可された identity ではなく単なる集計次元**であり、token を持つ任意のクライアントは他ユーザを騙る forged イベントを送って共有ダッシュボードを汚染したり、高カーディナリティ属性を注入して backend コストを押し上げられる。
+
+これは **single-team / 単一 token 構成では意図的に受容するリスク** とする。前提は「token を共有する全員が相互に信頼できる小規模チームであり、各クライアントは自分の正しい `user_id` を申告する」こと。この前提が成り立つ範囲では、per-client identity・署名・per-user 認可境界を持たない単純さを優先する。
+
+意図的に許容している脅威（single-team スコープ内では受容）:
+
+- **`user_id` 偽装** — 侵害された / 悪意あるクライアントが他ユーザ名義のイベントを送れる。dashboard の per-user 集計は「自己申告ベース」であり監査証跡ではない
+- **イベント詐称・汚染** — token 保持者は任意の `event_id` / `session_id` / イベント種別 / 属性を投入でき、集約 DB を任意に汚染できる
+- **高カーディナリティ注入による backend コスト増** — 属性値が無制限のため、ラベル爆発で Mimir/Loki 等の backend コストを押し上げられる（security review §3 の Medium「cost spike」と関連）
+
+> **isolation を約束するデプロイには現行構成は不十分**。テナント間 / ユーザ間の分離を SLA として謳う運用に広げる場合は、下記「将来オプション」のいずれかを満たすことを前提条件とする。本節は「どこまでが受容リスクで、どこからが追加要件か」の境界を固定するための記録であり、実装は本 issue のスコープ外（別 PR）。
+
+将来オプション（per-user isolation を約束するデプロイ向け。実装可否は別 PR で判断）:
+
+- **per-user token** — ユーザ / クライアントごとに異なる token を発行し、サーバ側で token → 許可 `user_id` を対応付ける。`user_id` の申告値が token に紐づく identity と不一致なら reject する（`user_id` を認可済み identity に昇格）
+- **token scoping** — token に「書き込み可能な `user_id` / `coding_agent` の範囲」などのスコープを持たせ、範囲外の属性を持つイベントを reject する
+- **監査ログ** — 受理 / reject したイベントを送信元 token・申告 `user_id`・受信時刻つきで追記し、後から偽装・汚染を追跡できるようにする（現状の `rejected.log` を identity 軸へ拡張）
+- **backend カーディナリティ制御** — 属性キー / 値の allowlist・値長上限・per-token のラベル種別数上限を設け、高カーディナリティ注入で backend コストが暴走しないようにする
+
+単一共有 token そのものの運用（rotation・配布・漏洩時対応）は別途 [0057] のスコープ。本節は identity と認可境界の方針に集中する。
+
 ### サーバ側 — OTLP Logs receiver + events table
 
 新設するパッケージ:
@@ -726,3 +749,4 @@ events 単位なので旧設計（集計値のみ）より体積は数倍だが�
 - backfill が後追い更新を検出した時点で新しい `agent.pr.observed` イベントを events に追記する責務がクライアント側にある。backfill が動かないと最新状態がサーバへ反映されない
 - events のオンザフライ VIEW 集約は events 数が大きくなるとクエリレイテンシに効く。materialization 切替の閾値は実測で決める（最初は VIEW のまま運用）
 - サーバ認証は単一 API key。複数ユーザでの read/write 権限分離（user 別 RLS、OIDC 等）は将来課題
+- サーバは単一共有 token のみで認証し per-client identity を持たない。`user_id` は自己申告の集計次元であり、token 保持者は他ユーザ偽装・イベント汚染・高カーディナリティ注入が可能。single-team 構成では意図的な受容リスクとし、isolation を約束するデプロイ向けの追加要件（per-user token / token scoping / 監査ログ / backend カーディナリティ制御）は「信頼境界と identity のスコープ（[0058]）」に列挙した（実装は別 PR）
