@@ -10,6 +10,7 @@ import (
 
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 	"github.com/ishii1648/agent-telemetry/internal/configpath"
+	"github.com/ishii1648/agent-telemetry/internal/serverclient"
 	"github.com/ishii1648/agent-telemetry/internal/userid"
 )
 
@@ -34,6 +35,46 @@ func envWith(t *testing.T, agents []*agent.Agent, lookOK bool, settings map[stri
 		SettingsLoader: fakeLoader(settings),
 		LegacyPaths:    func() []string { return nil },
 		UserResolver:   func() (string, userid.Source) { return "alice@example.com", userid.SourceConfig },
+		// Hermetic default: no export targets, so checkExport never reads the
+		// real config.toml. Tests that exercise the http:// warning override this.
+		ExportTargets: func() ([]serverclient.ExportTarget, error) { return nil, nil },
+	}
+}
+
+// TestRun_InsecureHTTPExportSurfacedAsWarning verifies doctor flags a
+// non-loopback http:// export target (issue 0059) as a warning — and only that
+// target, not the loopback collector — without marking the run as a failure.
+func TestRun_InsecureHTTPExportSurfacedAsWarning(t *testing.T) {
+	dir := t.TempDir()
+	a := &agent.Agent{Name: agent.NameClaude, DataDir: dir}
+	env := envWith(t, []*agent.Agent{a}, true, map[string]map[string][]string{
+		agent.NameClaude: {
+			"SessionStart": {"agent-telemetry hook session-start"},
+			"SessionEnd":   {"agent-telemetry hook session-end"},
+			"Stop":         {"agent-telemetry hook stop"},
+		},
+	})
+	env.ExportTargets = func() ([]serverclient.ExportTarget, error) {
+		return []serverclient.ExportTarget{
+			{ID: "local", Endpoint: "http://localhost:4318", Signals: []string{"logs"}},
+			{ID: "remote", Endpoint: "http://telemetry.example.com", Token: "secret", Signals: []string{"logs"}},
+		}, nil
+	}
+
+	var buf bytes.Buffer
+	r, err := RunWith(&buf, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.HasFailure() {
+		t.Fatalf("insecure export is a warning, not a failure: %s", buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "remote") || !strings.Contains(out, "issue 0059") {
+		t.Errorf("missing insecure-export warning:\n%s", out)
+	}
+	if strings.Contains(out, "local:") {
+		t.Errorf("loopback target must not be flagged:\n%s", out)
 	}
 }
 

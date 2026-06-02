@@ -343,6 +343,8 @@ signals = ["logs"]
 
 設定された target が 1 つも無い、または全 target の `endpoint` が空の場合、`agent-telemetry flush` は warning を stderr に出して exit code 0 で終了する（cron で叩いて壊れないこと）。target が configured とみなされる条件は **`endpoint` が非空**であること（`token` の有無は問わない）。`endpoint` を持つ一部 target だけが誤設定（`endpoint` 空）の場合は、その target の id を stderr に明示してスキップする（黙殺しない）。`signals` に `logs` を含む target だけが logs flush の対象、`metrics` を含む target だけが metrics flush の対象になる（両 representation は同一 flush 内で別経路として処理される）。
 
+`endpoint` の scheme が **非ループバック宛ての `http://`** の場合（`localhost` / `127.0.0.0/8` / `::1` 以外への平文送信）、`flush` は送信を継続したうえで stderr に warning を出す（`token` 付きなら「平文で漏洩」と強い文言）。`doctor` も同条件を誤設定ヒントとして表示する。`https://` 一律必須化はしない: tokenless な localhost Collector（OSS observability レシピ）への送信は意図的に許容する設計のため、loopback は例外、それ以外の `http://` のみ警告する（refuse ではなく warn。issue [0059](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0059-design-flush-endpoint-scheme-validation.md)）。
+
 #### endpoint モデル（base + signal path 補完）
 
 target の `endpoint` は **base URL** とし、クライアントが signal ごとの path を補完する（実装時の解釈ブレを防ぐため 1 つに固定）:

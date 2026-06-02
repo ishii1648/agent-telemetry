@@ -701,6 +701,17 @@ ingest は **アプリケーション層の認証を持たず**（前節「認�
 
 書き込み token は [0057] で廃止し、認証境界をネットワーク到達制御 + proxy に移した（前節「認証境界」）。本節は per-user isolation を約束する場合の identity enforcement の方針に集中する。
 
+### export endpoint の scheme 検証（平文送信の警告）
+
+flush の export target は operator が `config.toml` で制御するため SSRF はスコープ外だが、`http://` への誤設定は事故として起こりやすく、`user_id` / `cwd` / `repo` / `branch` / `pr_url` や bearer token が平文でネットワークに乗る（[0059]、セキュリティレビュー §3「Client export」Medium）。一方で **tokenless localhost Collector への送信は意図的にサポート**しており（[0050] / [0051] の OSS observability レシピは `http://localhost:4318` に token 無しで送る）、`https` を一律必須化すると壊れる。
+
+このため「loopback は許容、それ以外の `http://` は明示 opt-in（事故防止のため警告）」を方針とする。判定は `ExportTarget.IsInsecurePlaintext`（`internal/serverclient/security.go`）に一本化する: scheme が `http` かつ host が loopback（`localhost` / `127.0.0.0/8` / `::1`）でない target だけを insecure とし、`https` / `grpc` / 空 endpoint（= Misconfigured 側で別途警告）は対象外。
+
+**refuse ではなく warn を採る**。config は operator 制御で、稀に意図的な平文ホップ（信頼できる内部網の中継など）もありうるため、送信を止めて event を silent に落とすより、送信は通したうえで stderr に警告を出す方が事故と意図を切り分けやすい。token を伴う `http://`（= 認証情報の平文漏洩）は警告文言を強める。将来 refuse したい場合は明示の opt-in フラグを足す前提で、現時点では warn に留める。警告は 2 経路で出す:
+
+- **`flush` 実行時** — `FlushResult.InsecureTargets` に積み、`Summarize` が `warning: export target … は非ループバック宛てに http:// で平文送信します` を出す（送信自体は継続）
+- **`doctor`** — `config.toml` の export target を読み、同じ判定で誤設定ヒントを出す（loopback 例外を明記）。診断のみで failure 扱いにはしない（warning）
+
 ### サーバ側 — OTLP Logs receiver + events table
 
 新設するパッケージ:

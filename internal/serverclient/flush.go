@@ -57,6 +57,14 @@ type FlushResult struct {
 	// configured" (issue 0051). A tokenless local collector is NOT listed here:
 	// the token is optional and such a target is Configured().
 	Misconfigured []string
+
+	// InsecureTargets lists configured targets that would POST cleartext
+	// http:// to a non-loopback host (issue 0059). flush still sends — config is
+	// operator-controlled and refusing could silently drop a deliberate
+	// plaintext hop — but Summarize warns so an accidental http:// (especially
+	// one carrying a token) does not leak metadata/credentials unnoticed.
+	// Loopback endpoints (the tokenless local-Collector recipe) are never here.
+	InsecureTargets []InsecureTarget
 }
 
 // FlushAgentResult collects the per-target outcomes for one coding agent.
@@ -210,6 +218,9 @@ func RunFlush(ctx context.Context, opts FlushOptions) (*FlushResult, error) {
 			res.Misconfigured = append(res.Misconfigured, t.ID)
 		}
 	}
+	// Flag configured targets that would send cleartext http:// to a non-loopback
+	// host so an accidental plaintext leak (issue 0059) is visible on stderr.
+	res.InsecureTargets = InsecurePlaintextTargets(targets)
 	var firstErr error
 	for _, a := range agents {
 		ar, err := runFlushForAgent(ctx, db, a, targets, opts)
@@ -770,6 +781,13 @@ func authValue(scheme, token string) string {
 func (r *FlushResult) Summarize(w io.Writer) {
 	if len(r.Misconfigured) > 0 {
 		fmt.Fprintf(w, "flush: export target %s は endpoint が空のためスキップしました（誤設定の可能性。token は認証なし backend では不要ですが endpoint は必須です）\n", strings.Join(r.Misconfigured, ", "))
+	}
+	for _, ins := range r.InsecureTargets {
+		if ins.HasCredential {
+			fmt.Fprintf(w, "  warning: export target %s は非ループバック宛てに http:// で平文送信します（%s）— token が平文で漏洩します。https:// に変更するか、ローカル Collector のみに送ってください\n", ins.ID, ins.Endpoint)
+		} else {
+			fmt.Fprintf(w, "  warning: export target %s は非ループバック宛てに http:// で平文送信します（%s）— user_id/cwd/repo/branch/pr_url が平文で流れます。https:// の利用を推奨します\n", ins.ID, ins.Endpoint)
+		}
 	}
 	names := make([]string, 0, len(r.PerAgent))
 	for name := range r.PerAgent {
