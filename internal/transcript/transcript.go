@@ -41,26 +41,51 @@ func Parse(transcriptPath, agentName string) Stats {
 	}
 }
 
+// MaxDecodedBytes caps how many *decoded* bytes a single transcript parse
+// reads, applied after zstd decompression. It bounds two local-DoS vectors
+// from a hostile/runaway agent session (issue 0060): a zstd "zip bomb"
+// (tiny .jsonl.zst that inflates to GBs) and a plainly huge .jsonl pinning
+// CPU during the scan. 256 MB sits comfortably above any realistic
+// single-user session transcript, so legitimate data is never truncated;
+// past the cap the scanner just stops, yielding partial stats (graceful
+// degrade) rather than OOM. It is a var so tests can shrink it.
+var MaxDecodedBytes int64 = 256 * 1024 * 1024
+
 // openTranscript opens a transcript file, transparently decompressing
 // .jsonl.zst rollouts. The caller must close the returned ReadCloser.
 //
-// Codex archives older sessions as zstd; Claude never compresses, so this
-// helper only kicks in when needed.
+// Codex archives older sessions as zstd; Claude never compresses, so the
+// decompression branch only kicks in when needed. The returned reader is
+// capped at MaxDecodedBytes in both branches.
 func openTranscript(path string) (io.ReadCloser, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	if !strings.HasSuffix(path, ".zst") {
-		return f, nil
+		return limitReadCloser(f, MaxDecodedBytes), nil
 	}
 	dec, err := zstd.NewReader(f)
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	return &zstdCloser{dec: dec, file: f}, nil
+	return limitReadCloser(&zstdCloser{dec: dec, file: f}, MaxDecodedBytes), nil
 }
+
+// limitReadCloser caps reads at n decoded bytes while preserving the
+// underlying Close (io.LimitReader alone drops the Closer).
+func limitReadCloser(rc io.ReadCloser, n int64) io.ReadCloser {
+	return &limitedReadCloser{r: io.LimitReader(rc, n), c: rc}
+}
+
+type limitedReadCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.r.Read(p) }
+func (l *limitedReadCloser) Close() error               { return l.c.Close() }
 
 // zstdCloser couples the zstd.Decoder lifecycle to the underlying file so
 // callers only need a single Close().

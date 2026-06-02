@@ -107,6 +107,15 @@ Codex は古い rollout JSONL を zstd 圧縮することがある。`internal/t
 
 依存追加: `github.com/klauspost/compress`。modernc.org/sqlite と同じく cgo フリーで Go プロジェクトの方針に整合する。
 
+#### 解凍後サイズの上限（local DoS 防御）
+
+`openTranscript` が返す reader は **解凍後** で `MaxDecodedBytes`（256 MB）に cap する（`.jsonl` 直読みも `.jsonl.zst` 解凍後も同じ）。狙いは 2 つの local-DoS ベクタ（[issues/closed/0060-design-hook-transcript-unbounded-read-local-dos.md](../issues/closed/0060-design-hook-transcript-unbounded-read-local-dos.md)）の遮断:
+
+- **zstd zip-bomb**: 数 KB の `.jsonl.zst` が GB に膨らみ OOM を誘発する経路
+- **巨大 plain `.jsonl`**: scan 中に CPU を占有する経路
+
+cap は `io.LimitReader` で実現し、Close を失わないよう薄い `limitedReadCloser` で包む。超過時は scanner がそこで止まり、途中までの partial stats を返す（**graceful degrade**。最後の半端行は JSON parse 失敗で `continue` スキップ）。閾値 256 MB は単一ユーザの現実的な最長セッション transcript を十分上回る値で、正規データは決して切り詰めない。単一ユーザ前提では transcript を作る攻撃者は既にユーザ環境を制御しているため、これ以上厳しくすると正規セッションの誤切りリスクが上回る（過剰防御の回避）。
+
 ---
 
 ## データ収集層
@@ -123,6 +132,10 @@ hook はすべて `agent-telemetry hook <event> [--agent <claude|codex>]` の Go
 - バイナリへの埋め込み (`embed`) と展開 (`ExtractHooks`) が不要になり、配布が「PATH 上にバイナリがあること」だけで完結する
 - awk による複雑なパース（旧 `todo-cleanup-check.sh` の 80 行、現在は `todo-cleanup` 系統ごと廃止済み）を Go テストでカバーできる
 - Go バイナリの起動コスト（〜10 ms）は hook の発火間隔に対して無視できる
+
+#### hook stdin の読み込み上限（local DoS 防御）
+
+`hook.ReadInput` は stdin を `io.LimitReader` で `MaxInputBytes`（50 MB、`serverpipe.MaxPayloadBytes` と整合）に cap してから `io.ReadAll` する（[issues/closed/0060-design-hook-transcript-unbounded-read-local-dos.md](../issues/closed/0060-design-hook-transcript-unbounded-read-local-dos.md)）。hook JSON は実運用で << 1 MB（`tool_input` + `tool_response`）なので 50 MB は純粋な保険で、超過時はエラーで弾く（無効入力扱い）。空 stdin は従来どおり非エラー（legacy Claude Stop hook 互換）。単一ユーザ前提では攻撃に既にユーザ環境の制御が要るため Medium 較正で、これ以上絞らない。
 
 ### Stop hook の非同期 worker 起動
 

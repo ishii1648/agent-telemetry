@@ -2,11 +2,19 @@ package hook
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 )
+
+// MaxInputBytes caps a single hook stdin payload. A hook JSON is tiny in
+// practice (tool_input + tool_response, typically << 1 MB); 50 MB matches
+// serverpipe.MaxPayloadBytes and is pure insurance against an unbounded
+// io.ReadAll on a hostile/runaway agent session (see issue 0060). It is a
+// var, not a const, so tests can shrink it without generating 50 MB.
+var MaxInputBytes int64 = 50 * 1024 * 1024
 
 // HookInput is the unified hook payload accepted from both Claude Code and
 // Codex CLI. Fields that exist for only one agent are present as optional;
@@ -62,10 +70,21 @@ func (h *HookInput) AgentVersion(agentName string) string {
 //
 // Empty stdin is treated as a non-error: the legacy Claude Stop hook
 // fires without any stdin payload, and we don't want to break it.
+//
+// The read is bounded by MaxInputBytes so a hostile or runaway session
+// cannot pin CPU/memory by feeding an endless stdin stream (issue 0060).
 func ReadInput() (*HookInput, error) {
-	data, err := io.ReadAll(os.Stdin)
+	return readInput(os.Stdin)
+}
+
+func readInput(r io.Reader) (*HookInput, error) {
+	// +1 so we can distinguish "exactly at the cap" from "over the cap".
+	data, err := io.ReadAll(io.LimitReader(r, MaxInputBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)) > MaxInputBytes {
+		return nil, fmt.Errorf("hook input exceeds %d bytes", MaxInputBytes)
 	}
 	if len(data) == 0 {
 		return &HookInput{}, nil

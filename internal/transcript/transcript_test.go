@@ -113,6 +113,33 @@ func TestParse_ExcludesLocalCommand(t *testing.T) {
 	}
 }
 
+func TestParse_DecodedSizeCapTruncatesGracefully(t *testing.T) {
+	// Line 1 sets model=EARLY with tokens; many padding lines follow; the
+	// final line sets model=LATE. With MaxDecodedBytes shrunk so the scan
+	// stops before the final line, parsing must degrade gracefully:
+	// EARLY's stats survive and LATE is never reached (no crash/hang).
+	lines := []string{
+		`{"type":"assistant","message":{"model":"EARLY","usage":{"input_tokens":100}}}`,
+	}
+	for i := 0; i < 200; i++ {
+		lines = append(lines, `{"type":"user","message":{"content":"padding padding padding padding"}}`)
+	}
+	lines = append(lines, `{"type":"assistant","message":{"model":"LATE"}}`)
+	p := writeTempTranscript(t, lines)
+
+	orig := MaxDecodedBytes
+	MaxDecodedBytes = 500 // well below the final line's offset
+	defer func() { MaxDecodedBytes = orig }()
+
+	stats := ParseClaude(p)
+	if stats.Model == "LATE" {
+		t.Errorf("model: got %q, want a pre-cap value (final line should be cut off)", stats.Model)
+	}
+	if stats.InputTokens != 100 {
+		t.Errorf("input_tokens: got %d, want 100 (early line within cap)", stats.InputTokens)
+	}
+}
+
 func TestParse_NonExistentFile(t *testing.T) {
 	stats := ParseClaude("/nonexistent/path/transcript.jsonl")
 	if !stats.IsGhost {
