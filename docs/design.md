@@ -558,12 +558,14 @@ OTel SDK / Collector エコシステムに乗ることを優先し、独自 JSON
 
 ```
 POST /v1/logs
-Authorization: Bearer <api_key>
 Content-Type: application/json
 Content-Encoding: gzip   (optional)
+Authorization: Bearer <token>   (optional — 認証付き proxy を前段に置く場合のみ)
 
 (OTLP/HTTP Logs payload — resourceLogs[*].scopeLogs[*].logRecords[*])
 ```
+
+`agent-telemetry-server` 自身は `Authorization` ヘッダを検証しない（前節「認証境界」）。client は `[server] token` が設定されていればヘッダを付けて送るが、付属サーバは無視する。ヘッダが意味を持つのは認証付き proxy を前段に置くデプロイのみ。
 
 各 logRecord は次の semantic に従う:
 
@@ -622,15 +624,26 @@ Stop hook 経路には載せない方針は維持する。理由は旧設計と�
 
 [site の setup/server](https://ishii1648.github.io/agent-telemetry/setup/server/) に launchd plist と systemd timer のサンプルを置く。
 
-### 認証 — 単一 API key
+### 認証境界 — ネットワーク到達制御 + proxy（[0057]）
 
-旧設計と同じ。サーバ起動時に `AGENT_TELEMETRY_SERVER_TOKEN` 環境変数で API key を渡し、クライアントは `~/.config/agent-telemetry/config.toml` の `[server] token` で同値を持つ。`user_id`（人物識別）は events の `agent.session.started` 属性に含まれる。**API key の認証**（信頼境界）と **`user_id` 経路**（集計軸）は責務を分ける。
+`agent-telemetry-server` の ingest endpoint `/v1/logs` は **アプリケーション層の認証を持たない**。旧設計の単一共有 write token（`AGENT_TELEMETRY_SERVER_TOKEN`）は [0057] で廃止した。理由:
+
+- 単一共有 token は per-client identity を持たず（[0058]）、`user_id` の偽装もイベント汚染も防げない（token の有無に関わらず `user_id` は自己申告のまま）
+- 共有 token が実際に守れるのは「公開事故時の無認証書き込み（DoS / backend コスト増）」だけで、配布・rotation・漏洩対応のコストをユーザに課す割に守備範囲が狭い。そのリスクはネットワーク到達制御と proxy で代替できる
+- optional 化（既定 off）は誰も有効化せず防御として当てにできず、複雑さだけ残る。「無くす」か「必須にする」の二択で、非公開前提なら削除が筋
+
+代わりに信頼境界を 2 層で表現する:
+
+1. **ネットワーク到達制御**: 既定 listen を `127.0.0.1:8443`（loopback）に倒し、「インターネットに晒さない」を既定値で担保する。loopback の外（全インターフェイス / 公開 IP）へ bind する場合は起動時に警告ログを出す（`cmd/agent-telemetry-server/main.go` の `isLoopbackHost` 判定）
+2. **公開時の proxy 終端**: loopback の外へ公開するデプロイは、TLS 終端・認証・レート制限を前段の reverse proxy / Ingress に寄せることを運用契約とする（[0057]）。バイナリ側は `ReadTimeout` / `WriteTimeout` / `IdleTimeout` で slow-body を安価に切るに留め、本格的なレート制限は proxy 責務とする
+
+`/v1/logs` は **書き込み専用**で蓄積データを読み出す API を持たないため、誤って公開しても保存済みメトリクスの **漏えい（confidentiality）は起きない**。残るリスクは無認証書き込みによる **汚染（integrity）と DoS / backend コスト増（availability）** で、これを上記 2 層で抑える。`user_id`（人物識別）は events の `agent.session.started` 属性に含まれる自己申告の集計軸であり、認証 identity とは独立（per-user isolation を約束する場合の昇格策は次節）。
 
 ### 信頼境界と identity のスコープ（[0058]）
 
-現行の認証は **単一の共有 write token** で信頼境界を表現する。`internal/serverpipe/handler.go` は Bearer token の一致だけを検証し、payload 中の `event_id` / `session_id` / `coding_agent` / `eventName` / 全属性（`user_id` を含む）はクライアント申告をそのまま受理する。つまり **`user_id` は認可された identity ではなく単なる集計次元**であり、token を持つ任意のクライアントは他ユーザを騙る forged イベントを送って共有ダッシュボードを汚染したり、高カーディナリティ属性を注入して backend コストを押し上げられる。
+ingest は **アプリケーション層の認証を持たず**（前節「認証境界」）、payload 中の `event_id` / `session_id` / `coding_agent` / `eventName` / 全属性（`user_id` を含む）はクライアント申告をそのまま受理する。つまり **`user_id` は認可された identity ではなく単なる集計次元**であり、ingest に到達できる任意のクライアントは他ユーザを騙る forged イベントを送って共有ダッシュボードを汚染したり、高カーディナリティ属性を注入して backend コストを押し上げられる。これは token の有無と独立した性質で、共有 write token があった旧構成でも token 保持者なら誰もが同じことをできた（だからこそ token は identity の防御にならず [0057] で廃止した）。
 
-これは **single-team / 単一 token 構成では意図的に受容するリスク** とする。前提は「token を共有する全員が相互に信頼できる小規模チームであり、各クライアントは自分の正しい `user_id` を申告する」こと。この前提が成り立つ範囲では、per-client identity・署名・per-user 認可境界を持たない単純さを優先する。
+これは **single-team / 非公開デプロイでは意図的に受容するリスク** とする。前提は「ingest に到達できるのはネットワーク到達制御で限定された相互信頼の小規模チームのマシンだけであり、各クライアントは自分の正しい `user_id` を申告する」こと。この前提が成り立つ範囲では、per-client identity・署名・per-user 認可境界を持たない単純さを優先する。
 
 意図的に許容している脅威（single-team スコープ内では受容）:
 
@@ -654,11 +667,11 @@ Stop hook 経路には載せない方針は維持する。理由は旧設計と�
 
 **production で Collector を挟む構成での緩和可否**: otel 一本化（[0055]）の Mimir/Loki 経路や Datadog collector レシピでは client と backend の間に OTel Collector が入る（責務分担は本書「外部 backend 経路の責務分担」）。これは上記の **補助要件（backend カーディナリティ / コスト制御）には実効的な緩和** になる — Collector の `filter` / `transform` / `attributes` processor で属性 allowlist・値長上限・高カーディナリティ drop を ingest 時に強制でき、backend へ流す前に cost spike を抑えられる（現 `deploy/oss-observability/collector-config.yaml` は `resource` upsert と `batch` のみだが、processor 追加で対応できる配置点）。
 
-一方 **identity enforcement（必須要件）は Collector を「挟むだけ」では満たせない**。Collector は stateless な router であり（責務分担表のとおり集約しない）、payload の `user_id` をそのまま転送する。現構成の receiver は `0.0.0.0:4318` で認証すら持たず、認証面ではむしろ server path（Bearer token 検証あり）より弱い。偽装を防ぐには、per-client の認証 credential（per-user bearer token / mTLS client cert / OIDC）を Collector の auth extension で検証し、その **認証済み identity から `user_id` / tenant を processor の `upsert` で上書きして client 申告値を捨てる** 必要がある（既存の `resource` processor が `service.name` を upsert するのと同じ機構だが、値が静的定数ではなく認証 identity 由来になる点が決定的に違う）。つまり Collector は identity enforcement を **server 本体（`internal/serverpipe/`）を改修せず実装する配置先の一案** として有力だが、per-client credential という必須要件そのものを回避するものではない。
+一方 **identity enforcement（必須要件）は Collector を「挟むだけ」では満たせない**。Collector は stateless な router であり（責務分担表のとおり集約しない）、payload の `user_id` をそのまま転送する。現構成の receiver は `0.0.0.0:4318` で認証を持たない（自前 server path も token 廃止後は同様に無認証で、両経路ともネットワーク到達制御に依存する）。偽装を防ぐには、per-client の認証 credential（per-user bearer token / mTLS client cert / OIDC）を Collector の auth extension で検証し、その **認証済み identity から `user_id` / tenant を processor の `upsert` で上書きして client 申告値を捨てる** 必要がある（既存の `resource` processor が `service.name` を upsert するのと同じ機構だが、値が静的定数ではなく認証 identity 由来になる点が決定的に違う）。つまり Collector は identity enforcement を **server 本体（`internal/serverpipe/`）を改修せず実装する配置先の一案** として有力だが、per-client credential という必須要件そのものを回避するものではない。
 
 さらに 2 点に注意する: (1) SQLite + Grafana の server path は設計上 Collector を経由しない（本書「プロトコル — OTLP/HTTP Logs」で明記）ため、Collector 経路での enforcement は Mimir/Loki/Datadog 経路のみを保護し、**SQLite dashboard 汚染には効かない**。(2) `user_id` を enforce しても `session_id` / `event_id` / 他属性の詐称は残るため、攻撃者自身の `user_id` namespace 内の汚染は防げない（成りすましは塞げてもデータの信頼性そのものは担保されない）。
 
-単一共有 token そのものの運用（rotation・配布・漏洩時対応）は別途 [0057] のスコープ。本節は identity と認可境界の方針に集中する。
+書き込み token は [0057] で廃止し、認証境界をネットワーク到達制御 + proxy に移した（前節「認証境界」）。本節は per-user isolation を約束する場合の identity enforcement の方針に集中する。
 
 ### サーバ側 — OTLP Logs receiver + events table
 
@@ -681,10 +694,9 @@ internal/
 
 ingest ハンドラの責務:
 
-1. Bearer token を検証
-2. OTLP Logs payload をパースして `eventName` / `attributes` / `timeUnixNano` を取り出す
-3. events table に `INSERT OR IGNORE`（`event_id` PK で重複排除）
-4. OTLP/HTTP の標準 `partialSuccess` レスポンスを返す（`rejectedLogRecords`、`errorMessage`）
+1. OTLP Logs payload をパースして `eventName` / `attributes` / `timeUnixNano` を取り出す（認証は行わない。認証境界は前節のとおりネットワーク到達制御 + proxy）
+2. events table に `INSERT OR IGNORE`（`event_id` PK で重複排除）
+3. OTLP/HTTP の標準 `partialSuccess` レスポンスを返す（`rejectedLogRecords`、`errorMessage`）
 
 `internal/syncdb/schema.sql`（events DDL + 派生 VIEW 定義）をサーバ binary にも埋め込み、起動時に `schema_meta` ハッシュ比較で DDL 再構築する仕組みはクライアントと同じ。`schema_hash` 不一致でクライアント送信を全停止させるロジックは持たない（events table の DDL は安定で、新メトリクスは新属性の追加で表現できるため）。
 
@@ -759,5 +771,5 @@ events 単位なので旧設計（集計値のみ）より体積は数倍だが�
 - サーバ送信を有効化する場合、`agent-telemetry flush --since-last` の定期起動を cron / launchd / systemd timer で自前運用する必要がある（Stop hook hot path に乗せないことの代償）
 - backfill が後追い更新を検出した時点で新しい `agent.pr.observed` イベントを events に追記する責務がクライアント側にある。backfill が動かないと最新状態がサーバへ反映されない
 - events のオンザフライ VIEW 集約は events 数が大きくなるとクエリレイテンシに効く。materialization 切替の閾値は実測で決める（最初は VIEW のまま運用）
-- サーバ認証は単一 API key。複数ユーザでの read/write 権限分離（user 別 RLS、OIDC 等）は将来課題
-- サーバは単一共有 token のみで認証し per-client identity を持たない。`user_id` は自己申告の集計次元であり、token 保持者は他ユーザ偽装・イベント汚染・高カーディナリティ注入が可能。single-team 構成では意図的な受容リスクとし、isolation を約束するデプロイ向けの追加要件（per-user token / token scoping / 監査ログ / backend カーディナリティ制御）は「信頼境界と identity のスコープ（[0058]）」に列挙した（実装は別 PR）
+- サーバ ingest はアプリ層の認証を持たない（[0057] で write token 廃止）。既定 loopback bind + 公開時 proxy 終端が信頼境界で、複数ユーザの read/write 権限分離（user 別 RLS、OIDC 等）は将来課題
+- `user_id` は自己申告の集計次元であり、ingest に到達できるクライアントは他ユーザ偽装・イベント汚染・高カーディナリティ注入が可能（token の有無と独立）。single-team / 非公開デプロイでは意図的な受容リスクとし、isolation を約束するデプロイ向けの追加要件（identity enforcement = per-user token / token scoping、補助 = 監査ログ / backend カーディナリティ制御）は「信頼境界と identity のスコープ（[0058]）」に列挙した（実装は別 PR）

@@ -309,19 +309,17 @@ GROUP BY は (`pr_url`, `coding_agent`, `user_id`)。同一 PR が複数 agent /
 ```toml
 [server]
 endpoint = "https://telemetry.example.com"
-token = "xxx"
 ```
 
-`[server]` は安定 ID `"server"`・`Authorization: Bearer <token>`・`encoding = "json"`・`signals = ["logs"]` の単一 target に正規化される。既存設定はそのまま動く。
+`[server]` は安定 ID `"server"`・`encoding = "json"`・`signals = ["logs"]` の単一 target に正規化される。既存設定はそのまま動く。`token` は任意で、付属の `agent-telemetry-server` は認証しないため不要（指定しても送出され、サーバ側で無視される）。`[server]` を認証付き proxy の背後に置く場合のみ、proxy が要求する credential を `token`（既定で `Authorization: Bearer <token>`）として設定する。
 
 **(2) export target 配列** — `[[export]]`（array-of-tables、複数可）:
 
 ```toml
-# 中央サーバ（既存の [server] と等価）
+# 中央サーバ（既存の [server] と等価。付属サーバは認証しないので token 不要）
 [[export]]
 id = "central"
 endpoint = "https://telemetry.example.com"
-token = "xxx"
 
 # Datadog direct（protobuf + dd-api-key）
 [[export]]
@@ -337,7 +335,7 @@ signals = ["logs"]
 |---|---|---|---|
 | `id` | string | （必須） | target の**安定 ID**。per-target cursor（後述 `flush_cursors`）のキー。URL を変えても cursor を保つため endpoint とは別に持つ。重複は起動エラー |
 | `endpoint` | string | （必須） | **base URL**（signal path を含めない）。クライアントが signal path を補完する（**endpoint モデル**節を参照） |
-| `token` | string | （認証が必要な backend でのみ必須） | 認証用 credential。認証なしのローカル Collector（OSS observability レシピ）では省略可で、その target も送信対象になる。`${VAR}` のみ環境変数展開する（秘密を config に直書きしない direct レシピ向け） |
+| `token` | string | （認証が必要な backend でのみ必須） | 認証用 credential。付属の `agent-telemetry-server`（認証なし）や認証なしのローカル Collector（OSS observability レシピ）では省略可で、その target も送信対象になる。`${VAR}` のみ環境変数展開する（秘密を config に直書きしない direct レシピ向け） |
 | `auth_header` | string | `Authorization` | credential を載せる HTTP ヘッダ名。Datadog は `dd-api-key` |
 | `auth_scheme` | string | `Authorization` 時は `Bearer`、それ以外は空 | ヘッダ値の prefix。空なら raw token（`dd-api-key: <token>`）、非空なら `<scheme> <token>`（`Authorization: Bearer <token>`） |
 | `encoding` | string | `json` | wire encoding。`json`（自前サーバ / Collector）または `protobuf`（Datadog direct logs は protobuf 必須） |
@@ -566,16 +564,16 @@ agent-telemetry-server [--data-dir <path>] [--listen <addr>]
 | フラグ | 既定 | 説明 |
 |---|---|---|
 | `--data-dir` | `/var/lib/agent-telemetry` | サーバが集約 DB を保管する root |
-| `--listen` | `:8443` | HTTP listen アドレス |
+| `--listen` | `127.0.0.1:8443` | HTTP listen アドレス（既定は loopback）。`/v1/logs` はバイナリ自身では認証しないため、loopback の外へ公開する際は TLS 終端 proxy を前段に置く。loopback 以外へ bind すると起動時に警告ログを出す |
 
-環境変数 `AGENT_TELEMETRY_SERVER_TOKEN` で API key を受け取る。未設定時は起動時にエラー終了する。
+**認証境界**: ingest endpoint `/v1/logs` は **バイナリ自身では認証を行わない**。信頼境界はネットワーク到達制御（既定の loopback bind）と、公開時に前段へ置く TLS 終端 proxy（認証・レート制限）が担う（[issue 0057](../issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md)）。書き込み token（旧 `AGENT_TELEMETRY_SERVER_TOKEN`）は廃止した — 単一共有 token は per-client identity を持たず（[issue 0058](../issues/closed/0058-design-server-per-client-identity-userid-spoofing.md)）配布・rotation コストに見合わないため。`/v1/logs` は書き込み専用で蓄積データを読み出す API を持たないため、誤って公開しても保存済みメトリクスの漏えいは起きないが、無認証では偽イベント注入・DoS・backend コスト増の余地が残る点に注意する。
 
 ### サーバ側データ配置
 
 | ファイル | 形式 | 役割 |
 |---|---|---|
 | `<data_dir>/agent-telemetry.db` | SQLite | 全 user 集約 DB。`events` テーブル（SoR、`INSERT OR IGNORE`）+ 派生 VIEW（`sessions` / `transcript_stats` / `pr_metrics` / `session_concurrency_*`）を本文書のスキーマで保持 |
-| `<data_dir>/rejected.log` | テキスト | 不正な payload / 認証失敗のログ |
+| `<data_dir>/rejected.log` | テキスト | 不正・検証失敗の payload のログ |
 
 サーバはクライアントから受信した events を `event_id` で冪等に追記するだけで、transcript 解釈や集計は行わない。VIEW の中身（`sessions` 等を events からどう組み立てるか）はサーバとクライアントで共有する（`internal/syncdb/schema/schema.sql`）。
 
@@ -680,7 +678,6 @@ events は **events table の DDL を変えずに新属性 / 新イベント名�
 |---|---|
 | `AGENT_TELEMETRY_AGENT` | hook / CLI のデフォルト agent（`claude` / `codex`）。`--agent` が省略され、かつ自動検出を行わない経路で参照する |
 | `AGENT_TELEMETRY_USER` | `session-index.jsonl` の `user_id` を上書きする。CI / コンテナで決定的に設定したい場合に使う。最優先のソース（`config.toml` の `user` キーや git config より優先される） |
-| `AGENT_TELEMETRY_SERVER_TOKEN` | サーバ binary `agent-telemetry-server` 起動時の Bearer 認証用 API key。クライアント側 `config.toml` の `[server] token` と一致させる。サーバ側で必須、クライアント側では参照しない |
 | `XDG_CONFIG_HOME` | クライアント側で `config.toml` の置き場所を上書きする。設定されている場合は `$XDG_CONFIG_HOME/agent-telemetry/config.toml` を読み、無ければ `~/.config/agent-telemetry/config.toml` を読む |
 | `CODEX_HOME` | Codex CLI のホームディレクトリ。未指定なら `~/.codex`。Codex 標準と同じ |
 

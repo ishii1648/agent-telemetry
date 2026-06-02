@@ -30,20 +30,20 @@ docker pull ghcr.io/ishii1648/agent-telemetry-server:v0.6.0
 
 ```fish
 docker run --rm -p 8443:8443 \
-  -e AGENT_TELEMETRY_SERVER_TOKEN=(openssl rand -hex 32) \
   -v $PWD/agent-telemetry-data:/var/lib/agent-telemetry \
-  ghcr.io/ishii1648/agent-telemetry-server:latest
+  ghcr.io/ishii1648/agent-telemetry-server:latest --listen :8443
 ```
 
-## 2. Bearer token を生成する
+既定 listen は loopback (`127.0.0.1:8443`) で、コンテナ内 loopback は published port から到達できないため、ここでは `--listen :8443`（全インターフェイス）で起動しています。サーバはアプリ層の認証を持たない（次節）ので、`:8443` で公開する場合は信頼できるネットワークに限定するか前段に proxy を置いてください。
 
-`AGENT_TELEMETRY_SERVER_TOKEN` はサーバ起動時の Bearer 認証 key です。クライアント `~/.config/agent-telemetry/config.toml` の `[server] token` と同値にする必要があります（旧パス `~/.claude/agent-telemetry.toml` も fallback として読まれますが、新規セットアップでは `~/.config/` 側に置いてください）。
+## 2. 認証境界（ネットワーク到達制御 + proxy）
 
-```fish
-openssl rand -hex 32
-```
+`agent-telemetry-server` の ingest endpoint `/v1/logs` は **アプリケーション層の認証を持ちません**（旧 `AGENT_TELEMETRY_SERVER_TOKEN` は廃止しました）。信頼境界は次の 2 層で表現します（設計判断は [issue 0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md) / [issue 0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0058-design-server-per-client-identity-userid-spoofing.md)）:
 
-漏えい時はサーバ側 env と全クライアントの `[server] token` を同時にローテーションしてください。
+- **既定 bind は loopback (`127.0.0.1:8443`)**。手元のマシン以外から到達させない限り認証は不要です。コンテナ / k8s では published port / ClusterIP から届く必要があるので `--listen :8443`（全インターフェイス）で起動しますが、その場合は **ネットワーク到達制御（VPN / 内部ネットワーク / ClusterIP）で送信元を限定する**のが前提です。loopback 以外へ bind するとサーバは起動時に警告ログを出します。
+- **インターネット公開する場合は、前段に TLS 終端 + 認証 + レート制限を行う reverse proxy / Ingress を必ず置きます**（oauth2-proxy / mTLS / OIDC 等）。`/v1/logs` は書き込み専用で蓄積データを読み出す API を持たないため誤公開でも保存済みメトリクスの漏えいは起きませんが、無認証のままでは偽イベント注入・DoS・backend コスト増の余地が残ります。
+
+クライアント側に token 設定は不要です。認証付き proxy を前段に置く場合のみ、proxy が要求する credential を `[server] token` に設定してください（付属サーバ自身は無視します）。
 
 ## 3. k8s 参考デプロイ — 最小構成（サーバのみ）
 
@@ -55,17 +55,6 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: agent-telemetry
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-telemetry-server-token
-  namespace: agent-telemetry
-type: Opaque
-stringData:
-  # REPLACE_ME: openssl rand -hex 32 で生成し、クライアント [server] token と同値にする。
-  # SealedSecret / External Secrets Operator など秘匿配信に置き換えるのが望ましい。
-  token: "REPLACE_ME_with_openssl_rand_hex_32"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -97,15 +86,11 @@ spec:
       containers:
         - name: server
           image: ghcr.io/ishii1648/agent-telemetry-server:latest   # REPLACE_ME: 本番では vX.Y.Z で tag pin
+          # ":8443" は全インターフェイス bind。認証は持たないので ClusterIP + ネットワーク
+          # 到達制御で送信元を限定する前提（公開する場合は下記 Ingress で proxy 認証を入れる）。
           args: ["--listen", ":8443", "--data-dir", "/var/lib/agent-telemetry"]
           ports:
             - {containerPort: 8443, name: ingest}
-          env:
-            - name: AGENT_TELEMETRY_SERVER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: agent-telemetry-server-token
-                  key: token
           volumeMounts:
             - {name: data, mountPath: /var/lib/agent-telemetry}
           readinessProbe:
@@ -130,6 +115,8 @@ spec:
     - {port: 8443, targetPort: ingest, name: ingest}
 ---
 # REPLACE_ME: 外部公開する場合の Ingress 例。cluster の IngressClass / cert-manager Issuer に合わせて調整。
+# サーバは無認証なので、公開する場合はこの Ingress（または別の reverse proxy）で TLS 終端に加え
+# 認証（oauth2-proxy / OIDC / mTLS 等）とレート制限を必ず入れること。
 # 公開しない場合（VPN / port-forward 経由のみ）はこのブロックをまるごと削除してよい。
 # apiVersion: networking.k8s.io/v1
 # kind: Ingress
@@ -176,7 +163,7 @@ kubectl create configmap agent-telemetry-grafana-dashboards -n agent-telemetry \
 
 > **ConfigMap サイズ上限**: ConfigMap は etcd の制約から 1 MiB が上限です。dashboard JSON が肥大化した場合は、Grafana sidecar pattern（[grafana/helm-charts](https://github.com/grafana/helm-charts) の sidecar dashboards loader）または initContainer で `git clone` する形に切り替えてください。
 
-そのうえで以下を `kubectl apply -f -` します。Secret / PVC / Service の最小構成は § 3 と共通なので、ここでは Deployment + Service だけを示します（§ 3 の Secret + PVC + Namespace は事前に apply 済みである前提）。
+そのうえで以下を `kubectl apply -f -` します。PVC / Service の最小構成は § 3 と共通なので、ここでは Deployment + Service だけを示します（§ 3 の PVC + Namespace は事前に apply 済みである前提）。
 
 ```yaml
 ---
@@ -198,15 +185,10 @@ spec:
       containers:
         - name: server
           image: ghcr.io/ishii1648/agent-telemetry-server:latest   # REPLACE_ME: 本番では tag pin
+          # ":8443" は全インターフェイス bind。認証は持たないので ClusterIP + ネットワーク到達制御が前提。
           args: ["--listen", ":8443", "--data-dir", "/var/lib/agent-telemetry"]
           ports:
             - {containerPort: 8443, name: ingest}
-          env:
-            - name: AGENT_TELEMETRY_SERVER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: agent-telemetry-server-token
-                  key: token
           volumeMounts:
             - {name: data, mountPath: /var/lib/agent-telemetry}
           readinessProbe:
@@ -298,7 +280,7 @@ user = "you@example.com"
 
 [server]
 endpoint = "https://telemetry.example.com"   # サーバの base URL（パスは含めない）
-token    = "xxx"                             # AGENT_TELEMETRY_SERVER_TOKEN と同値
+# token は不要（付属サーバは認証しない）。認証付き proxy を前段に置く場合のみ proxy の credential を設定する
 ```
 
 設定を確認:
