@@ -126,6 +126,8 @@ agent-telemetry sync-db
 
 リポジトリを clone した環境で、Collector → Mimir / Loki → Grafana の最小スタックを 1 コマンドで起動します。`flush` がローカルの Collector（認証不要）にデータを push し、Grafana がそれを Mimir（gauge metrics）/ Loki（raw events logs）経由で表示します。
 
+> **⚠ ローカル限定・本番非対応**: この compose スタックは **開発用ローカル可視化専用** です。Grafana は anonymous access（ログイン不要・Admin）、OTLP receiver / Mimir / Loki は無認証で、公開ネットワークに晒すとダッシュボードの無認証閲覧と OTLP 注入を許します。誤公開を防ぐため compose は全 host port を `127.0.0.1`（loopback）に bind してあり、同一マシンからしか届きません。別ホストや `0.0.0.0` へ広げないこと。複数マシン / チームで集約する本番相当の経路は Bearer 認証付きの中央サーバ（[server]({{< relref "/setup/server" >}})）が担います。本番相当で使う場合の最低要件（Grafana 認証 / OTLP 認証 / TLS）は [`deploy/oss-observability/README.md`](https://github.com/ishii1648/agent-telemetry/blob/main/deploy/oss-observability/README.md) を参照してください。
+
 ### 4-1. config.toml に export target を追加
 
 ローカル可視化は `flush` を localhost の Collector に向ける **credential 不要の export target** で成り立ちます。[`deploy/oss-observability/config.toml.example`](https://github.com/ishii1648/agent-telemetry/blob/main/deploy/oss-observability/config.toml.example) を `~/.config/agent-telemetry/config.toml` にコピーするか、以下を追記します:

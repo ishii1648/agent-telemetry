@@ -1,10 +1,17 @@
+# SQLite dashboard (legacy datasource 経路) のローカル可視化 / E2E スクショ用 compose。
+#
+# ⚠ ローカル限定・本番非対応 (issue 0063)。Grafana は anonymous access。
+# host port を 127.0.0.1 (loopback) に bind し公開を防ぐ。本番相当で使う場合の
+# 最低要件 (Grafana 認証 / TLS) は deploy/oss-observability/README.md を参照。
 services:
   grafana:
     image: grafana/grafana-oss:11.5.2
     ports:
-      - "${GRAFANA_PORT:-13000}:3000"
+      # 127.0.0.1 bind で anonymous Grafana の公開を防ぐ (issue 0063)。
+      - "127.0.0.1:${GRAFANA_PORT:-13000}:3000"
     environment:
       - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      # anonymous はローカル単独利用前提。公開時は無認証閲覧になる (issue 0063)。
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_RENDERING_SERVER_URL=http://renderer:8081/render
