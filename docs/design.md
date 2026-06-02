@@ -247,6 +247,14 @@ GitHub の secondary rate limit は総量でなく **バースト / 同時実行
   - **Phase 1**: PR が付いた可能性の高い順＝ **newest-first** で cap 件。あふれた分は次 run に回る。
   - **Phase 2**: per-URL の `last_meta_check`（state の `meta_url_checks`）で **oldest-checked-first** に cap 件。単純 cap で先頭 N 件だけ更新され続ける starvation を避ける。
 
+### 外部コマンドの PATH / cwd 信頼境界（[0061]）
+
+`git` / `gh` / 自己呼び出しの `agent-telemetry` はいずれもシェルを介さず argv で起動し攻撃者データを展開しないが、PATH 解決と実行 cwd には信頼境界がある。[issues/closed/0061-design-external-command-path-hijack-untrusted-cwd.md](../issues/closed/0061-design-external-command-path-hijack-untrusted-cwd.md) の方針:
+
+- **自己呼び出しは `os.Executable()` の絶対パス解決に寄せる**。`SessionEnd` の `sync-db` 再実行（`internal/hook/sessionend.go`）と Stop hook の worker spawn（`internal/hook/stop.go`）はどちらも、実行中バイナリを `os.Executable()` で解決してから起動する。PATH 上に先回りで置かれた同名バイナリを拾わない。解決不能時のみ bare PATH lookup（`"agent-telemetry"`）にフォールバックする。
+- **`gh pr view <full-url>` は信頼できる作業ディレクトリで実行する**。full URL がリポジトリを解決するため cwd の git remote に依存しない。したがって攻撃者が用意しうるセッション記録由来の cwd ではなく、常に HOME（不可なら TempDir）を cwd にして起動する（`trustedWorkdir`）。リポジトリ cwd 固有の `.git/config` / gh 設定・hook を拾わせない。元 cwd が消えた古いセッションでも meta を更新できる副次効果も兼ねる。
+- **`gh pr list --head` はセッション cwd で実行せざるを得ない**。リポジトリを cwd の git remote から解決するため（full URL を持たない）。ここでの cwd は自分の `session-index.jsonl` 由来であり telemetry の信頼ドメイン内。攻撃者が cwd を差し替えた場合でも、既存の緩和（**no-shell argv / 8s timeout / global single-flight lock**）で被害を限定する。これらの緩和は本 hardening でも維持する。
+
 ### 移行 drain `backfill --gc`
 
 deploy 後の既存 backlog（再現環境で 2390）は GC 適用前なので初回数 Stop が大バーストになる。これを cap 無しの一括パス `agent-telemetry backfill --gc` で 1 回 drain する。`--gc` は `gh` を呼ばず、`COALESCE(ended_at, timestamp)` から 24h 以上経過した PR-less・未 checked セッションを一括で `backfill_checked` にする（`ended_at` 空の Claude セッションも `timestamp` フォールバックで age out する。詳細は [issues/0035-bug-backfill-no-pr-infinite-retry.md](../issues/closed/0035-bug-backfill-no-pr-infinite-retry.md)）。`doctor` が backlog 件数を見て案内する。backlog のカウント（`countBacklog`）は backfill candidate と同じフィルタを使い、`is_default_branch` のセッションを除外する——第1層で構造除外されるデフォルトブランチは `--gc` でも markChecked されないため、数えると解消不能な `--gc` 案内になってしまう。

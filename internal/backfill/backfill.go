@@ -433,17 +433,17 @@ func runMetaBackfill(indexPath string, sessions []sessionindex.Session, capBudge
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// `gh pr view <full-url>` は cwd の git remote に依存しないので、
-			// 元の cwd が消えていても HOME にフォールバックしてリモート解決する。
-			// リネームや worktree 削除で cwd が消えた古いセッションでも meta を更新できる。
-			cwd := t.cwd
-			if cwd == "" || !isDir(cwd) {
-				home, err := os.UserHomeDir()
-				if err != nil || !isDir(home) {
-					results <- metaResult{url: t.url}
-					return
-				}
-				cwd = home
+			// `gh pr view <full-url>` は full URL でリポジトリを解決するため
+			// cwd の git remote に依存しない。信頼境界を固定するため、攻撃者が
+			// 用意しうるセッション記録由来の cwd ではなく常に信頼できる作業
+			// ディレクトリ（HOME / 不可なら TempDir）で実行する（[0061]）。
+			// リポジトリ cwd 固有の git/gh 設定・hook を拾わせない狙いも兼ねる。
+			// 副次効果として、リネームや worktree 削除で元 cwd が消えた古い
+			// セッションでも meta を更新できる。
+			cwd := trustedWorkdir()
+			if cwd == "" {
+				results <- metaResult{url: t.url}
+				return
 			}
 
 			pr, err := fetchPRByURL(t.url, cwd)
@@ -482,7 +482,12 @@ func runMetaBackfill(indexPath string, sessions []sessionindex.Session, capBudge
 
 // fetchPR fetches PR URL, state, and comments for a branch group.
 func fetchPR(g group) result {
-	// Use the last entry's cwd (matches Python behavior)
+	// `gh pr list --head` はリポジトリを cwd の git remote から解決するため、
+	// セッション記録の cwd で実行せざるを得ない（gh pr view と違い full URL を
+	// 持たない）。信頼境界: ここでの cwd は自分のセッション記録（session-index）
+	// 由来であり、それ自体が telemetry の信頼ドメイン内。攻撃者が cwd を差し替えた
+	// 場合でも no-shell argv / 8s timeout / global lock の緩和で被害を限定する
+	// （[0061]）。Use the last entry's cwd (matches Python behavior)。
 	cwd := g.entries[len(g.entries)-1].CWD
 	if cwd == "" || !isDir(cwd) {
 		return result{group: g, markChecked: true}
@@ -640,6 +645,21 @@ func countChangesRequested(reviews []reviewJSON) int {
 func isDir(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()
+}
+
+// trustedWorkdir returns a directory under the user's own control for running
+// cwd-independent `gh` commands (e.g. `gh pr view <full-url>`), so they never
+// execute inside an untrusted repository cwd that an attacker may have planted
+// git/gh config or hooks in. Prefers HOME, falls back to TempDir, and returns
+// "" if neither is usable (caller skips the fetch). See [0061].
+func trustedWorkdir() string {
+	if home, err := os.UserHomeDir(); err == nil && isDir(home) {
+		return home
+	}
+	if tmp := os.TempDir(); isDir(tmp) {
+		return tmp
+	}
+	return ""
 }
 
 // backfillCodexEndedAt reads each Codex session whose ended_at is empty
