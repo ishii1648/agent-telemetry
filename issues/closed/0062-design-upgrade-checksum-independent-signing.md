@@ -30,9 +30,12 @@ Completed: 2026-06-02
 
 ## 解決方法
 
-受容はせず、**cosign keyless で `checksums.txt` を独立署名する**方針を採用し `docs/design.md`「配布補助 > `upgrade` の成果物署名（cosign keyless）と独立した信頼の根（[0062]）」に記録した。
+独立署名は導入せず、**`upgrade` サブコマンドそのものを廃止して self-update 経路（任意コード実行に直結する attack surface）を除去する**方針を採用した。`docs/design.md`「配布補助 > `upgrade` サブコマンドの廃止（self-update 経路の除去）（[0062]）」に記録。
 
-- **方針記録（design）**: 信頼の根を Sigstore（Fulcio/Rekor）に置き、署名者 identity を GitHub Actions の OIDC（release workflow ref）とする。release asset を後から差し替えただけの攻撃者は正規 identity で再署名できない。却下した代替（minisign / cosign 固定鍵ペア＝長期秘密鍵の配布・ローテ負荷と鍵自体が高価値ターゲット化／署名なしでの受容＝任意コード実行直結のため非受容）も明記。
-- **goreleaser 署名ステップ追加**: `.goreleaser.yaml` に `signs`（`cosign sign-blob` を `artifacts: checksum` に適用、`checksums.txt.sig` + `checksums.txt.pem` を release asset 化）を追加。`.github/workflows/release.yml` に `id-token: write` 権限と `sigstore/cosign-installer` step を追加。
-- **client 側検証は後続 PR**: `internal/upgrade/upgrade.go` での `sigstore-go` による SAN/issuer 検証（＋ air-gapped 向け bypass）は実装規模が大きいため分離。署名のみでは client が検証しない限りユーザは保護されないため、**Critical 較正は本 PR では据え置き**、client 検証強制が入った段階で High に下げる。
-- **較正の下限**: 同一 pipeline 内署名は公開後の asset 改竄・repo write 侵害には有効だが build 時 CI runner 侵害には無効。これが較正を下げられる下限を決めることを残留リスクとして明記した。
+> 当初は cosign keyless で `checksums.txt` を独立署名する方針で着手したが（goreleaser `signs` + release.yml の cosign step まで実装）、レビュー方針の見直しで「self-update を残して署名で守る」より「self-update を削って attack surface ごと無くす」方が単純かつ安全と判断し、署名導入はすべて revert した。
+
+- **コード削除**: `internal/upgrade/`（`upgrade.go` / `upgrade_test.go`）を削除し、`cmd/agent-telemetry/main.go` から `upgrade` case・`runUpgrade`・import・usage 行を除去。
+- **署名導入の revert**: `.goreleaser.yaml` の `signs` ブロックと `.github/workflows/release.yml` の `id-token: write` / `sigstore/cosign-installer` step を撤去（self-update を守るための信頼の根が不要になったため）。
+- **更新手段**: self-update は持たず、更新は再インストール（GitHub Releases tarball / `go build` / `make install`）で行う。site の install 手順は元々 `upgrade` を案内していないため変更なし。
+- **較正**: self-update 経路が消えることで「`upgrade`/release 経路の侵害で攻撃者バイナリを実行」という Critical シナリオの agent-telemetry 起因の経路は消滅。残るのは手動 DL tarball の一般的供給網リスクのみで、self-update を持たない一般 CLI と同等＝本ツール固有の Critical ではない。手動 DL の authenticity 強化（署名）は将来の任意改善として余地を残すがスコープ外。
+- **却下した代替**: (a) cosign keyless 署名＋client 検証の実装（`sigstore-go`・鍵/identity 管理・air-gapped bypass まで保守コスト大、かつ同一 pipeline 署名は build 時 CI runner 侵害に無効で完全防御にならず、self-update 保持の便益がコストに見合わない）、(b) 署名なしのまま `upgrade` 据え置き（rename して即実行する経路が残り Critical を下げられない）。
