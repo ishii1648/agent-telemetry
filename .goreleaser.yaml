@@ -42,6 +42,22 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+# cosign keyless で checksums.txt を独立署名し、Sigstore (Fulcio/Rekor) を
+# 信頼の根とする。GitHub Actions の OIDC identity が Rekor 透過ログに記録され、
+# release asset を後から差し替えただけの攻撃者は正規 identity で再署名できない。
+# 設計判断は docs/design.md「`upgrade` の成果物署名」/ issues/closed/0062 を参照。
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    output: true
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+
 changelog:
   use: github
   filters:
