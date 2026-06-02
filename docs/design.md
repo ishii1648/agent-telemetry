@@ -414,6 +414,18 @@ ADR-024 で task_type を集計軸から廃止したため、`pr_metrics` の集
 
 **legacy SQLite datasource 経路の残置**: frser-sqlite-datasource で `grafana/dashboards/agent-telemetry.json` を直接読む構成（`make grafana-up` / site の setup/local「方法 A/B/C」）は、export を設定せず SQLite 単独で任意日付範囲の SQL 集計を見たい低レベル用途のために残す。otel 経路と機能が重複するが、撤去はしない（後方互換・オフライン分析の余地）。E2E スクショは SQLite dashboard を `make grafana-screenshot`、OSS otel dashboard を `make oss-screenshot`（[0055] ⑤）で別々にカバーする。
 
+### ローカル compose は production hardening の対象外（[0063]）
+
+リポジトリ同梱の compose（`docker-compose.yaml` の SQLite 版と `deploy/oss-observability/docker-compose.yaml` の OSS 版）は **開発用ローカル可視化専用** と位置づけ、production hardening の対象外とする（[issues/closed/0063-design-oss-grafana-compose-exposure-hardening.md](../issues/closed/0063-design-oss-grafana-compose-exposure-hardening.md)）。両 compose は利便性のため Grafana の anonymous access（OSS 版は Admin・login form 無効、SQLite 版は Viewer）と無認証の OTLP receiver / Mimir / Loki を有効化している。これらは security-review §3 で「**公開時 High**」と較正された残課題で、外部公開するとダッシュボードの無認証閲覧と OTLP 注入を許す。
+
+**なぜ hardening しないか**: 認証 / TLS / multitenancy を compose に足すと、ローカルで「1 コマンドで上げてすぐ見る」体験（`make oss-up` / `make grafana-up`）が崩れ、credential 管理という本来ローカルに不要な負担が乗る。本番相当の集約は中央 `agent-telemetry-server`（Bearer 認証あり、`site/content/setup/server`）が担う責務であり、compose にその役割を負わせない。両者の責務を分離し、compose は「検証用最小構成」に閉じるのが設計判断。
+
+**誤公開を防ぐ契約**: hardening しない代わりに、誤って公開されないことを次の多層で担保する:
+
+- compose の全 host port を **`127.0.0.1`（loopback）に bind** し、既定で同一マシンからしか届かないようにする（別ホスト・`0.0.0.0` へ広げる操作を明示的に要求させる）。
+- compose ファイル冒頭と anonymous / 無認証 receiver の定義箇所に「ローカル限定・本番非対応」を明記する。
+- `deploy/oss-observability/README.md` と `site/content/setup/`（local / server）に同じ契約と、本番相当で使う場合の **最低要件（Grafana 認証 / OTLP・backend 認証 / TLS / ネットワーク境界 / ストレージ冗長化）** を列挙する。
+
 ### SQLite + Grafana の選定（legacy datasource 経路の背景）
 
 > 以下は SQLite を Grafana datasource に直結する **legacy 経路**の選定経緯。otel 一本化後のメイン可視化は上節のとおり Mimir/Loki を読むが、残置する SQLite datasource 経路の設計判断として記録を残す。

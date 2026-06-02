@@ -12,6 +12,15 @@
 #
 # サーバ deploy への橋渡し: 各 service / config / volume は Kubernetes の
 # Deployment + ConfigMap + PVC に 1:1 で移しやすい単位で切ってある (対応方針 5)。
+#
+# ⚠ ローカル限定・本番非対応 (issue 0063)。本 compose は **開発用ローカル可視化**
+# 専用で、production hardening の対象外。Grafana は anonymous access + Admin、
+# OTLP receiver / Mimir / Loki は無認証なので、公開ネットワークに晒すと
+# ダッシュボードが無認証閲覧され、OTLP intake にイベント注入される
+# (security-review §3 で「公開時 High」と較正)。
+# 防御として全 host port を 127.0.0.1 (loopback) に bind し、同一マシンからしか
+# 届かないようにしてある。0.0.0.0 へ広げたり本番相当で使う場合の最低要件
+# (Grafana 認証 / OTLP 認証 / TLS) は README.md「ローカル限定・本番非対応」を参照。
 services:
   otel-collector:
     # Datadog レシピと同じ版に pin する (OTTL / exporter 挙動の再現性)。
@@ -24,7 +33,8 @@ services:
     ports:
       # host port は env で可変（既定 4318）。スクショ用の e2e stack を
       # `make oss-up` と別 port・別 project で並走させるため (issue 0055 ⑤)。
-      - "${OSS_COLLECTOR_PORT:-4318}:4318" # OTLP/HTTP (clients flush here)
+      # 127.0.0.1 bind で無認証 OTLP receiver の公開を防ぐ (issue 0063)。
+      - "127.0.0.1:${OSS_COLLECTOR_PORT:-4318}:4318" # OTLP/HTTP (clients flush here)
     depends_on:
       - mimir
       - loki
@@ -36,7 +46,8 @@ services:
       - ./mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
       - mimir-data:/data
     ports:
-      - "${OSS_MIMIR_PORT:-9009}:9009" # HTTP (OTLP ingest + Prometheus query API)
+      # 127.0.0.1 bind で無認証 ingest / query API の公開を防ぐ (issue 0063)。
+      - "127.0.0.1:${OSS_MIMIR_PORT:-9009}:9009" # HTTP (OTLP ingest + Prometheus query API)
 
   loki:
     image: grafana/loki:3.3.2
@@ -45,15 +56,20 @@ services:
       - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
       - loki-data:/loki
     ports:
-      - "${OSS_LOKI_PORT:-3100}:3100" # HTTP (OTLP ingest + LogQL query API)
+      # 127.0.0.1 bind で無認証 ingest / query API の公開を防ぐ (issue 0063)。
+      - "127.0.0.1:${OSS_LOKI_PORT:-3100}:3100" # HTTP (OTLP ingest + LogQL query API)
 
   grafana:
     image: grafana/grafana-oss:11.5.2
     # 既存 SQLite dashboard (top-level compose) の :13000 と衝突しないよう
     # 既定 port を分ける (対応方針 3: 別系統の検証 dashboard)。
+    # 127.0.0.1 bind で anonymous Grafana の公開を防ぐ (issue 0063)。
     ports:
-      - "${GRAFANA_PORT:-13001}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-13001}:3000"
     environment:
+      # anonymous + Admin はローカル単独利用前提の利便性設定。公開ネットワーク
+      # では無認証閲覧になるため、本番相当で使う場合は anonymous を切り
+      # GF_SECURITY_ADMIN_PASSWORD 等で認証を有効化する (issue 0063 / README 参照)。
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true

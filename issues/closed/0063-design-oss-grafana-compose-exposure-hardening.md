@@ -26,3 +26,14 @@ compose 例は開発・ローカル可視化用であって本番セキュリテ
 - `deploy/oss-observability` の compose と `site/content/setup/` に「ローカル限定・本番非対応」を明示する（バインドを `127.0.0.1` に限定する例を示す）
 - 本番相当で使う場合の最低要件（Grafana 認証 / OTLP 認証 / TLS）を docs に列挙する
 - 設計判断として「compose は production hardening の対象外」を `docs/design.md` に固定する
+
+## 解決方法
+
+Completed: 2026-06-02
+
+「compose は開発用ローカル可視化専用で production hardening の対象外」という契約を確定し、誤公開を多層で防ぐ形に固めた。hardening 自体は行わず（ローカルの 1 コマンド起動体験を壊さず、本番相当は Bearer 認証付きの中央 `agent-telemetry-server` が担うため）、代わりに次を実施:
+
+- **loopback bind**: `deploy/oss-observability/docker-compose.yaml`（Collector `:4318` / Mimir `:9009` / Loki `:3100` / Grafana `:13001`）と top-level `docker-compose.yaml`（SQLite dashboard、Grafana `:13000`）の全 host port を `127.0.0.1:` 付き bind に変更。`docker compose config` で `host_ip: 127.0.0.1` を確認。既定で同一マシンからしか届かず、`0.0.0.0` 公開には明示操作を要求させる。
+- **compose 内の明示**: 両 compose の冒頭バナーと、anonymous Grafana / 無認証 OTLP receiver の定義箇所に「ローカル限定・本番非対応」とリスクをコメントで明記。
+- **docs の契約と最低要件**: `deploy/oss-observability/README.md` に「ローカル限定・本番非対応」節を追加し、本番相当で使う場合の最低要件（Grafana 認証 / OTLP・backend 認証 / TLS / ネットワーク境界 / ストレージ冗長化）を表で列挙。`site/content/setup/local`・`server` にも同契約の警告を追記。
+- **design.md に固定**: `docs/design.md ## 可視化層` に「ローカル compose は production hardening の対象外（[0063]）」節を追加し、hardening しない理由（責務分離）と誤公開を防ぐ多層の契約を記録。

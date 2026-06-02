@@ -4,6 +4,29 @@
 
 Datadog レシピ（[`../otel-collector/`](../otel-collector/)）と同じ「Collector が backend へ push する」構成を、credential 不要の OSS で再現するのが目的。Prometheus scrape（pull 型）では Datadog exporter と運用感・失敗点がずれるため、あえて push 経路で揃える。
 
+## ⚠ ローカル限定・本番非対応
+
+本レシピは **開発用ローカル可視化専用** で、production hardening の対象外（[issue 0063](../../issues/closed/0063-design-oss-grafana-compose-exposure-hardening.md)）。利便性のため次の無認証コントロールを有効化している:
+
+- **Grafana は anonymous access + Admin**（`GF_AUTH_ANONYMOUS_ENABLED=true` / `GF_AUTH_DISABLE_LOGIN_FORM=true`）— ログインなしでダッシュボードを閲覧・編集できる
+- **OTLP receiver / Mimir / Loki は無認証** — token なしでメトリクス・ログを ingest / query できる
+
+これらを公開ネットワークに晒すと、ダッシュボードが無認証閲覧され、OTLP intake に任意イベントを注入される（security-review §3 で「公開時 High」と較正）。誤公開を防ぐため、compose は全 host port を **`127.0.0.1`（loopback）に bind** してあり、同一マシンからしか届かない。`docker compose` を別ホストや 0.0.0.0 へ広げて使わないこと。
+
+### 本番相当で使う場合の最低要件
+
+このレシピを土台に本番相当（複数ユーザ / 共有ネットワーク / 外部公開）で運用するなら、最低でも次を満たす別構成に作り替える。本レシピ自体はこれらを満たさない:
+
+| 領域 | 最低要件 |
+|---|---|
+| **Grafana 認証** | anonymous access を無効化（`GF_AUTH_ANONYMOUS_ENABLED=false`）し、`GF_SECURITY_ADMIN_PASSWORD` / OAuth / LDAP 等で認証を必須化。`GF_AUTH_DISABLE_LOGIN_FORM` も外す |
+| **OTLP / backend 認証** | Collector の OTLP receiver と Mimir / Loki の ingest・query API に認証（reverse proxy + Bearer / mTLS / multitenancy + `X-Scope-OrgID`）を前置し、無認証 ingest を塞ぐ |
+| **TLS** | 全エンドポイント（Grafana / Collector / Mimir / Loki）を TLS 終端の背後に置き、平文公開しない |
+| **ネットワーク境界** | loopback bind を外す場合は firewall / security group / private network で到達範囲を絞り、`0.0.0.0` 直公開しない |
+| **ストレージ / 冗長化** | single-process / filesystem storage / replication=1 の検証用最小構成（後述）なので、object storage・replication・multitenancy を有効化する |
+
+agent-telemetry が公式に本番デプロイとしてサポートするのは中央 [`agent-telemetry-server`](https://github.com/ishii1648/agent-telemetry/blob/main/site/content/setup/server/index.md)（Bearer 認証あり）であり、本 compose ではない。設計判断としての固定は [docs/design.md「ローカル compose は production hardening の対象外」](../../docs/design.md#ローカル-compose-は-production-hardening-の対象外0063)。
+
 ## データフロー
 
 ```text
