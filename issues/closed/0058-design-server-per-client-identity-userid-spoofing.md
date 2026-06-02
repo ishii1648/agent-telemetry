@@ -36,6 +36,7 @@ Created: 2026-06-02
 - **意図的に許容する脅威の列挙**（single-team スコープ内では受容）: `user_id` 偽装 / イベント詐称・汚染 / 高カーディナリティ注入による backend コスト増。
 - **将来オプションの列挙**（per-user isolation を約束するデプロイ向け、実装可否は別 PR）: identity enforcement（必須要件＝偽装・汚染を防ぐ認可境界）として per-user token / token scoping、補助要件（検知・コスト制御で認可境界ではない）として監査ログ / backend カーディナリティ制御を **層を分けて** 列挙。
 - **isolation を約束するデプロイ向け要件の切り分け**: テナント間・ユーザ間分離を SLA として謳う運用は **identity enforcement のいずれか** を前提条件とすると注記。監査ログ・カーディナリティ制御だけでは偽装そのものを防げないため SLA を満たさないことも明記。
+- **Collector を挟む production 構成での緩和可否**: cardinality / コスト制御（補助要件）は Collector processor が実効的な緩和になる。一方 `user_id` 偽装（必須要件）は「挟むだけ」では緩和にならず、per-client credential を Collector の auth extension で検証して認証 identity から `user_id` を `upsert` 上書きする場合のみ enforce できる（= per-client credential が前提で、Collector は実装配置先の一案にすぎない）。SQLite + Grafana の server path は Collector を経由しないため別途保護が要る、という整理を design に追記。
 
 あわせて `## 既知の制約` に同節への 1 行ポインタを追加し可視性を確保した。単一共有 token そのものの運用（rotation・配布・漏洩時対応）は [[0057]] のスコープとして分離。
 

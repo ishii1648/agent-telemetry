@@ -652,6 +652,12 @@ Stop hook 経路には載せない方針は維持する。理由は旧設計と�
 - **監査ログ** — 受理 / reject したイベントを送信元 token・申告 `user_id`・受信時刻つきで追記し、後から偽装・汚染を追跡できるようにする（現状の `rejected.log` を identity 軸へ拡張）。偽装の事後追跡には効くが、偽装そのものは防げない
 - **backend カーディナリティ制御** — 属性キー / 値の allowlist・値長上限・per-token のラベル種別数上限を設け、高カーディナリティ注入で backend コストが暴走しないようにする
 
+**production で Collector を挟む構成での緩和可否**: otel 一本化（[0055]）の Mimir/Loki 経路や Datadog collector レシピでは client と backend の間に OTel Collector が入る（責務分担は本書「外部 backend 経路の責務分担」）。これは上記の **補助要件（backend カーディナリティ / コスト制御）には実効的な緩和** になる — Collector の `filter` / `transform` / `attributes` processor で属性 allowlist・値長上限・高カーディナリティ drop を ingest 時に強制でき、backend へ流す前に cost spike を抑えられる（現 `deploy/oss-observability/collector-config.yaml` は `resource` upsert と `batch` のみだが、processor 追加で対応できる配置点）。
+
+一方 **identity enforcement（必須要件）は Collector を「挟むだけ」では満たせない**。Collector は stateless な router であり（責務分担表のとおり集約しない）、payload の `user_id` をそのまま転送する。現構成の receiver は `0.0.0.0:4318` で認証すら持たず、認証面ではむしろ server path（Bearer token 検証あり）より弱い。偽装を防ぐには、per-client の認証 credential（per-user bearer token / mTLS client cert / OIDC）を Collector の auth extension で検証し、その **認証済み identity から `user_id` / tenant を processor の `upsert` で上書きして client 申告値を捨てる** 必要がある（既存の `resource` processor が `service.name` を upsert するのと同じ機構だが、値が静的定数ではなく認証 identity 由来になる点が決定的に違う）。つまり Collector は identity enforcement を **server 本体（`internal/serverpipe/`）を改修せず実装する配置先の一案** として有力だが、per-client credential という必須要件そのものを回避するものではない。
+
+さらに 2 点に注意する: (1) SQLite + Grafana の server path は設計上 Collector を経由しない（本書「プロトコル — OTLP/HTTP Logs」で明記）ため、Collector 経路での enforcement は Mimir/Loki/Datadog 経路のみを保護し、**SQLite dashboard 汚染には効かない**。(2) `user_id` を enforce しても `session_id` / `event_id` / 他属性の詐称は残るため、攻撃者自身の `user_id` namespace 内の汚染は防げない（成りすましは塞げてもデータの信頼性そのものは担保されない）。
+
 単一共有 token そのものの運用（rotation・配布・漏洩時対応）は別途 [0057] のスコープ。本節は identity と認可境界の方針に集中する。
 
 ### サーバ側 — OTLP Logs receiver + events table
