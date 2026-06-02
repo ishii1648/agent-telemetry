@@ -15,8 +15,6 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/syncdb/schema"
 )
 
-const testToken = "test-token"
-
 func newTestHandler(t *testing.T) (*Handler, *sql.DB, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -26,7 +24,7 @@ func newTestHandler(t *testing.T) (*Handler, *sql.DB, string) {
 		t.Fatalf("OpenDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	h := NewHandler(db, testToken, dir)
+	h := NewHandler(db, dir)
 	t.Cleanup(func() { h.Close() })
 	return h, db, dir
 }
@@ -71,7 +69,6 @@ func TestServeLogs_RejectsInvalidAndLogs(t *testing.T) {
 	]}]}]}`
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/logs", strings.NewReader(payload))
-	req.Header.Set("Authorization", "Bearer "+testToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -141,7 +138,6 @@ func TestServeLogs_PRMetricsViewExists(t *testing.T) {
 	]}]}]}`
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/logs", strings.NewReader(payload))
-	req.Header.Set("Authorization", "Bearer "+testToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

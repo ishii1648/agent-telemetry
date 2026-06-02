@@ -28,16 +28,19 @@ operator が `--listen :8443` で公開すると `/v1/logs` はインターネ�
 - バイナリ側で安価に閉じられる範囲（`http.Server` の `ReadTimeout`/`WriteTimeout`/`IdleTimeout` 設定）を追加検討する
 - per-client identity / token scoping は別 issue [[0058]] に切り出す
 
-Completed: 2026-06-02
-
 ## 解決方法
 
-`decision_type: design` の方針どおり「TLS・レート制限は ingress/proxy の責務」を契約として固定し、binary 側は安価に閉じられる範囲だけを実装した。
+「TLS・レート制限は ingress/proxy 責務」という契約は #112 (`feat/0057-server-ingest-timeouts`) で先行して固定し、binary 側で安価に閉じられる範囲（`ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s`）も同 PR で追加済み（`WriteTimeout` は Go が request header 読了後に write deadline を開始する仕様に合わせ `ReadTimeout` より大きく取る）。続く本 PR (#119) で「インターネット非公開を前提に書き込み token を廃止し、認証境界をネットワーク到達制御 + proxy に寄せる」最終形に切り替えた。
 
-- **契約の明文化**:
-  - `docs/spec.md` に「サーバ binary の運用前提（信頼境界 / proxy 終端）」節を追加。proxy / ingress が担う関心事（TLS 終端・レート制限・接続元の制限）と、binary が単体で閉じる範囲（request timeout / payload 上限 / Bearer 認証）を表で固定。単一共有 token の影響範囲と per-client scoping は [0058] に切り出す旨を明記。
-  - `site/content/setup/server/index.md` に「運用前提 — TLS / レート制限は proxy 側の責務」節を追加。`--listen` を直接公開しないこと、公開時は reverse proxy / ingress 背後に置くことを運用ガイドとして明記し、§3 の Ingress 例（cert-manager で TLS）と接続。
-- **binary 側の最小実装**: `cmd/agent-telemetry-server/main.go` の `http.Server` に `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を追加（`ReadHeaderTimeout=10s` は既存）。slow-body / idle keep-alive 接続が goroutine を無期限に占有するのを防ぐ defence-in-depth。`WriteTimeout` は Go が request header 読了後に write deadline を開始する仕様に合わせ `ReadTimeout` より大きく取る。payload 上限（50 MB）・Bearer 定数時間比較は既存のまま。
-- **非対象**: per-client identity / token scoping は [0058] の範疇として本 issue では扱わない。TLS / レート制限の binary 内蔵も「ingress 責務」の契約に倣い実装しない。
+セキュリティと運用のバランス検討の結論:
 
-`go test ./...` 全 pass を確認。
+1. **write token（`AGENT_TELEMETRY_SERVER_TOKEN`）を廃止** — 単一共有 token は per-client identity を持たず（[[0058]]）`user_id` 偽装もイベント汚染も防げない。実際に守れるのは「公開事故時の無認証書き込み（DoS / backend コスト増）」だけで、配布・rotation コストに見合わない。optional 化は default off で誰も有効化せず防御にならないため、削除を選んだ。
+2. **既定 listen を loopback (`127.0.0.1:8443`) に変更** — 「インターネットに晒さない」を既定値で担保。loopback 以外へ bind すると起動時に警告ログを出す（`cmd/agent-telemetry-server/main.go` の `isLoopbackHost` 判定）。
+3. **公開時は前段 proxy（TLS 終端 + 認証 + レート制限）を運用契約として明文化** — `docs/spec.md`「認証境界」、`docs/design.md`「認証境界 — ネットワーク到達制御 + proxy」節、`site/content/setup/server/`。
+4. **#112 で導入した `ReadTimeout` / `WriteTimeout` / `IdleTimeout` は本 PR でも維持** — slow-body / slow-loris を安価に切る defence-in-depth（本格的なレート制限は proxy 責務）。
+
+`/v1/logs` は書き込み専用で蓄積データを読み出す API を持たないため、誤公開でも漏えい（confidentiality）は起きない。残る integrity（汚染）/ availability（DoS・コスト）を上記 2〜4 で抑える。per-client identity / token scoping（偽装の根治）は [[0058]] のスコープ。
+
+実装範囲: `cmd/agent-telemetry-server/main.go`（token 撤去・bind 既定・公開警告）、`internal/serverpipe/handler.go`（`checkAuth` / `Token` フィールド撤去）、`internal/serverpipe/handler_test.go`、`docs/spec.md` / `docs/design.md` / `site/content/setup/server/`。
+
+Completed: 2026-06-02

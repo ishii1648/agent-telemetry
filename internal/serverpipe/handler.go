@@ -3,7 +3,6 @@ package serverpipe
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -28,19 +27,19 @@ const MaxPayloadBytes = 50 * 1024 * 1024
 // server before its first write.
 type Handler struct {
 	DB           *sql.DB
-	Token        string
 	RejectedPath string
 
 	mu        sync.Mutex
 	rejectedW io.WriteCloser
 }
 
-// NewHandler wires up the http.Handler. Token must be non-empty —
-// the cmd entrypoint validates the env var before reaching here.
-func NewHandler(db *sql.DB, token, dataDir string) *Handler {
+// NewHandler wires up the http.Handler. The ingest endpoint performs no
+// authentication of its own — the trust boundary is network reachability
+// (default loopback bind) plus a TLS-terminating proxy for public
+// deployments. See docs/design.md "認証境界" and issue 0057.
+func NewHandler(db *sql.DB, dataDir string) *Handler {
 	return &Handler{
 		DB:           db,
-		Token:        token,
 		RejectedPath: filepath.Join(dataDir, "rejected.log"),
 	}
 }
@@ -94,10 +93,6 @@ func (h *Handler) ServeLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !h.checkAuth(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	body, err := readBody(r)
@@ -223,17 +218,6 @@ func otlpTime(ns string) string {
 		return ns
 	}
 	return time.Unix(0, n).UTC().Format(time.RFC3339Nano)
-}
-
-func (h *Handler) checkAuth(r *http.Request) bool {
-	authz := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(authz, prefix) {
-		return false
-	}
-	got := authz[len(prefix):]
-	// Constant-time compare so an attacker can't time the token.
-	return subtle.ConstantTimeCompare([]byte(got), []byte(h.Token)) == 1
 }
 
 // readBody reads the request body, transparently decompressing gzip

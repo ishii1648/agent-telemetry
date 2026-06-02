@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,7 +40,7 @@ func run(args []string) error {
 	}
 	fs := flag.NewFlagSet("agent-telemetry-server", flag.ContinueOnError)
 	dataDir := fs.String("data-dir", "/var/lib/agent-telemetry", "directory holding agent-telemetry.db and collisions.log")
-	listen := fs.String("listen", ":8443", "HTTP listen address")
+	listen := fs.String("listen", "127.0.0.1:8443", "HTTP listen address (defaults to loopback; /v1/logs has no auth — front it with a TLS-terminating proxy before exposing beyond loopback)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -49,9 +50,13 @@ func run(args []string) error {
 		return nil
 	}
 
-	token := os.Getenv("AGENT_TELEMETRY_SERVER_TOKEN")
-	if token == "" {
-		return errors.New("AGENT_TELEMETRY_SERVER_TOKEN must be set")
+	// The ingest endpoint has no application-level auth: the trust boundary
+	// is network reachability (loopback default) plus a fronting proxy for
+	// public exposure (issue 0057). Warn loudly if bound beyond loopback so
+	// an operator can't silently expose an unauthenticated /v1/logs.
+	if host, _, err := net.SplitHostPort(*listen); err == nil && !isLoopbackHost(host) {
+		log.Printf("WARNING: listening on %s — /v1/logs accepts unauthenticated writes; "+
+			"restrict network reach and front it with a TLS-terminating proxy (see issue 0057)", *listen)
 	}
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -65,7 +70,7 @@ func run(args []string) error {
 	}
 	defer db.Close()
 
-	handler := serverpipe.NewHandler(db, token, *dataDir)
+	handler := serverpipe.NewHandler(db, *dataDir)
 	defer handler.Close()
 
 	mux := http.NewServeMux()
@@ -111,6 +116,16 @@ func run(args []string) error {
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// isLoopbackHost reports whether a listen host stays on the local machine.
+// An empty host (e.g. ":8443") means all interfaces, which is NOT loopback.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
 }
 
 func runMigrate(args []string) error {
