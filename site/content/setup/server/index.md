@@ -47,23 +47,24 @@ docker run --rm -p 8443:8443 \
 
 クライアント側に token 設定は不要です。認証付き proxy を前段に置く場合のみ、proxy が要求する credential を `[server] token` に設定してください（付属サーバ自身は無視します）。
 
-## 運用前提 — TLS / レート制限は proxy 側の責務
+## 運用前提 — TLS / 認証 / レート制限は proxy 側の責務
 
-`agent-telemetry-server` は **TLS 終端もレート制限も持たない平文 HTTP ingest** です。`--listen` を **インターネットへ直接公開しないでください**。公開する場合は必ず reverse proxy / ingress（nginx / Caddy / cloud LB など）の背後に置き、次を proxy 側で担保するのが契約です（[issues/0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md)）:
+`agent-telemetry-server` は **アプリ層の認証を持たない平文 HTTP ingest** です（書き込み token は [issues/0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md) で廃止しました）。`--listen` を **インターネットへ直接公開しないでください**。公開する場合は必ず reverse proxy / ingress（nginx / Caddy / cloud LB など）の背後に置き、次を proxy 側で担保するのが契約です:
 
 | 関心事 | どこで担保するか |
 |---|---|
-| **TLS 終端** | proxy / ingress。Bearer token を平文で運ぶため、公開経路は必ず TLS の背後に置く（§3 の Ingress 例は cert-manager で TLS を張る前提） |
-| **レート制限** | proxy / ingress。token 総当たり・大量 ingest の抑制。binary 内にレート制限は無い |
-| **接続元の制限** | proxy / ingress / NetworkPolicy。`/v1/logs` は単一共有 token のみで認可するため、到達範囲を信頼ネットワーク（VPN / cluster 内 / 許可 IP）へ絞る |
+| **TLS 終端** | proxy / ingress。`/v1/logs` は平文 HTTP なので、公開経路は必ず TLS の背後に置く（§3 の Ingress 例は cert-manager で TLS を張る前提） |
+| **認証** | proxy / ingress。oauth2-proxy / OIDC / mTLS 等で前段認証を入れる。`/v1/logs` 自身は認証しない |
+| **レート制限** | proxy / ingress。大量 ingest による DoS / backend コスト増の抑制。binary 内にレート制限は無い |
+| **接続元の制限** | proxy / ingress / NetworkPolicy。到達範囲を信頼ネットワーク（VPN / cluster 内 / 許可 IP）へ絞る |
 
 binary 単体で閉じているのは「公開しても安価に効く最小限」だけです:
 
-- **request timeout**: slow-body / idle keep-alive 接続が goroutine を無期限に占有しないよう `ReadHeaderTimeout=10s` / `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を設定済み。
-- **payload 上限**: 1 リクエストを 50 MB（圧縮フレーム・展開後の双方）で上限し、zip-bomb 系入力を弾く。
-- **Bearer 認証**: token を定数時間比較で検証する。
+- **既定 loopback bind**: 既定 `--listen` は `127.0.0.1:8443`。loopback 以外へ bind すると起動時に警告ログを出す
+- **request timeout**: slow-body / idle keep-alive 接続が goroutine を無期限に占有しないよう `ReadHeaderTimeout=10s` / `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を設定済み
+- **payload 上限**: 1 リクエストを 50 MB（圧縮フレーム・展開後の双方）で上限し、zip-bomb 系入力を弾く
 
-書き込み token は **単一共有** で、漏えい時の影響範囲は全クライアントに及びます。クライアント単位の identity / token scoping は本 binary の対象外です（[issues/0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0058-design-server-per-client-identity-userid-spoofing.md) で別途検討）。VPN / port-forward のみで使う（公開しない）場合は §3 の Ingress ブロックを丸ごと削除して構いません。
+`user_id` は payload 上の自己申告フィールドで、ingest 到達できるクライアントは他ユーザ偽装やイベント汚染が可能です。per-client identity / token scoping は本 binary の対象外で、isolation を約束するデプロイでの追加要件は [issues/0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0058-design-server-per-client-identity-userid-spoofing.md) を参照してください。VPN / port-forward のみで使う（公開しない）場合は §3 の Ingress ブロックを丸ごと削除して構いません。
 
 ## 3. k8s 参考デプロイ — 最小構成（サーバのみ）
 
