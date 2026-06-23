@@ -45,7 +45,7 @@ func TestInsecurePlaintextTargets(t *testing.T) {
 		{ID: "leaky", Endpoint: "http://remote.example.com", Token: "secret", Signals: []string{signalLogs}},
 		{ID: "plain", Endpoint: "http://remote.example.com", Signals: []string{signalLogs}},
 		{ID: "no-endpoint", Endpoint: "", Signals: []string{signalLogs}}, // not Configured
-		{ID: "no-signal", Endpoint: "http://remote.example.com"},          // not Configured
+		{ID: "no-signal", Endpoint: "http://remote.example.com"},         // not Configured
 	}
 	got := InsecurePlaintextTargets(targets)
 	if len(got) != 2 {
