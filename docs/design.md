@@ -654,6 +654,40 @@ Stop hook 経路には載せない方針は維持する。理由は旧設計と�
 
 旧設計と同じ。サーバ起動時に `AGENT_TELEMETRY_SERVER_TOKEN` 環境変数で API key を渡し、クライアントは `~/.config/agent-telemetry/config.toml` の `[server] token` で同値を持つ。`user_id`（人物識別）は events の `agent.session.started` 属性に含まれる。**API key の認証**（信頼境界）と **`user_id` 経路**（集計軸）は責務を分ける。
 
+### 信頼境界と identity のスコープ（[0058]）
+
+現行の認証は **単一の共有 write token** で信頼境界を表現する。`internal/serverpipe/handler.go` は Bearer token の一致だけを検証し、payload 中の `event_id` / `session_id` / `coding_agent` / `eventName` / 全属性（`user_id` を含む）はクライアント申告をそのまま受理する。つまり **`user_id` は認可された identity ではなく単なる集計次元**であり、token を持つ任意のクライアントは他ユーザを騙る forged イベントを送って共有ダッシュボードを汚染したり、高カーディナリティ属性を注入して backend コストを押し上げられる。
+
+これは **single-team / 単一 token 構成では意図的に受容するリスク** とする。前提は「token を共有する全員が相互に信頼できる小規模チームであり、各クライアントは自分の正しい `user_id` を申告する」こと。この前提が成り立つ範囲では、per-client identity・署名・per-user 認可境界を持たない単純さを優先する。
+
+意図的に許容している脅威（single-team スコープ内では受容）:
+
+- **`user_id` 偽装** — 侵害された / 悪意あるクライアントが他ユーザ名義のイベントを送れる。dashboard の per-user 集計は「自己申告ベース」であり監査証跡ではない
+- **イベント詐称・汚染** — token 保持者は任意の `event_id` / `session_id` / イベント種別 / 属性を投入でき、集約 DB を任意に汚染できる
+- **高カーディナリティ注入による backend コスト増** — 属性値が無制限のため、ラベル爆発で Mimir/Loki 等の backend コストを押し上げられる（security review §3 の Medium「cost spike」と関連）
+
+> **isolation を約束するデプロイには現行構成は不十分**。テナント間 / ユーザ間の分離を SLA として謳う運用に広げる場合は、下記の **identity enforcement（必須要件）** のいずれかを満たすことを前提条件とする。監査ログ・backend カーディナリティ制御は **補助要件** であり、検知・コスト制御には効くが `user_id` 偽装やイベント汚染そのものは防げない（認可境界にはならない）ため、これらだけでユーザ間分離 SLA を満たすことはできない。本節は「どこまでが受容リスクで、どこからが追加要件か」の境界を固定するための記録であり、実装は本 issue のスコープ外（別 PR）。
+
+将来オプション（per-user isolation を約束するデプロイ向け。実装可否は別 PR で判断）:
+
+**identity enforcement（必須要件 — 偽装・汚染を防ぐ認可境界）**:
+
+- **per-user token** — ユーザ / クライアントごとに異なる token を発行し、サーバ側で token → 許可 `user_id` を対応付ける。`user_id` の申告値が token に紐づく identity と不一致なら reject する（`user_id` を認可済み identity に昇格）
+- **token scoping** — token に「書き込み可能な `user_id` / `coding_agent` の範囲」などのスコープを持たせ、範囲外の属性を持つイベントを reject する
+
+**補助要件（検知・コスト制御 — 認可境界ではない）**:
+
+- **監査ログ** — 受理 / reject したイベントを送信元 token・申告 `user_id`・受信時刻つきで追記し、後から偽装・汚染を追跡できるようにする（現状の `rejected.log` を identity 軸へ拡張）。偽装の事後追跡には効くが、偽装そのものは防げない
+- **backend カーディナリティ制御** — 属性キー / 値の allowlist・値長上限・per-token のラベル種別数上限を設け、高カーディナリティ注入で backend コストが暴走しないようにする
+
+**production で Collector を挟む構成での緩和可否**: otel 一本化（[0055]）の Mimir/Loki 経路や Datadog collector レシピでは client と backend の間に OTel Collector が入る（責務分担は本書「外部 backend 経路の責務分担」）。これは上記の **補助要件（backend カーディナリティ / コスト制御）には実効的な緩和** になる — Collector の `filter` / `transform` / `attributes` processor で属性 allowlist・値長上限・高カーディナリティ drop を ingest 時に強制でき、backend へ流す前に cost spike を抑えられる（現 `deploy/oss-observability/collector-config.yaml` は `resource` upsert と `batch` のみだが、processor 追加で対応できる配置点）。
+
+一方 **identity enforcement（必須要件）は Collector を「挟むだけ」では満たせない**。Collector は stateless な router であり（責務分担表のとおり集約しない）、payload の `user_id` をそのまま転送する。現構成の receiver は `0.0.0.0:4318` で認証すら持たず、認証面ではむしろ server path（Bearer token 検証あり）より弱い。偽装を防ぐには、per-client の認証 credential（per-user bearer token / mTLS client cert / OIDC）を Collector の auth extension で検証し、その **認証済み identity から `user_id` / tenant を processor の `upsert` で上書きして client 申告値を捨てる** 必要がある（既存の `resource` processor が `service.name` を upsert するのと同じ機構だが、値が静的定数ではなく認証 identity 由来になる点が決定的に違う）。つまり Collector は identity enforcement を **server 本体（`internal/serverpipe/`）を改修せず実装する配置先の一案** として有力だが、per-client credential という必須要件そのものを回避するものではない。
+
+さらに 2 点に注意する: (1) SQLite + Grafana の server path は設計上 Collector を経由しない（本書「プロトコル — OTLP/HTTP Logs」で明記）ため、Collector 経路での enforcement は Mimir/Loki/Datadog 経路のみを保護し、**SQLite dashboard 汚染には効かない**。(2) `user_id` を enforce しても `session_id` / `event_id` / 他属性の詐称は残るため、攻撃者自身の `user_id` namespace 内の汚染は防げない（成りすましは塞げてもデータの信頼性そのものは担保されない）。
+
+単一共有 token そのものの運用（rotation・配布・漏洩時対応）は別途 [0057] のスコープ。本節は identity と認可境界の方針に集中する。
+
 ### サーバ側 — OTLP Logs receiver + events table
 
 新設するパッケージ:
@@ -754,3 +788,4 @@ events 単位なので旧設計（集計値のみ）より体積は数倍だが�
 - backfill が後追い更新を検出した時点で新しい `agent.pr.observed` イベントを events に追記する責務がクライアント側にある。backfill が動かないと最新状態がサーバへ反映されない
 - events のオンザフライ VIEW 集約は events 数が大きくなるとクエリレイテンシに効く。materialization 切替の閾値は実測で決める（最初は VIEW のまま運用）
 - サーバ認証は単一 API key。複数ユーザでの read/write 権限分離（user 別 RLS、OIDC 等）は将来課題
+- サーバは単一共有 token のみで認証し per-client identity を持たない。`user_id` は自己申告の集計次元であり、token 保持者は他ユーザ偽装・イベント汚染・高カーディナリティ注入が可能。single-team 構成では意図的な受容リスクとし、isolation を約束するデプロイ向けの追加要件（per-user token / token scoping / 監査ログ / backend カーディナリティ制御）は「信頼境界と identity のスコープ（[0058]）」に列挙した（実装は別 PR）
