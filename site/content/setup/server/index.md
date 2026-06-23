@@ -32,38 +32,39 @@ docker pull ghcr.io/ishii1648/agent-telemetry-server:v0.6.0
 
 ```fish
 docker run --rm -p 8443:8443 \
-  -e AGENT_TELEMETRY_SERVER_TOKEN=(openssl rand -hex 32) \
   -v $PWD/agent-telemetry-data:/var/lib/agent-telemetry \
-  ghcr.io/ishii1648/agent-telemetry-server:latest
+  ghcr.io/ishii1648/agent-telemetry-server:latest --listen :8443
 ```
 
-## 2. Bearer token を生成する
+既定 listen は loopback (`127.0.0.1:8443`) で、コンテナ内 loopback は published port から到達できないため、ここでは `--listen :8443`（全インターフェイス）で起動しています。サーバはアプリ層の認証を持たない（次節）ので、`:8443` で公開する場合は信頼できるネットワークに限定するか前段に proxy を置いてください。
 
-`AGENT_TELEMETRY_SERVER_TOKEN` はサーバ起動時の Bearer 認証 key です。クライアント `~/.config/agent-telemetry/config.toml` の `[server] token` と同値にする必要があります（旧パス `~/.claude/agent-telemetry.toml` も fallback として読まれますが、新規セットアップでは `~/.config/` 側に置いてください）。
+## 2. 認証境界（ネットワーク到達制御 + proxy）
 
-```fish
-openssl rand -hex 32
-```
+`agent-telemetry-server` の ingest endpoint `/v1/logs` は **アプリケーション層の認証を持ちません**（旧 `AGENT_TELEMETRY_SERVER_TOKEN` は廃止しました）。信頼境界は次の 2 層で表現します（設計判断は [issue 0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md) / [issue 0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0058-design-server-per-client-identity-userid-spoofing.md)）:
 
-漏えい時はサーバ側 env と全クライアントの `[server] token` を同時にローテーションしてください。
+- **既定 bind は loopback (`127.0.0.1:8443`)**。手元のマシン以外から到達させない限り認証は不要です。コンテナ / k8s では published port / ClusterIP から届く必要があるので `--listen :8443`（全インターフェイス）で起動しますが、その場合は **ネットワーク到達制御（VPN / 内部ネットワーク / ClusterIP）で送信元を限定する**のが前提です。loopback 以外へ bind するとサーバは起動時に警告ログを出します。
+- **インターネット公開する場合は、前段に TLS 終端 + 認証 + レート制限を行う reverse proxy / Ingress を必ず置きます**（oauth2-proxy / mTLS / OIDC 等）。`/v1/logs` は書き込み専用で蓄積データを読み出す API を持たないため誤公開でも保存済みメトリクスの漏えいは起きませんが、無認証のままでは偽イベント注入・DoS・backend コスト増の余地が残ります。
 
-## 運用前提 — TLS / レート制限は proxy 側の責務
+クライアント側に token 設定は不要です。認証付き proxy を前段に置く場合のみ、proxy が要求する credential を `[server] token` に設定してください（付属サーバ自身は無視します）。
 
-`agent-telemetry-server` は **TLS 終端もレート制限も持たない平文 HTTP ingest** です。`--listen` を **インターネットへ直接公開しないでください**。公開する場合は必ず reverse proxy / ingress（nginx / Caddy / cloud LB など）の背後に置き、次を proxy 側で担保するのが契約です（[issues/0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md)）:
+## 運用前提 — TLS / 認証 / レート制限は proxy 側の責務
+
+`agent-telemetry-server` は **アプリ層の認証を持たない平文 HTTP ingest** です（書き込み token は [issues/0057](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0057-design-server-tls-ratelimit-bodytimeout-shared-token.md) で廃止しました）。`--listen` を **インターネットへ直接公開しないでください**。公開する場合は必ず reverse proxy / ingress（nginx / Caddy / cloud LB など）の背後に置き、次を proxy 側で担保するのが契約です:
 
 | 関心事 | どこで担保するか |
 |---|---|
-| **TLS 終端** | proxy / ingress。Bearer token を平文で運ぶため、公開経路は必ず TLS の背後に置く（§3 の Ingress 例は cert-manager で TLS を張る前提） |
-| **レート制限** | proxy / ingress。token 総当たり・大量 ingest の抑制。binary 内にレート制限は無い |
-| **接続元の制限** | proxy / ingress / NetworkPolicy。`/v1/logs` は単一共有 token のみで認可するため、到達範囲を信頼ネットワーク（VPN / cluster 内 / 許可 IP）へ絞る |
+| **TLS 終端** | proxy / ingress。`/v1/logs` は平文 HTTP なので、公開経路は必ず TLS の背後に置く（§3 の Ingress 例は cert-manager で TLS を張る前提） |
+| **認証** | proxy / ingress。oauth2-proxy / OIDC / mTLS 等で前段認証を入れる。`/v1/logs` 自身は認証しない |
+| **レート制限** | proxy / ingress。大量 ingest による DoS / backend コスト増の抑制。binary 内にレート制限は無い |
+| **接続元の制限** | proxy / ingress / NetworkPolicy。到達範囲を信頼ネットワーク（VPN / cluster 内 / 許可 IP）へ絞る |
 
 binary 単体で閉じているのは「公開しても安価に効く最小限」だけです:
 
-- **request timeout**: slow-body / idle keep-alive 接続が goroutine を無期限に占有しないよう `ReadHeaderTimeout=10s` / `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を設定済み。
-- **payload 上限**: 1 リクエストを 50 MB（圧縮フレーム・展開後の双方）で上限し、zip-bomb 系入力を弾く。
-- **Bearer 認証**: token を定数時間比較で検証する。
+- **既定 loopback bind**: 既定 `--listen` は `127.0.0.1:8443`。loopback 以外へ bind すると起動時に警告ログを出す
+- **request timeout**: slow-body / idle keep-alive 接続が goroutine を無期限に占有しないよう `ReadHeaderTimeout=10s` / `ReadTimeout=60s` / `WriteTimeout=90s` / `IdleTimeout=120s` を設定済み
+- **payload 上限**: 1 リクエストを 50 MB（圧縮フレーム・展開後の双方）で上限し、zip-bomb 系入力を弾く
 
-書き込み token は **単一共有** で、漏えい時の影響範囲は全クライアントに及びます。クライアント単位の identity / token scoping は本 binary の対象外です（[issues/0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/0058-design-server-per-client-identity-userid-spoofing.md) で別途検討）。VPN / port-forward のみで使う（公開しない）場合は §3 の Ingress ブロックを丸ごと削除して構いません。
+`user_id` は payload 上の自己申告フィールドで、ingest 到達できるクライアントは他ユーザ偽装やイベント汚染が可能です。per-client identity / token scoping は本 binary の対象外で、isolation を約束するデプロイでの追加要件は [issues/0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0058-design-server-per-client-identity-userid-spoofing.md) を参照してください。VPN / port-forward のみで使う（公開しない）場合は §3 の Ingress ブロックを丸ごと削除して構いません。
 
 ## 3. k8s 参考デプロイ — 最小構成（サーバのみ）
 
@@ -75,17 +76,6 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: agent-telemetry
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-telemetry-server-token
-  namespace: agent-telemetry
-type: Opaque
-stringData:
-  # REPLACE_ME: openssl rand -hex 32 で生成し、クライアント [server] token と同値にする。
-  # SealedSecret / External Secrets Operator など秘匿配信に置き換えるのが望ましい。
-  token: "REPLACE_ME_with_openssl_rand_hex_32"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -117,15 +107,11 @@ spec:
       containers:
         - name: server
           image: ghcr.io/ishii1648/agent-telemetry-server:latest   # REPLACE_ME: 本番では vX.Y.Z で tag pin
+          # ":8443" は全インターフェイス bind。認証は持たないので ClusterIP + ネットワーク
+          # 到達制御で送信元を限定する前提（公開する場合は下記 Ingress で proxy 認証を入れる）。
           args: ["--listen", ":8443", "--data-dir", "/var/lib/agent-telemetry"]
           ports:
             - {containerPort: 8443, name: ingest}
-          env:
-            - name: AGENT_TELEMETRY_SERVER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: agent-telemetry-server-token
-                  key: token
           volumeMounts:
             - {name: data, mountPath: /var/lib/agent-telemetry}
           readinessProbe:
@@ -150,6 +136,8 @@ spec:
     - {port: 8443, targetPort: ingest, name: ingest}
 ---
 # REPLACE_ME: 外部公開する場合の Ingress 例。cluster の IngressClass / cert-manager Issuer に合わせて調整。
+# サーバは無認証なので、公開する場合はこの Ingress（または別の reverse proxy）で TLS 終端に加え
+# 認証（oauth2-proxy / OIDC / mTLS 等）とレート制限を必ず入れること。
 # 公開しない場合（VPN / port-forward 経由のみ）はこのブロックをまるごと削除してよい。
 # apiVersion: networking.k8s.io/v1
 # kind: Ingress
@@ -196,7 +184,7 @@ kubectl create configmap agent-telemetry-grafana-dashboards -n agent-telemetry \
 
 > **ConfigMap サイズ上限**: ConfigMap は etcd の制約から 1 MiB が上限です。dashboard JSON が肥大化した場合は、Grafana sidecar pattern（[grafana/helm-charts](https://github.com/grafana/helm-charts) の sidecar dashboards loader）または initContainer で `git clone` する形に切り替えてください。
 
-そのうえで以下を `kubectl apply -f -` します。Secret / PVC / Service の最小構成は § 3 と共通なので、ここでは Deployment + Service だけを示します（§ 3 の Secret + PVC + Namespace は事前に apply 済みである前提）。
+そのうえで以下を `kubectl apply -f -` します。PVC / Service の最小構成は § 3 と共通なので、ここでは Deployment + Service だけを示します（§ 3 の PVC + Namespace は事前に apply 済みである前提）。
 
 ```yaml
 ---
@@ -218,15 +206,10 @@ spec:
       containers:
         - name: server
           image: ghcr.io/ishii1648/agent-telemetry-server:latest   # REPLACE_ME: 本番では tag pin
+          # ":8443" は全インターフェイス bind。認証は持たないので ClusterIP + ネットワーク到達制御が前提。
           args: ["--listen", ":8443", "--data-dir", "/var/lib/agent-telemetry"]
           ports:
             - {containerPort: 8443, name: ingest}
-          env:
-            - name: AGENT_TELEMETRY_SERVER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: agent-telemetry-server-token
-                  key: token
           volumeMounts:
             - {name: data, mountPath: /var/lib/agent-telemetry}
           readinessProbe:
@@ -318,7 +301,7 @@ user = "you@example.com"
 
 [server]
 endpoint = "https://telemetry.example.com"   # サーバの base URL（パスは含めない）
-token    = "xxx"                             # AGENT_TELEMETRY_SERVER_TOKEN と同値
+# token は不要（付属サーバは認証しない）。認証付き proxy を前段に置く場合のみ proxy の credential を設定する
 ```
 
 設定を確認:
