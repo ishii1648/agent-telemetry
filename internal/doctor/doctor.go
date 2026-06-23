@@ -13,6 +13,7 @@ import (
 	"github.com/ishii1648/agent-telemetry/internal/agent"
 	"github.com/ishii1648/agent-telemetry/internal/configpath"
 	"github.com/ishii1648/agent-telemetry/internal/legacy"
+	"github.com/ishii1648/agent-telemetry/internal/serverclient"
 	"github.com/ishii1648/agent-telemetry/internal/sessionindex"
 	"github.com/ishii1648/agent-telemetry/internal/setup"
 	"github.com/ishii1648/agent-telemetry/internal/userid"
@@ -43,6 +44,9 @@ func RunWith(w io.Writer, env Env) (Result, error) {
 
 	r.ConfigPath = checkConfigPath(env)
 	writeConfigPath(w, r.ConfigPath)
+
+	r.Export = checkExport(env)
+	writeExport(w, r.Export)
 
 	for _, a := range env.Agents {
 		ar := AgentReport{Agent: a}
@@ -96,6 +100,12 @@ type Env struct {
 	// path. When nil, defaults to configpath.Status.
 	ConfigPathStatus func() configpath.MigrationStatus
 
+	// ExportTargets returns the configured flush export targets. When nil,
+	// defaults to loading them from the resolved config path. Used to flag
+	// non-loopback http:// targets that would leak cleartext (issue 0059);
+	// tests inject fakes so they never read the real config.toml.
+	ExportTargets func() ([]serverclient.ExportTarget, error)
+
 	// AsyncFlags returns, per hook event, whether the agent's registered
 	// agent-telemetry hook is marked "async": true. Used to hint when a hook
 	// that should be async (HookSpec.Async) is registered without it. Only
@@ -122,8 +132,17 @@ type Result struct {
 	Binary       CheckResult
 	User         UserCheck
 	ConfigPath   ConfigPathCheck
+	Export       ExportReport
 	AgentReports []AgentReport
 	Legacy       LegacyReport
+}
+
+// ExportReport lists configured flush export targets that would POST cleartext
+// http:// to a non-loopback host (issue 0059). It is a warning, not a failure:
+// config is operator-controlled and a deliberate plaintext hop is allowed, but
+// an accidental http:// (especially one carrying a token) should be visible.
+type ExportReport struct {
+	Insecure []serverclient.InsecureTarget
 }
 
 // ConfigPathCheck reports which TOML config path agent-telemetry is using
@@ -227,6 +246,24 @@ func checkConfigPath(env Env) ConfigPathCheck {
 		PreferredExists: status.PreferredExists,
 		LegacyExists:    status.LegacyExists,
 	}
+}
+
+// checkExport loads the configured export targets and flags any that would
+// send cleartext http:// to a non-loopback host (issue 0059). Errors loading
+// the config are swallowed: a missing/garbled config is already surfaced by
+// checkConfigPath and the flush path, and doctor never fails on it here.
+func checkExport(env Env) ExportReport {
+	loader := env.ExportTargets
+	if loader == nil {
+		loader = func() ([]serverclient.ExportTarget, error) {
+			return serverclient.LoadConfig(serverclient.ConfigPath())
+		}
+	}
+	targets, err := loader()
+	if err != nil {
+		return ExportReport{}
+	}
+	return ExportReport{Insecure: serverclient.InsecurePlaintextTargets(targets)}
 }
 
 func checkBinary(env Env) CheckResult {
@@ -467,6 +504,21 @@ func writeConfigPath(w io.Writer, c ConfigPathCheck) {
 	default:
 		fmt.Fprintf(w, "%s config: not found (expected at %s)\n", markWarn, c.Preferred)
 	}
+}
+
+func writeExport(w io.Writer, r ExportReport) {
+	if len(r.Insecure) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%s export target に非ループバック宛ての http:// 平文送信があります（issue 0059）:\n", markWarn)
+	for _, t := range r.Insecure {
+		if t.HasCredential {
+			fmt.Fprintf(w, "  - %s: %s — token が平文で漏洩します。https:// に変更してください\n", t.ID, t.Endpoint)
+		} else {
+			fmt.Fprintf(w, "  - %s: %s — メタデータが平文で流れます。https:// の利用を推奨します\n", t.ID, t.Endpoint)
+		}
+	}
+	fmt.Fprintln(w, "  → localhost への tokenless Collector 送信は意図的に許容（loopback 例外）。それ以外は https:// を使ってください")
 }
 
 func writeBinary(w io.Writer, c CheckResult) {
