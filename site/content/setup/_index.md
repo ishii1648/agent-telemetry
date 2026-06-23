@@ -9,3 +9,4 @@ agent-telemetry のセットアップと運用手順をまとめます。仕組�
 
 1. [local]({{< relref "/setup/local" >}}) — ローカルマシンへの導入（CLI・hook 登録・Grafana 設定）
 2. [server]({{< relref "/setup/server" >}}) — `agent-telemetry-server` を立てて複数マシン / チームで集計値を集約する（オプトイン）
+3. [datadog]({{< relref "/setup/datadog" >}}) — Datadog へ raw events と PR 単位 gauge を送る（direct / collector のどちらかを選ぶ。オプトイン）
