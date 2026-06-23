@@ -149,6 +149,91 @@ signals = ["logs", "metrics"]
 
 `DD_API_KEY` は Collector プロセスに渡し、**client には置きません**（team / 多 client 向けの credential モデル）。
 
+### 2-3. k8s 参考デプロイ（Collector を Pod として立てる）
+
+リポジトリ同梱の `collector-config.yaml` をそのまま ConfigMap として配り、`DD_API_KEY` は Secret で渡す最小構成です。本 binary（`agent-telemetry-server`）の k8s 例（[server]({{< relref "/setup/server" >}}) § 3）とは別物で、こちらは **OSS の OTel Collector contrib distribution** を立ち上げて Datadog Intake に送ります。
+
+> Collector は `collector-config.yaml` の pipeline 定義に従って受信 → 整形 → forward するだけで cross-instance state を持たないので、`replicas` を増やしても多重カウントは起きません（gauge は per-flush の last-value、logs は冪等 dedup）。HA したい場合は `replicas: 2+` にできます。
+
+ConfigMap と Secret はリポジトリのファイルから生成します（リポジトリ root で実行）:
+
+```fish
+kubectl create namespace agent-telemetry-collector
+
+kubectl create configmap otel-collector-config -n agent-telemetry-collector \
+  --from-file=collector-config.yaml=deploy/otel-collector/collector-config.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic datadog-credentials -n agent-telemetry-collector \
+  --from-literal=DD_API_KEY=<your-api-key> \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+そのうえで以下を `kubectl apply -f -` してください。`# REPLACE_ME` 箇所は cluster ごとに調整します。
+
+```yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: agent-telemetry-collector
+spec:
+  replicas: 1                    # 最小構成。stateless なので HA したい場合は 2+ に増やせる（上の note 参照）
+  selector:
+    matchLabels: {app: otel-collector}
+  template:
+    metadata:
+      labels: {app: otel-collector}
+    spec:
+      containers:
+        - name: collector
+          # deploy/otel-collector/docker-compose.yaml と同じ pin。版を上げる際は collector-config.yaml の OTTL 互換を確認すること。
+          image: otel/opentelemetry-collector-contrib:0.153.0
+          args: ["--config=/etc/otelcol/collector-config.yaml"]
+          ports:
+            - {containerPort: 4318, name: otlp-http}
+          env:
+            - {name: DD_SITE,    value: datadoghq.com}   # REPLACE_ME: 自分の Datadog site parameter（site 早見表参照）
+            - {name: DEPLOY_ENV, value: production}       # REPLACE_ME: resource attribute deployment.environment に入る値
+            - name: DD_API_KEY
+              valueFrom:
+                secretKeyRef: {name: datadog-credentials, key: DD_API_KEY}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol}
+          readinessProbe:
+            httpGet: {path: /, port: otlp-http}           # 簡易チェック。`health_check` extension を collector-config に追加すれば専用 endpoint を使える
+          resources:
+            requests: {cpu: "100m", memory: "256Mi"}
+            limits:   {cpu: "500m", memory: "512Mi"}
+      volumes:
+        - name: config
+          configMap: {name: otel-collector-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: agent-telemetry-collector
+spec:
+  type: ClusterIP                # cluster 内の client からのみ受ける。外部 client（VPN / VPC peering 越し）から送るなら NodePort / LoadBalancer / Ingress に変更
+  selector: {app: otel-collector}
+  ports:
+    - {port: 4318, targetPort: otlp-http, name: otlp-http}
+```
+
+client 側 `config.toml` で endpoint を Service の DNS に向けます:
+
+```toml
+[[export]]
+id = "collector"
+endpoint = "http://otel-collector.agent-telemetry-collector.svc.cluster.local:4318"
+encoding = "json"
+signals = ["logs", "metrics"]
+```
+
+> **無認証 receiver の注意**: 上記 `collector-config.yaml` の OTLP receiver はアプリ層認証を持たないため、外部公開する場合は NetworkPolicy で送信元 namespace / Pod を絞るか、Ingress 側で mTLS / 認証 proxy を挟んでください。Collector レベルの per-client identity enforcement は本 PR のスコープ外で、[issues/closed/0058](https://github.com/ishii1648/agent-telemetry/blob/main/issues/closed/0058-design-server-per-client-identity-userid-spoofing.md) で別 PR 切り出し済みです。
+
 > **OSS observability スタックを Datadog の代わりに使いたい場合** は [local]({{< relref "/setup/local" >}}) の手順 4 を参照してください。Mimir / Loki / Grafana がローカル compose で立ち上がり、Datadog credential 無しで PR 単位 gauge と raw events を検証できます。
 
 ## 3. Datadog 側受け設定
