@@ -40,7 +40,7 @@ jobs:
       # aqua.yaml で hugo (extended) と go のバージョンを単一の真実として管理する。
       # v3.1.1 + aqua v2.58.1 の組み合わせでは bootstrap aqua の slsa-verifier が
       # 新しい SLSA bundle 形式を解釈できず失敗するため v4.0.4 を使う。
-      - uses: aquaproj/aqua-installer@11dd79b4e498d471a9385aa9fb7f62bb5f52a73c  # v4.0.4
+      - uses: aquaproj/aqua-installer@96a9bc20066c5bf5e275b41019cfc165b25f4e2e  # v4.0.5
         if: github.event.action != 'closed'
         with:
           aqua_version: v2.58.1
