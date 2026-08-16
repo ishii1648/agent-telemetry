@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/klauspost/compress v1.18.6
 	go.opentelemetry.io/proto/otlp v1.10.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 	modernc.org/sqlite v1.53.0
 )
 
