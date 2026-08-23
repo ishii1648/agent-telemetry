@@ -3,7 +3,7 @@
 # Build the agent-telemetry-server binary. CGO_ENABLED=0 keeps the image
 # fully static — modernc.org/sqlite is a pure-Go reimplementation, so no
 # libsqlite3 link is needed.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
