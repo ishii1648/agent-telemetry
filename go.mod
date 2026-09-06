@@ -3,7 +3,7 @@ module github.com/ishii1648/agent-telemetry
 go 1.26.4
 
 require (
-	github.com/klauspost/compress v1.18.6
+	github.com/klauspost/compress v1.20.0
 	go.opentelemetry.io/proto/otlp v1.10.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.53.0
